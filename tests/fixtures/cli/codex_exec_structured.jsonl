@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"01a18673-3f09-76b1-b12b-60c0c2e2169a"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"{\"verdict\":\"PASS\",\"reason\":\"2 + 2 equals 4.\"}"}}
+{"type":"turn.completed","usage":{"input_tokens":13488,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":27,"reasoning_output_tokens":0}}
