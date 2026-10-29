@@ -1,0 +1,39 @@
+[project]
+name = "multi-agent-orchestrator"
+version = "0.1.0"
+description = "FastAPI multi-agent orchestrator integrating Codex CLI and Claude Code CLI"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic>=2",
+    "pydantic-settings",
+    "sqlalchemy[asyncio]>=2",
+    "asyncpg",
+    "alembic",
+    "psutil",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "httpx",
+    "aiosqlite",
+    # Test-only embedded PostgreSQL (no Docker/PG install required). Fork of pgserver, which has no Python 3.14 build.
+    "pixeltable-pgserver",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "e2e_cli: runs the real Codex/Claude CLIs (slow, costs tokens). Run with -m e2e_cli",
+]
+addopts = "-m 'not e2e_cli'"
