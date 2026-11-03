@@ -8,7 +8,7 @@ from app.infra.process_control import TerminationResult
 from app.models.states import CliOutcome
 from app.models.tables import Execution, ExecutionRequest, TaskRun
 from app.providers.base import ProviderResult
-from tests.harness import TEST_CODE, Harness, design_pass, developer_good, structured, write_tests_ok, wait_for
+from tests.harness import TEST_CODE, Harness, design_pass, developer_good, structured, write_tests_ok, wait_for, recover_for_test
 
 
 class Crash(RuntimeError):
@@ -53,7 +53,7 @@ async def test_restart_resumes_an_interrupted_step_when_nothing_changed(db, tmp_
     assert (await h.task(task.id)).status == "TESTING"
 
     await expire_everything(db, task.id)
-    assert (await h.runner.recover())["requeued"] == 1
+    assert (await recover_for_test(h.runner))["requeued"] == 1
     assert await h.run_until_idle() == ["COMPLETED"]
 
     steps = await h.steps_of(task.id)
@@ -74,7 +74,7 @@ async def test_interrupted_file_changing_step_with_unknown_changes_is_never_re_r
     task = await h.new_task()
     await crash_during(h, task)
     await expire_everything(db, task.id)
-    await h.runner.recover()
+    await recover_for_test(h.runner)
     tester_calls_before = h.roles_called(h.claude).count("TESTER")
     assert await h.run_until_idle() == ["WAITING_APPROVAL"]
 
@@ -95,7 +95,7 @@ async def test_recovery_continue_keeps_the_changes_and_resumes_from_the_checkpoi
     task = await h.new_task()
     await crash_during(h, task)
     await expire_everything(db, task.id)
-    await h.runner.recover()
+    await recover_for_test(h.runner)
     assert await h.run_until_idle() == ["WAITING_APPROVAL"]
     approval = (await h.approvals(task.id))[0]
     await h.decide(approval.id, option="continue")
@@ -111,7 +111,7 @@ async def test_recovery_retry_is_refused_when_the_workspace_differs_from_the_ste
     task = await h.new_task()
     await crash_during(h, task)
     await expire_everything(db, task.id)
-    await h.runner.recover()
+    await recover_for_test(h.runner)
     await h.run_until_idle()
     first = (await h.approvals(task.id))[0]
     await h.decide(first.id, option="retry")                  # "retry" demands the original starting state
@@ -129,7 +129,7 @@ async def test_unconfirmed_cli_termination_never_creates_a_new_run_even_after_re
     task = await h.new_task()
     await crash_during(h, task)
     await expire_everything(db, task.id)
-    await h.runner.recover()
+    await recover_for_test(h.runner)
 
     assert await h.run_until_idle() == ["UNCERTAIN"]
     t = await h.task(task.id)
@@ -163,7 +163,7 @@ async def test_spawn_with_unknown_process_identity_is_treated_as_possibly_runnin
     task = await h.new_task()
     await crash_during(h, task)
     await expire_everything(db, task.id)
-    await h.runner.recover()
+    await recover_for_test(h.runner)
     assert await h.run_until_idle() == ["UNCERTAIN"]
     assert (await h.task(task.id)).status == "WAITING_APPROVAL"
     assert h.roles_called(h.claude).count("TESTER") == 1
@@ -302,7 +302,7 @@ async def test_cancelling_an_idle_task_finishes_it_without_any_cli(db, tmp_path)
     task = await h.new_task()
     await h.tasks.request_cancellation(task.id)
     assert (await h.task(task.id)).status == "PENDING"                       # a request alone changes nothing else
-    assert (await h.runner.recover())["cancelled"] == 1
+    assert (await recover_for_test(h.runner))["cancelled"] == 1
     assert (await h.task(task.id)).status == "CANCELLED"
     assert h.claude.calls == [] and h.codex.calls == []
 
@@ -313,7 +313,7 @@ async def test_cancellation_of_a_task_waiting_for_approval(db, tmp_path):
     task = await h.new_task()
     await h.start(task.id)
     await h.tasks.request_cancellation(task.id)
-    await h.runner.recover()
+    await recover_for_test(h.runner)
     t = await h.task(task.id)
     assert t.status == "CANCELLED"
     assert (await h.steps_of(task.id))[0].status == "CANCELLED"

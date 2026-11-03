@@ -37,6 +37,32 @@ class MessageOut(_Out):
     created_at: datetime
 
 
+# --- projects ----------------------------------------------------------------------------------------------
+class ProjectCreate(BaseModel):
+    name: str
+    workspace_path: str | None = None       # connect an existing local workspace ...
+    repository_url: str | None = None       # ... or clone a git repository into the managed clone root
+    test_policy: dict | None = None
+
+
+class ProjectPatch(BaseModel):
+    name: str | None = None
+    status: str | None = None
+    test_policy: dict | None = None
+
+
+class ProjectOut(_Out):
+    id: uuid.UUID
+    name: str
+    workspace_path: str
+    repository_url: str | None = None
+    status: str
+    test_policy: dict | None = None
+    workspace_state: str
+    created_at: datetime
+    updated_at: datetime
+
+
 # --- tasks -------------------------------------------------------------------------------------------------
 class TaskCreate(BaseModel):
     requirements: str
@@ -68,6 +94,7 @@ class CheckpointOut(BaseModel):
 class TaskOut(_Out):
     id: uuid.UUID
     conversation_id: uuid.UUID
+    project_id: uuid.UUID | None = None
     status: str
     requirements: str
     limits: dict

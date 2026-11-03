@@ -84,8 +84,8 @@ When done, summarise what you changed."""
 
 
 def tester_prompt(ctx: dict) -> str:
-    return f"""You are the TESTER. Write and improve automated tests (pytest) under tests/ for the implementation in this directory.
-You may edit test files only. Do not edit application code, and do not remove, weaken or skip existing tests.
+    return f"""You are the TESTER. Write and improve automated tests for the implementation in this directory, using the project's own test framework (tests/ for pytest projects, src/test/ for Maven and Gradle projects).
+You may edit test files only. Do not edit application code, build files or wrapper scripts (pom.xml, mvnw, build.gradle, gradlew ...), and do not remove, weaken or skip existing tests.
 You may run tests; the Orchestrator will run the authoritative test commands itself, so your own run is informational.
 
 Requirements:

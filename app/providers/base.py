@@ -43,6 +43,10 @@ class ProviderRequest:
     run_key: str | None = None
     # A one-off, execution-bound tool grant from a PERMISSION approval (never persisted as a standing right).
     one_off_tool: str | None = None
+    # Set for tasks that run in a registered project workspace (outside WORKSPACE_ROOT).
+    workspace_root: Path | None = None
+    # The task's test preset (maven / gradle / pytest): selects the role's tool permissions.
+    test_preset: str | None = None
 
 
 @dataclass

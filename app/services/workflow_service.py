@@ -22,15 +22,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import Database
 from app.infra.event_bus import EventBus
-from app.infra.workspace_guard import WorkspaceGuard
-from app.infra.workspace_snapshot import diff_snapshots, take_snapshot
+from app.infra.workspace_guard import WorkspaceGuard, resolve_project_root
+from app.infra.workspace_snapshot import SnapshotError, diff_snapshots, is_current_snapshot_version, take_snapshot
 from app.models.states import (
     STEP_CODE_REVIEW, STEP_DESIGN_REVIEW, STEP_DEVELOP, STEP_PLAN, STEP_ROLE, STEP_TASK_STATE, STEP_TEST,
     TERMINAL_TASK_STATES, ApprovalType, CliOutcome, StepState, TaskState,
 )
 from app.models.tables import Approval, Execution, Task, TaskStep
 from app.providers.permissions import authorize_one_off, is_test_path, permissions_for
-from app.repositories.approval_repository import ApprovalRepository
+from app.repositories.approval_repository import ApprovalRepository, ExecutionRequestRepository
 from app.repositories.task_repository import TaskRepository
 from app.services import artifacts as A
 from app.services import context_service as C
@@ -40,20 +40,30 @@ from app.services.fingerprints import design_review_basis
 from app.services.hashing import stable_hash
 from app.services.human_gate_service import HumanGateService
 from app.services.lease_service import Lease, LeaseService
+from app.services.project_lock_service import ProjectLockService, StepGate
+from app.services.project_terminal import UNMEASURED, FingerprintProofStale
 from app.services.session_service import SessionService
 from app.services.state_service import change_step_state, change_task_state
 from app.services.step_runner import (
     LimitExceeded, StepExecution, StepHandle, StepRunner, TaskCancelled, TerminationUnconfirmed,
 )
+from app.services.task_finalizer import TaskFinalizer
 from app.services.test_policy_service import TestPolicyService, compute_test_signals
+from app.validation import policies as P
 from app.validation.exceptions import AppError, FailClosed, LeaseLost
 
 log = logging.getLogger(__name__)
 _EXTERNAL_SIDE_EFFECT = re.compile(r"\b(curl|wget|git\s+push|npm\s+publish|twine|ssh|scp)\b|https?://", re.I)
+PROJECT_CHANGED = "PROJECT_CHANGED"      # marker error of a read-only step attempt invalidated by a project change
 
 
 class RetryableStepFailure(Exception):
     """Technical failure of one step attempt (counts against max_step_attempts)."""
+
+
+class ProjectBusy(Exception):
+    """Another task holds the project write lock (or the project kept changing under a read-only step): the
+    request is deferred with a persistent backoff; no step attempt, CLI invocation or iteration is consumed."""
 
 
 class PolicyViolation(AppError):
@@ -87,26 +97,39 @@ class StepDecision:
 class RunContext:
     lease: Lease
     workspace: Path
+    workspace_root: Path | None = None    # set for project tasks: the trusted root outside WORKSPACE_ROOT
     resume_approval: Approval | None = None
     one_off_used: bool = False
     parked: bool = False       # a gate was opened and the lease released: stop driving
+    request_id: uuid.UUID | None = None
+    project_proof: object = None          # FingerprintProof / UNMEASURED for the terminal transition being completed
+    defer_reset: bool = False
 
 
 class WorkflowService:
     def __init__(self, db: Database, leases: LeaseService, steps: StepRunner, gates: HumanGateService,
                  test_policy: TestPolicyService, guard: WorkspaceGuard, sessions: SessionService,
-                 events: EventBus | None = None):
+                 events: EventBus | None = None, locks: ProjectLockService | None = None,
+                 finalizer: TaskFinalizer | None = None):
         self.db, self.leases, self.steps, self.gates = db, leases, steps, gates
         self.tests, self.guard, self.sessions = test_policy, guard, sessions
         self.events = events or steps.events
+        self.locks = locks or ProjectLockService(db, leases)
+        self.finalizer = finalizer or TaskFinalizer(db, self.locks)
 
     # ================================================================================================
     # driver
     # ================================================================================================
-    async def run_task(self, lease: Lease, task_id: uuid.UUID, *, resume_approval_id: uuid.UUID | None = None) -> str:
+    async def run_task(self, lease: Lease, task_id: uuid.UUID, *, resume_approval_id: uuid.UUID | None = None,
+                       request_id: uuid.UUID | None = None) -> str:
         task = await self._get_task(task_id)
-        workspace = self.guard.resolve_inside(task.workspace_path, must_exist=True)
-        ctx = RunContext(lease, workspace)
+        if task.project_id is not None:
+            # a project workspace lives outside WORKSPACE_ROOT: re-validated before every run
+            workspace = resolve_project_root(task.workspace_path)
+            ctx = RunContext(lease, workspace, workspace_root=workspace, request_id=request_id)
+        else:
+            workspace = self.guard.resolve_inside(task.workspace_path, must_exist=True)
+            ctx = RunContext(lease, workspace, request_id=request_id)
         try:
             if resume_approval_id is not None:
                 await self._resume_from_approval(ctx, task_id, resume_approval_id)
@@ -123,12 +146,18 @@ class WorkflowService:
         except LeaseLost:
             log.warning("lease lost for task %s; stopping without recording results", task_id)
             return "LEASE_LOST"
+        except ProjectBusy as busy:
+            log.info("task %s deferred: %s", task_id, busy)
+            await self._guarded(self._release_for_defer(ctx))
+            return "BLOCKED"
         except TaskCancelled:
             await self._guarded(self._finalize_cancel(ctx, task_id))
         except (LimitExceeded, PolicyViolation) as exc:
             await self._guarded(self._fail(ctx, task_id, exc.reason, str(exc)))
         except TerminationUnconfirmed as exc:
             await self._guarded(self._park_for_recovery(ctx, task_id, f"CLI termination not confirmed: {exc.message}"))
+        except SnapshotError as exc:      # BEFORE FailClosed (its base): the CLI result is already recorded
+            await self._guarded(self._fail(ctx, task_id, "SNAPSHOT_FAILED", exc.message))
         except FailClosed as exc:
             await self._guarded(self._fail(ctx, task_id, "FAIL_CLOSED", exc.message))
         return str(TaskState((await self._get_task(task_id)).status))
@@ -156,24 +185,28 @@ class WorkflowService:
             await self.leases.release(ctx.lease, reason, session=s)
         self.events.publish(task.id, {"event": "task.finished", "status": task.status})
 
+    async def _release_for_defer(self, ctx: RunContext) -> None:
+        """The task could not start a step now (project busy): hand the lease back so the request can be retried."""
+        await self.leases.release(ctx.lease, "project_busy")
+
     async def _fail(self, ctx: RunContext, task_id: uuid.UUID, reason: str, detail: str = "") -> None:
-        async with self.db.transaction() as s:
-            task = await TaskRepository(s).lock(task_id)
+        async def work(s: AsyncSession, task: Task, proof) -> None:
             await self.leases.verify(s, ctx.lease)
             if TaskState(task.status) not in TERMINAL_TASK_STATES:
                 await change_task_state(s, task, TaskState.FAILED, reason=reason, failure_reason=reason,
-                                        event={"detail": detail[:500]})
+                                        event={"detail": detail[:500]}, project_proof=proof)
             for step in await TaskRepository(s).steps_for_task(task_id):
                 if StepState(step.status) is StepState.RUNNING:
                     await change_step_state(s, step, StepState.FAILED, error=reason)
             await self.sessions.close_all_for_task(s, task_id)
             await self.leases.release(ctx.lease, f"failed:{reason}", session=s)
+
+        await self.finalizer.finalize_task_with_proof(task_id, work)
         self.events.publish(task_id, {"event": "task.finished", "status": "FAILED", "reason": reason})
 
     async def _finalize_cancel(self, ctx: RunContext, task_id: uuid.UUID) -> None:
         """Cancellation *request* != termination: CANCELLED only once every CLI process is proven gone."""
-        async with self.db.transaction() as s:
-            task = await TaskRepository(s).lock(task_id)
+        async def work(s: AsyncSession, task: Task, proof) -> None:
             await self.leases.verify(s, ctx.lease)
             open_exec = [e for e in await TaskRepository(s).unterminated_executions(task_id)
                          if e.role in STEP_ROLE.values()]
@@ -189,9 +222,11 @@ class WorkflowService:
                 if StepState(step.status) is StepState.RUNNING:
                     await change_step_state(s, step, StepState.CANCELLED, error="cancelled")
             if TaskState(task.status) not in TERMINAL_TASK_STATES:
-                await change_task_state(s, task, TaskState.CANCELLED, reason="cancelled")
+                await change_task_state(s, task, TaskState.CANCELLED, reason="cancelled", project_proof=proof)
             await self.sessions.close_all_for_task(s, task_id)
             await self.leases.release(ctx.lease, "cancelled", session=s)
+
+        await self.finalizer.finalize_task_with_proof(task_id, work)
         self.events.publish(task_id, {"event": "task.finished", "status": "CANCELLED"})
 
     async def _park_for_recovery(self, ctx: RunContext, task_id: uuid.UUID, reason: str) -> None:
@@ -271,8 +306,22 @@ class WorkflowService:
         role = STEP_ROLE[step_key]
         if await self._interrupted_needs_human(ctx, task, step_key, mutating):
             return
+        # Pre-step project gate (BEFORE any step attempt exists, so waiting consumes no attempt / CLI / iteration):
+        # changing steps and the code review run under the project write lock; the DIRTY gate may open here.
+        needs_lock = mutating or step_key == STEP_CODE_REVIEW
+        if needs_lock:
+            gate = await self.locks.ensure_for_step(ctx.lease, task.id, step_key, self.gates)
+            if gate is StepGate.GATE_OPENED:
+                ctx.parked = True
+                return
+            if gate is StepGate.BLOCKED:
+                raise ProjectBusy("another task holds the project write lock")
+            await self._reset_defer_once(ctx)
         while True:
-            handle = await self.steps.begin(ctx.lease, task.id, step_key, role, input_hash, ctx.workspace)
+            watch = None if needs_lock else await self._read_only_start(task)
+            handle = await self.steps.begin(ctx.lease, task.id, step_key, role, input_hash, ctx.workspace,
+                                            workspace_root=ctx.workspace_root,
+                                            on_begin=self.locks.on_mutating_begin if mutating else None)
             one_off, before_spawn = self._one_off_for(ctx, role, step_key)
             try:
                 ex = await self.steps.execute(ctx.lease, handle, prompt=prompt, schema=schema, workspace=ctx.workspace,
@@ -281,6 +330,12 @@ class WorkflowService:
                 await self._mark_step(ctx, handle, StepState.CANCELLED, "cancelled")
                 raise
             result = ex.result
+            if watch is not None and await self._project_changed(task.id, watch):
+                # epoch_stable != fingerprint_stable: a changing step of another task overlapped this read-only
+                # step, so neither its result nor this attempt may be reused. It is NOT a technical failure.
+                await self._mark_step(ctx, handle, StepState.CANCELLED, PROJECT_CHANGED)
+                await self._check_project_change_budget(task, step_key)
+                raise ProjectBusy("the project changed while a read-only step was running")
             if result.outcome is CliOutcome.CANCELLED:
                 await self._mark_step(ctx, handle, StepState.CANCELLED, "cancelled")
                 raise TaskCancelled("cancelled")
@@ -310,9 +365,55 @@ class WorkflowService:
                 await self.steps.complete(ctx.lease, handle, StepState.WAITING_APPROVAL, output=decision.output,
                                           snapshot_after=ex.snapshot_after, mutate=mutate)
                 return
-            await self.steps.complete(ctx.lease, handle, StepState.SUCCEEDED, output=decision.output,
-                                      snapshot_after=ex.snapshot_after, mutate=decision.mutate)
+            await self._complete_succeeded(ctx, handle, decision, ex)
             return
+
+    async def _complete_succeeded(self, ctx: RunContext, handle: StepHandle, decision: StepDecision,
+                                  ex: StepExecution) -> None:
+        """Step result + the transition it causes (possibly terminal) in one transaction, with the same optimistic
+        proof retry as task_finalizer: measure outside, verify under the project lock, roll back and re-measure on
+        FingerprintProofStale, UNMEASURED once after PROOF_MAX_ATTEMPTS."""
+        for _ in range(P.PROOF_MAX_ATTEMPTS):
+            ctx.project_proof = await self.locks.measure_for_task(handle.task_id)
+            try:
+                await self.steps.complete(ctx.lease, handle, StepState.SUCCEEDED, output=decision.output,
+                                          snapshot_after=ex.snapshot_after, mutate=decision.mutate)
+                return
+            except FingerprintProofStale:
+                log.info("fingerprint proof went stale while completing %s; measuring again", handle.step_key)
+        ctx.project_proof = UNMEASURED
+        await self.steps.complete(ctx.lease, handle, StepState.SUCCEEDED, output=decision.output,
+                                  snapshot_after=ex.snapshot_after, mutate=decision.mutate)
+
+    # --- project coordination for the steps ---------------------------------------------------------------
+    async def _reset_defer_once(self, ctx: RunContext) -> None:
+        if ctx.request_id is not None and not ctx.defer_reset:
+            ctx.defer_reset = True
+            async with self.db.transaction() as s:
+                await ExecutionRequestRepository(s).reset_defer(ctx.request_id)
+
+    async def _read_only_start(self, task: Task):
+        """(epoch) of a project at the start of a read-only step; ProjectBusy while another task is changing it."""
+        state = await self.locks.read_state(task.id)
+        if state is None:
+            return None
+        _owner, epoch, running = state
+        if running:
+            raise ProjectBusy("another task is changing the project workspace right now")
+        return epoch
+
+    async def _project_changed(self, task_id: uuid.UUID, epoch_at_start: int) -> bool:
+        state = await self.locks.read_state(task_id)
+        return state is not None and (state[1] != epoch_at_start or state[2])
+
+    async def _check_project_change_budget(self, task: Task, step_key: str) -> None:
+        async with self.db.transaction() as s:
+            fresh = await TaskRepository(s).get(task.id)
+            used = await TaskRepository(s).count_steps_with_error(
+                task.id, fresh.plan_revision, fresh.workflow_iteration, step_key, PROJECT_CHANGED)
+        if used > P.PROJECT_EPOCH_RETRIES:
+            raise PolicyViolation("PROJECT_WORKSPACE_UNSTABLE",
+                                  f"{step_key} was invalidated {used} times by changes made to the project")
 
     @staticmethod
     def _json_or_none(text: str):
@@ -525,19 +626,20 @@ class WorkflowService:
                     ApprovalType.DESIGN, req, {"decision": req["problem"]}, "STEP", STEP_PLAN))
 
             async def mutate(s, t, st):
-                await self._verdict_transition(s, t, output)
+                await self._verdict_transition(s, t, output, ctx.project_proof)
             return StepDecision(output=output, mutate=mutate)
 
         await self._agent_step(ctx, task, step_key=STEP_DESIGN_REVIEW, input_hash=input_hash, prompt=prompt,
                                schema=A.DESIGN_REVIEW_SCHEMA, mutating=False, allow_resume=True, evaluate=evaluate)
 
     async def _apply_design_verdict(self, ctx: RunContext, task: Task, output: dict) -> None:
-        async with self.db.transaction() as s:
-            locked = await TaskRepository(s).lock(task.id)
+        async def work(s: AsyncSession, locked: Task, proof) -> None:
             await self.leases.verify(s, ctx.lease)
-            await self._verdict_transition(s, locked, output)
+            await self._verdict_transition(s, locked, output, proof)
 
-    async def _verdict_transition(self, s: AsyncSession, task: Task, output: dict) -> None:
+        await self.finalizer.finalize_task_with_proof(task.id, work)
+
+    async def _verdict_transition(self, s: AsyncSession, task: Task, output: dict, proof=None) -> None:
         verdict = output["verdict"]
         if verdict == "PASS":
             await change_task_state(s, task, TaskState.DEVELOPING, reason="design_review_pass",
@@ -545,7 +647,8 @@ class WorkflowService:
         elif verdict == "NEEDS_REVISION":
             if task.replan_count >= task.limits["max_replans"]:
                 await change_task_state(s, task, TaskState.FAILED, reason="max_replans_exceeded",
-                                        failure_reason="MAX_REPLANS_EXCEEDED", event={"issues": output["issues"][:20]})
+                                        failure_reason="MAX_REPLANS_EXCEEDED", event={"issues": output["issues"][:20]},
+                                        project_proof=proof)
                 return
             await s.execute(update(Task).where(Task.id == task.id).values(
                 replan_count=Task.replan_count + 1, plan_revision=Task.plan_revision + 1))
@@ -629,6 +732,7 @@ class WorkflowService:
                 and stable_hash(prev.output) == prev.output_hash
                 and prev.output.get("requirements_hash") == task.requirements_hash
                 and prev.output.get("test_policy_hash") == task.test_policy_hash
+                and is_current_snapshot_version(prev.output.get("code_fingerprint"))     # an older schema is never reused
                 and prev.output.get("code_fingerprint") == current["code_fingerprint"]):
             await self._after_test(ctx, task, prev.output)          # identical fingerprints: reuse the result
             return
@@ -636,7 +740,7 @@ class WorkflowService:
         input_hash = stable_hash("test", task.requirements_hash, current["code_fingerprint"], task.test_policy_hash)
         change_summary = await self._latest_dev_summary(task)
         prompt = PR.tester_prompt(C.tester_context(task, plan_step.output, change_summary, policy["commands"][0]))
-        ids_before = await self.tests.collect_ids(ctx.workspace, policy)
+        ids_before = await self.tests.collect_ids(ctx.workspace, policy, workspace_root=ctx.workspace_root)
 
         async def evaluate(handle: StepHandle, ex: StepExecution, data: dict) -> StepDecision:
             try:
@@ -644,16 +748,20 @@ class WorkflowService:
             except A.ArtifactInvalid as exc:
                 raise RetryableStepFailure(str(exc)) from exc
             changed = diff_snapshots(handle.snapshot_before, ex.snapshot_after).paths()
-            non_test = [p for p in changed if not is_test_path(p)]
+            preset = (policy or {}).get("preset")
+            non_test = [p for p in changed if not is_test_path(p, preset)]
             if non_test:
                 raise PolicyViolation("TESTER_MODIFIED_NON_TEST_FILES", f"tester changed non-test files: {non_test[:5]}")
             if req is not None:
                 return StepDecision(output={"gate_request": req}, gate=GateSpec(
                     ApprovalType.DESIGN, req, {"decision": req["problem"]}, "STEP", STEP_TEST))
-            result = await self.tests.run(ctx.workspace, policy)       # authoritative: exit codes + JUnit
-            ids_after = await self.tests.collect_ids(ctx.workspace, policy)
+            async with self.db.transaction() as owner_check:           # only the write owner runs commands here
+                await self.locks.assert_owner(owner_check, task)
+            result = await self.tests.run(ctx.workspace, policy,       # authoritative: exit codes + JUnit
+                                          workspace_root=ctx.workspace_root)
+            ids_after = await self.tests.collect_ids(ctx.workspace, policy, workspace_root=ctx.workspace_root)
             baseline = await self._previous_test_ids(task) or ids_before
-            signals = compute_test_signals(baseline, ids_after, result, [p for p in changed if is_test_path(p)])
+            signals = compute_test_signals(baseline, ids_after, result, [p for p in changed if is_test_path(p, preset)])
             final = await asyncio.to_thread(take_snapshot, ctx.workspace)
             output = {"agent_summary": str(data.get("summary", "")), "test_result": result.to_dict(),
                       "test_signals": signals, "test_ids": sorted(ids_after or []),
@@ -667,33 +775,36 @@ class WorkflowService:
                                 exit_code=next((c for c in result.exit_codes if c), 0), finished_at=datetime.now(UTC),
                                 stdout_tail=result.output_tail[-4000:], runner_id=ctx.lease.runner_id,
                                 detail={"orchestrator_test_run": True, "reason": result.reason}))
-                await self._test_transition(s, t, output)
+                await self._test_transition(s, t, output, ctx.project_proof)
             return StepDecision(output=output, mutate=mutate)
 
         await self._agent_step(ctx, task, step_key=STEP_TEST, input_hash=input_hash, prompt=prompt,
                                schema=A.TEST_AGENT_SCHEMA, mutating=True, allow_resume=True, evaluate=evaluate)
 
     async def _after_test(self, ctx: RunContext, task: Task, output: dict) -> None:
-        async with self.db.transaction() as s:
-            locked = await TaskRepository(s).lock(task.id)
+        async def work(s: AsyncSession, locked: Task, proof) -> None:
             await self.leases.verify(s, ctx.lease)
-            await self._test_transition(s, locked, output)
+            await self._test_transition(s, locked, output, proof)
 
-    async def _test_transition(self, s: AsyncSession, task: Task, output: dict) -> None:
+        await self.finalizer.finalize_task_with_proof(task.id, work)
+
+    async def _test_transition(self, s: AsyncSession, task: Task, output: dict, proof=None) -> None:
         if output["test_result"]["passed"]:
             await change_task_state(s, task, TaskState.REVIEWING, reason="tests_passed")
         else:
             await self._to_retry(s, task, "tests_failed", {"reason": output["test_result"]["reason"],
-                                                          "repeated_failure": output.get("repeated_failure", False)})
+                                                          "repeated_failure": output.get("repeated_failure", False)},
+                                 proof=proof)
 
-    async def _to_retry(self, s: AsyncSession, task: Task, reason: str, event: dict, replan: bool = False) -> None:
+    async def _to_retry(self, s: AsyncSession, task: Task, reason: str, event: dict, replan: bool = False,
+                        proof=None) -> None:
         """Improvement loop: initial run + at most max_workflow_iterations improvements."""
         exhausted = ("MAX_REPLANS_EXCEEDED" if replan and task.replan_count >= task.limits["max_replans"]
                      else "MAX_ITERATIONS_EXCEEDED" if not replan
                      and task.workflow_iteration >= task.limits["max_workflow_iterations"] else None)
         if exhausted:
             await change_task_state(s, task, TaskState.FAILED, reason=exhausted.lower(), failure_reason=exhausted,
-                                    event={**event, "iterations_used": task.workflow_iteration})
+                                    event={**event, "iterations_used": task.workflow_iteration}, project_proof=proof)
             return
         if replan:
             await s.execute(update(Task).where(Task.id == task.id).values(
@@ -733,6 +844,7 @@ class WorkflowService:
         async with self.db.transaction() as s:
             test_step = await TaskRepository(s).latest_step(task.id, STEP_TEST, workflow_iteration=task.workflow_iteration)
         fresh = (test_step is not None and StepState(test_step.status) is StepState.SUCCEEDED and test_step.output
+                 and is_current_snapshot_version(test_step.output.get("code_fingerprint"))
                  and test_step.output.get("code_fingerprint") == current["code_fingerprint"]
                  and test_step.output.get("test_policy_hash") == task.test_policy_hash)
         if not fresh:   # the Reviewer only ever sees test results produced for the CURRENT code
@@ -769,24 +881,26 @@ class WorkflowService:
                     ApprovalType.DESIGN, req, {"decision": req["problem"]}, "STEP", STEP_DEVELOP))
 
             async def mutate(s, t, st):
-                await self._review_transition(s, t, output)
+                await self._review_transition(s, t, output, ctx.project_proof)
             return StepDecision(output=output, mutate=mutate)
 
         await self._agent_step(ctx, task, step_key=STEP_CODE_REVIEW, input_hash=input_hash, prompt=prompt,
                                schema=A.CODE_REVIEW_SCHEMA, mutating=False, allow_resume=True, evaluate=evaluate)
 
     async def _apply_review(self, ctx: RunContext, task: Task, output: dict) -> None:
-        async with self.db.transaction() as s:
-            locked = await TaskRepository(s).lock(task.id)
+        async def work(s: AsyncSession, locked: Task, proof) -> None:
             await self.leases.verify(s, ctx.lease)
-            await self._review_transition(s, locked, output)
+            await self._review_transition(s, locked, output, proof)
 
-    async def _review_transition(self, s: AsyncSession, task: Task, output: dict) -> None:
+        await self.finalizer.finalize_task_with_proof(task.id, work)
+
+    async def _review_transition(self, s: AsyncSession, task: Task, output: dict, proof=None) -> None:
         repo = TaskRepository(s)
         if output["verdict"] == "PASS":
             problems = await self._dod_problems(s, task, output)
             if not problems:
-                await change_task_state(s, task, TaskState.COMPLETED, reason="definition_of_done_met")
+                await change_task_state(s, task, TaskState.COMPLETED, reason="definition_of_done_met",
+                                        project_proof=proof)
                 return
             output = {**output, "verdict": "FAIL", "issues": output["issues"] + [
                 {"severity": "MAJOR", "description": f"Definition of Done: {p}"} for p in problems]}
@@ -794,7 +908,7 @@ class WorkflowService:
         await self._to_retry(s, task, "review_failed",
                              {"issues": output["issues"][:20], "tests_passed": bool(test and test.output
                                                                                     and test.output["test_result"]["passed"])},
-                             replan=bool(output.get("plan_defect")))
+                             replan=bool(output.get("plan_defect")), proof=proof)
 
     async def _dod_problems(self, s: AsyncSession, task: Task, review_out: dict) -> list[str]:
         repo = TaskRepository(s)

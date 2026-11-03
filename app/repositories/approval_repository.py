@@ -1,12 +1,14 @@
 """Approvals, decisions, design decisions, and execution requests. Repositories never commit."""
 import uuid
+from collections.abc import Collection
 from datetime import datetime, timedelta
 
-from sqlalchemy import func, select, update
+from sqlalchemy import ARRAY, any_, bindparam, exists, func, or_, select, update
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.tables import Approval, ApprovalDecision, DesignDecision, ExecutionRequest
+from app.models.tables import Approval, ApprovalDecision, DesignDecision, ExecutionRequest, Task, TaskRun
 
 
 class ApprovalRepository:
@@ -92,32 +94,83 @@ class ExecutionRequestRepository:
             select(ExecutionRequest).where(ExecutionRequest.task_id == task_id,
                                            ExecutionRequest.status.in_(("PENDING", "CLAIMED"))))).scalars().first()
 
-    async def claim_next(self, runner_id: str) -> ExecutionRequest | None:
-        """PENDING -> CLAIMED with SKIP LOCKED so a request is consumed at most once."""
-        pick = (select(ExecutionRequest.id).where(ExecutionRequest.status == "PENDING")
-                .order_by(ExecutionRequest.created_at).limit(1).with_for_update(skip_locked=True).scalar_subquery())
+    async def claim_next(self, runner_id: str, *, busy_project_ids: Collection[uuid.UUID] = ()
+                         ) -> ExecutionRequest | None:
+        """PENDING -> CLAIMED with SKIP LOCKED so a request is consumed at most once.
+
+        Deferred requests (`not_before` in the future) are skipped, not claimed. Requests of tasks that belong to a
+        project already at its concurrency cap are skipped too; tasks without a project (legacy, each with a private
+        workspace) are never excluded. An empty `busy_project_ids` adds no condition at all. A fresh `claim_token`
+        fences every later write made by this claim's coroutine."""
+        pick = (select(ExecutionRequest.id).join(Task, Task.id == ExecutionRequest.task_id)
+                .where(ExecutionRequest.status == "PENDING",
+                       or_(ExecutionRequest.not_before.is_(None), ExecutionRequest.not_before <= func.now())))
+        if busy_project_ids:
+            busy = bindparam("busy_project_ids", list(busy_project_ids), type_=ARRAY(PG_UUID(as_uuid=True)))
+            pick = pick.where(or_(Task.project_id.is_(None), ~(Task.project_id == any_(busy))))
+        pick = (pick.order_by(ExecutionRequest.created_at).limit(1)
+                .with_for_update(skip_locked=True, of=ExecutionRequest).scalar_subquery())
         result = await self.s.execute(
             update(ExecutionRequest).where(ExecutionRequest.id == pick)
-            .values(status="CLAIMED", claimed_at=func.now(), runner_id=runner_id).returning(ExecutionRequest.id))
+            .values(status="CLAIMED", claimed_at=func.now(), runner_id=runner_id, claim_token=uuid.uuid4())
+            .returning(ExecutionRequest.id))
         row = result.first()
         if row is None:
             return None
         return await self.get(row[0])
 
-    async def attach_run(self, request_id: uuid.UUID, run_id: uuid.UUID) -> None:
-        await self.s.execute(update(ExecutionRequest).where(ExecutionRequest.id == request_id)
-                             .values(task_run_id=run_id))
+    async def fence_ok(self, request_id: uuid.UUID, token: uuid.UUID | None) -> bool:
+        """True while this claim is still the current one (a requeue or re-claim changes the token)."""
+        if token is None:
+            return True                                   # a request that was never claimed through claim_next
+        found = (await self.s.execute(select(ExecutionRequest.id).where(
+            ExecutionRequest.id == request_id, ExecutionRequest.status == "CLAIMED",
+            ExecutionRequest.claim_token == token))).first()
+        return found is not None
 
-    async def finish(self, request_id: uuid.UUID, status: str, note: str | None = None) -> None:
-        await self.s.execute(update(ExecutionRequest).where(ExecutionRequest.id == request_id)
-                             .values(status=status, note=note, finished_at=func.now()))
+    async def attach_run(self, request_id: uuid.UUID, run_id: uuid.UUID, *, token: uuid.UUID | None = None,
+                         reset_defer: bool = False) -> bool:
+        stmt = update(ExecutionRequest).where(ExecutionRequest.id == request_id)
+        if token is not None:
+            stmt = stmt.where(ExecutionRequest.status == "CLAIMED", ExecutionRequest.claim_token == token)
+        values: dict = {"task_run_id": run_id}
+        if reset_defer:
+            values.update(defer_count=0, not_before=None)
+        return (await self.s.execute(stmt.values(**values))).rowcount == 1
 
-    async def requeue(self, request_id: uuid.UUID, note: str) -> None:
+    async def reset_defer(self, request_id: uuid.UUID) -> None:
         await self.s.execute(update(ExecutionRequest).where(ExecutionRequest.id == request_id)
-                             .values(status="PENDING", claimed_at=None, runner_id=None, task_run_id=None, note=note))
+                             .values(defer_count=0, not_before=None))
 
-    async def stale_claimed(self, now: datetime, timeout_seconds: int) -> list[ExecutionRequest]:
+    async def finish(self, request_id: uuid.UUID, status: str, note: str | None = None, *,
+                     token: uuid.UUID | None = None) -> bool:
+        """With a token only the current claim owner may finish; False means this coroutine was fenced out."""
+        stmt = update(ExecutionRequest).where(ExecutionRequest.id == request_id)
+        if token is not None:
+            stmt = stmt.where(ExecutionRequest.status == "CLAIMED", ExecutionRequest.claim_token == token)
+        return (await self.s.execute(stmt.values(status=status, note=note, finished_at=func.now()))).rowcount == 1
+
+    async def requeue(self, request_id: uuid.UUID, note: str, *, token: uuid.UUID | None = None,
+                      delay_seconds: float | None = None) -> bool:
+        """Back to PENDING with every claim field cleared. A `delay_seconds` is a defer: `not_before` is pushed out
+        and `defer_count` grows (it survives restarts). Without it (crash recovery) the counter is left alone."""
+        stmt = update(ExecutionRequest).where(ExecutionRequest.id == request_id)
+        if token is not None:
+            stmt = stmt.where(ExecutionRequest.status == "CLAIMED", ExecutionRequest.claim_token == token)
+        values: dict = {"status": "PENDING", "claimed_at": None, "runner_id": None, "task_run_id": None,
+                        "claim_token": None, "note": note}
+        if delay_seconds is not None:
+            values["not_before"] = func.now() + timedelta(seconds=delay_seconds)
+            values["defer_count"] = ExecutionRequest.defer_count + 1
+        return (await self.s.execute(stmt.values(**values))).rowcount == 1
+
+    async def stale_claimed(self, now: datetime, grace_seconds: int) -> list[ExecutionRequest]:
+        """CLAIMED requests past the grace period whose task has NO live lease. A live lease means the request is
+        being executed; the normal claim-to-lease window is covered by the grace period."""
+        live = exists().where(TaskRun.task_id == ExecutionRequest.task_id, TaskRun.status == "RUNNING",
+                              TaskRun.lease_expires_at > now)
         rows = await self.s.execute(
             select(ExecutionRequest).where(ExecutionRequest.status == "CLAIMED",
-                                           ExecutionRequest.claimed_at <= now - timedelta(seconds=timeout_seconds)))
+                                           ExecutionRequest.claimed_at <= now - timedelta(seconds=grace_seconds),
+                                           ~live))
         return list(rows.scalars())

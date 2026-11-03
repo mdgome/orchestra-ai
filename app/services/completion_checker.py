@@ -1,6 +1,7 @@
 """Definition of Done. Anything unclear is NOT a pass."""
 from dataclasses import dataclass
 
+from app.infra.workspace_snapshot import is_current_snapshot_version
 from app.services.artifacts import has_critical
 
 
@@ -18,6 +19,8 @@ class DoDInput:
 def check_definition_of_done(d: DoDInput) -> list[str]:
     """Returns the list of unmet conditions; empty means the task may complete."""
     problems: list[str] = []
+    if not is_current_snapshot_version(d.current_code_fingerprint):
+        problems.append("code fingerprint is missing or not of the current snapshot version")
     t = d.test_output
     if t is None:
         problems.append("tests were not run")

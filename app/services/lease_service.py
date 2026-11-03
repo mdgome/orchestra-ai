@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import Database
 from app.infra.process_control import CONFIRMED_GONE, ProcessIdentity, TerminationResult, terminate_tree
 from app.models.tables import Execution
+from app.repositories.approval_repository import ExecutionRequestRepository
 from app.repositories.task_repository import TaskRepository
 from app.validation import policies as P
 from app.validation.exceptions import LeaseLost
@@ -36,6 +37,7 @@ class AcquireStatus(StrEnum):
     ACQUIRED = "ACQUIRED"
     HELD = "HELD"            # a live (unexpired) lease, or the situation changed under us
     UNCERTAIN = "UNCERTAIN"  # expired, but the previous CLI could not be proven terminated
+    FENCED = "FENCED"        # the execution request was requeued/re-claimed: this caller no longer owns it
 
 
 @dataclass(frozen=True)
@@ -65,14 +67,30 @@ class LeaseService:
         self.ttl = ttl_seconds
         self._terminate = terminator
         self._now = clock
+        self._revoked: set[uuid.UUID] = set()      # runs this process must stop writing for (shutdown)
+
+    def revoke(self, run_id: uuid.UUID) -> None:
+        """Local, in-memory: every later verify() of this lease raises LeaseLost, so an in-flight run stops without
+        recording anything. The DB lease is left to expire, and the normal takeover path (process-tree check,
+        RECOVERY gate when unproven) decides what happens next."""
+        self._revoked.add(run_id)
 
     # --- acquire ---------------------------------------------------------------------------
-    async def acquire(self, task_id: uuid.UUID) -> AcquireResult:
+    @staticmethod
+    async def _fenced_out(s: AsyncSession, fence: tuple[uuid.UUID, uuid.UUID | None] | None) -> bool:
+        return fence is not None and not await ExecutionRequestRepository(s).fence_ok(*fence)
+
+    async def acquire(self, task_id: uuid.UUID, fence: tuple[uuid.UUID, uuid.UUID | None] | None = None
+                      ) -> AcquireResult:
+        """`fence` = (request id, claim token): checked in both transactions, so a coroutine whose claim was
+        requeued meanwhile can never obtain (or take over) a lease."""
         # Txn A
         async with self.db.transaction() as s:
             repo = TaskRepository(s)
             if await repo.lock(task_id) is None:
                 raise LookupError("task not found")
+            if await self._fenced_out(s, fence):
+                return AcquireResult(AcquireStatus.FENCED, reason="execution request claim superseded")
             now = self._now()
             current = await repo.running_run(task_id)
             if current is None:
@@ -102,6 +120,8 @@ class LeaseService:
         async with self.db.transaction() as s:
             repo = TaskRepository(s)
             await repo.lock(task_id)
+            if await self._fenced_out(s, fence):
+                return AcquireResult(AcquireStatus.FENCED, reason="execution request claim superseded")
             now = self._now()
             current = await repo.running_run(task_id)
             if current is None or (current.id, current.row_version) != seen or current.lease_expires_at > now:
@@ -117,6 +137,8 @@ class LeaseService:
     # --- ownership -------------------------------------------------------------------------
     async def verify(self, session: AsyncSession, lease: Lease) -> None:
         """Re-validate ownership inside the caller's transaction (rowcount==1 or LeaseLost)."""
+        if lease.run_id in self._revoked:
+            raise LeaseLost("lease revoked by this runner", {"run_id": str(lease.run_id)})
         if not await TaskRepository(session).heartbeat(lease.run_id, lease.runner_id, self._now(), self.ttl):
             raise LeaseLost("lease ownership lost", {"run_id": str(lease.run_id)})
 

@@ -164,3 +164,181 @@ def test_terminate_already_exited_is_confirmed_gone():
     time.sleep(0.2)
     assert ident is not None
     assert terminate_tree(ident, 1) in CONFIRMED_GONE
+
+
+# --- process-slot (semaphore) cancellation safety ------------------------------------------------------------------------
+SLEEP = ("import sys, time; s = time.time(); time.sleep(float(sys.argv[2])); "
+         "open(sys.argv[1], 'w').write(f'{s} {time.time()}')")
+
+
+def timed(tmp_path, name, seconds):
+    return CommandSpec(argv=[PY, "-c", SLEEP, str(tmp_path / name), str(seconds)], cwd=tmp_path, idle_seconds=None)
+
+
+def max_overlap(tmp_path, names) -> int:
+    """The largest number of those commands that were really running at the same time (from their own clocks)."""
+    points = []
+    for name in names:
+        start, end = (float(x) for x in (tmp_path / name).read_text().split())
+        points += [(start, 1), (end, -1)]
+    best = running = 0
+    for _t, delta in sorted(points):
+        running += delta
+        best = max(best, running)
+    return best
+
+
+async def spin(times=20):
+    for _ in range(times):
+        await asyncio.sleep(0)
+
+
+async def assert_capacity(executor, tmp_path, capacity, tag="cap"):
+    """Behavioural check: exactly `capacity` commands run concurrently afterwards (no permit lost, none invented)."""
+    names = [f"{tag}-{i}" for i in range(capacity * 2)]
+    results = await asyncio.gather(*(executor.run(timed(tmp_path, n, 0.8)) for n in names))
+    assert all(r.outcome is CliOutcome.SUCCESS for r in results)
+    assert max_overlap(tmp_path, names) == capacity
+
+
+async def test_cancelling_a_command_that_waits_for_a_slot_loses_no_permit(guard, tmp_path):
+    executor = CommandExecutor(guard, max_concurrent=2)
+    holders = [asyncio.create_task(executor.run(timed(tmp_path, f"hold-{i}", 1.0))) for i in range(2)]
+    await spin()                                                        # both slots are taken
+    waiting = asyncio.create_task(executor.run(timed(tmp_path, "never", 0.1)))
+    await spin()
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+    assert all(r.outcome is CliOutcome.SUCCESS for r in await asyncio.gather(*holders))
+    assert not (tmp_path / "never").exists()                            # it never ran
+    await assert_capacity(executor, tmp_path, 2)
+
+
+async def test_a_second_cancel_during_cleanup_is_reraised_only_after_the_permit_is_settled(guard, tmp_path, monkeypatch):
+    executor = CommandExecutor(guard, max_concurrent=1)
+    original = executor._settle                                         # already bound: saved BEFORE patching
+    entered, proceed, calls, seen = asyncio.Event(), asyncio.Event(), [], []
+
+    async def wrapper(*args, **kw):                                     # instance attribute: called without `self`
+        calls.append(1)
+        seen.extend(args)
+        entered.set()
+        await proceed.wait()
+        return await original(*args, **kw)                              # the real cleanup, exactly once
+
+    holder = asyncio.create_task(executor.run(timed(tmp_path, "hold", 1.0)))
+    await spin()                                                        # the holder owns the slot (its own acquire is done)
+    monkeypatch.setattr(executor, "_settle", wrapper)                   # patch only now: observe the WAITER's cleanup
+    waiting = asyncio.create_task(executor.run(timed(tmp_path, "never", 0.1)))
+    await spin()
+    waiting.cancel()                                                    # first cancellation: cleanup starts
+    await asyncio.wait_for(entered.wait(), 10)
+    waiting.cancel()                                                    # second cancellation: cleanup NOT finished yet
+    await spin()
+    assert not waiting.done()                                           # still cleaning up, nothing re-raised yet
+    proceed.set()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+    assert len(calls) == 1 and all(t.done() for t in seen)              # both helper tasks really ended
+    assert (await holder).outcome is CliOutcome.SUCCESS
+    monkeypatch.undo()
+    assert "_settle" not in vars(executor)                              # the patch is restored automatically
+    await assert_capacity(executor, tmp_path, 1)
+
+
+async def test_settle_can_also_be_patched_on_the_class_with_self(guard, tmp_path, monkeypatch):
+    """Same scenario through descriptor binding: the wrapper receives `self` and still calls the original once."""
+    executor = CommandExecutor(guard, max_concurrent=1)
+    original = CommandExecutor._settle
+    calls = []
+
+    async def wrapper(self, acquire, waiter):
+        calls.append(self)
+        return await original(self, acquire, waiter)
+
+    holder = asyncio.create_task(executor.run(timed(tmp_path, "hold", 0.8)))
+    await spin()
+    monkeypatch.setattr(CommandExecutor, "_settle", wrapper)
+    waiting = asyncio.create_task(executor.run(timed(tmp_path, "never", 0.1), run_key="w"))
+    await spin()
+    executor.cancel("w")
+    result = await waiting
+    assert result.outcome is CliOutcome.CANCELLED and calls == [executor]
+    assert (await holder).outcome is CliOutcome.SUCCESS
+    await assert_capacity(executor, tmp_path, 1)
+
+
+async def test_a_permit_and_a_cancel_that_complete_together_never_spawn_and_return_the_permit_once(guard, tmp_path):
+    executor = CommandExecutor(guard, max_concurrent=1)
+    await executor._slots.acquire()                                     # setup only: occupy the single slot
+    started = []
+
+    async def on_started(_identity):
+        started.append(1)
+
+    waiting = asyncio.create_task(executor.run(timed(tmp_path, "never", 0.1), run_key="w", on_started=on_started))
+    await spin()
+    executor._slots.release()                                           # the permit becomes available ...
+    executor.cancel("w")                                                # ... in the same instant as the cancellation
+    result = await waiting
+    assert result.outcome is CliOutcome.CANCELLED and result.exit_code is None and started == []
+    assert not (tmp_path / "never").exists()
+    await assert_capacity(executor, tmp_path, 1)                        # behaviour: exactly one permit exists
+
+
+async def test_repeated_cancellation_keeps_the_full_capacity(guard, tmp_path):
+    executor = CommandExecutor(guard, max_concurrent=2)
+    holders = [asyncio.create_task(executor.run(timed(tmp_path, f"hold-{i}", 1.5))) for i in range(2)]
+    await spin()
+    for round_no in range(20):
+        waiting = asyncio.create_task(executor.run(timed(tmp_path, f"never-{round_no}", 0.1), run_key=f"w{round_no}"))
+        await spin()
+        if round_no % 2:
+            waiting.cancel()                                            # external cancellation
+            with pytest.raises(asyncio.CancelledError):
+                await waiting
+        else:
+            executor.cancel(f"w{round_no}")                             # cancel event
+            assert (await waiting).outcome is CliOutcome.CANCELLED
+    assert all(r.outcome is CliOutcome.SUCCESS for r in await asyncio.gather(*holders))
+    assert not list(tmp_path.glob("never-*"))
+    assert executor._cancel_events == {}                                # nothing is left registered
+    await assert_capacity(executor, tmp_path, 2)
+
+
+@pytest.mark.parametrize("max_concurrent", [None, 1])
+async def test_a_cancel_that_is_already_pending_never_spawns(guard, tmp_path, monkeypatch, max_concurrent):
+    executor = CommandExecutor(guard, max_concurrent=max_concurrent)
+
+    class PreCancelled(dict):
+        def __setitem__(self, key, event):
+            event.set()                                                 # the cancellation is pending from the start
+            super().__setitem__(key, event)
+
+    monkeypatch.setattr(executor, "_cancel_events", PreCancelled())
+    started = []
+
+    async def on_started(_identity):
+        started.append(1)
+
+    result = await executor.run(timed(tmp_path, "never", 0.1), run_key="k", on_started=on_started)
+    assert result.outcome is CliOutcome.CANCELLED and result.exit_code is None and started == []
+    assert not (tmp_path / "never").exists() and executor._cancel_events == {}
+    monkeypatch.undo()
+    if max_concurrent:
+        await assert_capacity(executor, tmp_path, max_concurrent)
+
+
+async def test_the_normal_path_releases_each_permit_exactly_once(guard, tmp_path):
+    executor = CommandExecutor(guard, max_concurrent=1)
+    for i in range(5):
+        assert (await executor.run(timed(tmp_path, f"seq-{i}", 0.05))).outcome is CliOutcome.SUCCESS
+    await assert_capacity(executor, tmp_path, 1)                        # a double release would let two run at once
+
+
+async def test_a_failing_command_still_returns_its_permit(guard, tmp_path):
+    executor = CommandExecutor(guard, max_concurrent=1)
+    bad = await executor.run(CommandSpec(argv=[PY, "-c", "import sys; sys.exit(3)"], cwd=tmp_path))
+    assert bad.outcome is CliOutcome.ERROR
+    await assert_capacity(executor, tmp_path, 1)

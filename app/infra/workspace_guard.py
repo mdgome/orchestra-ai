@@ -12,6 +12,29 @@ def _is_link_or_junction(path: Path) -> bool:
     return bool(is_junction and is_junction())
 
 
+def resolve_project_root(path: str | os.PathLike) -> Path:
+    """Re-validates a registered project workspace before every run (it lives outside WORKSPACE_ROOT).
+
+    The path was link-free and canonical at registration; anything that changed since then fails closed."""
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        raise FailClosed("project workspace must be an absolute path", {"path": str(path)})
+    probe = candidate
+    while probe != probe.parent:
+        if probe.exists() and _is_link_or_junction(probe):
+            raise FailClosed("project workspace traverses a symlink or junction", {"path": str(path)})
+        probe = probe.parent
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise FailClosed("project workspace is missing or inaccessible", {"path": str(path)}) from exc
+    if os.path.normcase(str(resolved)) != os.path.normcase(str(candidate)):
+        raise FailClosed("project workspace no longer resolves to its registered location", {"path": str(path)})
+    if not resolved.is_dir() or not os.access(resolved, os.R_OK | os.W_OK | os.X_OK):
+        raise FailClosed("project workspace is not an accessible directory", {"path": str(path)})
+    return resolved
+
+
 class WorkspaceGuard:
     def __init__(self, root: Path):
         self.root = Path(root).resolve()

@@ -52,7 +52,7 @@ class CodexCliProvider:
             argv = self.build_argv(request, resume_id, schema_file)
             raw = await self._executor.run(
                 CommandSpec(argv=argv, cwd=request.cwd, timeout_seconds=request.timeout_seconds,
-                            stdin_text=request.prompt),
+                            stdin_text=request.prompt, workspace_root=request.workspace_root),
                 run_key=request.run_key, on_started=on_started)
         finally:
             if schema_file:

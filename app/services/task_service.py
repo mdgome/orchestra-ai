@@ -6,13 +6,15 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import func, update
 
 from app.db import Database
-from app.infra.workspace_guard import WorkspaceGuard
+from app.infra.workspace_guard import WorkspaceGuard, resolve_project_root
 from app.models.states import TERMINAL_TASK_STATES, TaskState
 from app.models.tables import Approval, Conversation, Execution, ExecutionRequest, Message, StateTransition, Task
 from app.repositories.approval_repository import ApprovalRepository, ExecutionRequestRepository
 from app.repositories.conversation_repository import ConversationRepository
+from app.repositories.project_repository import ProjectRepository
 from app.repositories.task_repository import TaskRepository
 from app.services.hashing import stable_hash
+from app.services.test_policy_resolver import resolve_test_policy
 from app.services.test_policy_service import hash_test_policy
 from app.validation import policies as P
 from app.validation import validators as V
@@ -73,11 +75,24 @@ class TaskService:
 
     # --- tasks ---------------------------------------------------------------------------------------
     async def create_task(self, *, requirements: str, conversation_id: uuid.UUID | None = None,
-                          limits: dict | None = None, test_policy: dict | None = None) -> Task:
+                          limits: dict | None = None, test_policy: dict | None = None,
+                          project_id: uuid.UUID | None = None) -> Task:
         requirements = V.validate_requirements(requirements)
         limit_values = V.validate_limits(limits)
-        policy = V.validate_test_policy(test_policy)
         async with self.db.transaction() as s:
+            project = None
+            if project_id is not None:
+                # FOR UPDATE: serialises with ARCHIVE, so a task can never be added to a project being archived
+                project = await ProjectRepository(s).lock(project_id)
+                if project is None:
+                    raise NotFound("project not found")
+                if project.status != "ACTIVE":
+                    raise Conflict("project is not ACTIVE", {"status": project.status})
+            # precedence: task policy > project policy > default; a preset is resolved to ONE runnable command now
+            # and copied into the task, so test_policy_hash describes exactly what will run.
+            project_root = resolve_project_root(project.workspace_path) if project else None
+            policy = resolve_test_policy(test_policy if test_policy is not None else
+                                         (project.test_policy if project else None), project_root)
             convs = ConversationRepository(s)
             if conversation_id is None:
                 conversation_id = (await convs.create()).id
@@ -88,9 +103,10 @@ class TaskService:
                 if conv.status != "ACTIVE":
                     raise Conflict("conversation is not ACTIVE", {"status": conv.status})
             task_id = uuid.uuid4()
-            workspace = self.guard.task_workspace(task_id)
+            # project tasks share the registered workspace (re-validated here and before every run)
+            workspace = project_root if project else self.guard.task_workspace(task_id)
             task = await TaskRepository(s).add(Task(
-                id=task_id, conversation_id=conversation_id, requirements=requirements,
+                id=task_id, conversation_id=conversation_id, project_id=project_id, requirements=requirements,
                 requirements_hash=stable_hash("requirements", requirements), status=str(TaskState.PENDING),
                 limits={k: getattr(limit_values, k) for k in P.LIMIT_BOUNDS}, test_policy=policy,
                 test_policy_hash=hash_test_policy(policy), workspace_path=str(workspace), plan_revision=0,
@@ -106,9 +122,12 @@ class TaskService:
             raise NotFound("task not found")
         return task
 
-    async def list_tasks(self, status: str | None, limit: int, offset: int) -> list[Task]:
+    async def list_tasks(self, status: str | None, limit: int, offset: int,
+                         project_id: uuid.UUID | None = None) -> list[Task]:
         async with self.db.transaction() as s:
-            return await TaskRepository(s).list(status=status, limit=limit, offset=offset)
+            if project_id is not None and await ProjectRepository(s).get(project_id) is None:
+                raise NotFound("project not found")
+            return await TaskRepository(s).list(status=status, limit=limit, offset=offset, project_id=project_id)
 
     async def update_task(self, task_id: uuid.UUID, *, requirements: str | None = None,
                           limits: dict | None = None) -> Task:

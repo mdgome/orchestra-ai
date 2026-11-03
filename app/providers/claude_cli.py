@@ -17,7 +17,8 @@ class ClaudeCliProvider:
         self._bin = binary
 
     def build_argv(self, request: ProviderRequest, resume_id: str | None = None) -> list[str]:
-        argv = [self._bin, "-p", "--output-format", "json", *claude_permission_args(request.role, request.one_off_tool)]
+        argv = [self._bin, "-p", "--output-format", "json", *claude_permission_args(request.role, request.one_off_tool,
+                                                                                  request.test_preset)]
         if request.output_schema:
             argv += ["--json-schema", json.dumps(request.output_schema, separators=(",", ":"))]
         if resume_id:
@@ -38,7 +39,7 @@ class ClaudeCliProvider:
         argv = self.build_argv(request, resume_id)
         raw = await self._executor.run(
             CommandSpec(argv=argv, cwd=request.cwd, timeout_seconds=request.timeout_seconds,
-                        stdin_text=request.prompt),
+                        stdin_text=request.prompt, workspace_root=request.workspace_root),
             run_key=request.run_key, on_started=on_started)
         # fingerprint binds the argv (tools/permissions) but not the resume id or the prompt
         fp_argv = [a for a in argv if a != resume_id]

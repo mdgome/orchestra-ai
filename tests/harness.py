@@ -14,10 +14,15 @@ from app.providers.mock import MockCall, MockProvider, ok
 from app.repositories.approval_repository import ExecutionRequestRepository
 from app.services.human_gate_service import HumanGateService
 from app.services.lease_service import LeaseService
+from app.services.project_lock_service import ProjectLockService
+from app.services.project_recovery_effect import ProjectDirtyRecoveryEffect
+from app.services.recovery_effects import RecoveryEffects
 from app.services.runner import Runner
 from app.services.session_service import SessionService
 from app.services.step_runner import StepRunner
+from app.services.task_finalizer import TaskFinalizer
 from app.services.task_service import TaskService
+from app.validation import policies as P
 from app.services.test_policy_service import TestPolicyService
 from app.services.workflow_service import WorkflowService
 
@@ -88,10 +93,14 @@ class Harness:
         self.sessions = SessionService()
         self.steps = StepRunner(db, self.leases, self.sessions, {"CLAUDE": self.claude, "CODEX": self.codex},
                                 self.events, cancel_poll_seconds=cancel_poll)
-        self.gates = HumanGateService(db)
+        self.locks = ProjectLockService(db, self.leases)
+        self.finalizer = TaskFinalizer(db, self.locks)
+        self.gates = HumanGateService(
+            db, effects=RecoveryEffects({P.RECOVERY_REASON_PROJECT_DIRTY: ProjectDirtyRecoveryEffect(self.locks)}),
+            measure=self.locks.measure_for_task)
         self.tests = TestPolicyService(CommandExecutor(self.guard))
         self.workflow = WorkflowService(db, self.leases, self.steps, self.gates, self.tests, self.guard,
-                                        self.sessions, self.events)
+                                        self.sessions, self.events, locks=self.locks, finalizer=self.finalizer)
         self.runner = Runner(db, self.leases, self.workflow, self.gates, [self.claude, self.codex],
                              advisory_key=987_654_321, claim_timeout_seconds=300, poll_seconds=0.05)
         self.tasks = TaskService(db, self.guard)
@@ -167,3 +176,11 @@ async def wait_for(predicate, timeout=5.0):
 
 __all__ = ["Harness", "PLAN", "GATE", "GOOD_CODE", "BAD_CODE", "TEST_CODE", "structured", "wait_for", "ok",
            "CliOutcome", "planner_ok", "design_pass", "developer_good", "write_tests_ok", "review_pass"]
+
+
+async def recover_for_test(runner, startup=False):
+    """Runs one recovery pass on a Runner that was never start()ed (a test-only shortcut around the lifecycle gate):
+    the same request-recovery transaction and remainder `Runner.recover` runs, taken under the lifecycle lock."""
+    async with runner._lifecycle_lock:
+        summary = await runner._recover_requests_locked(startup)
+    return await runner._recover_rest(summary)

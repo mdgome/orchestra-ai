@@ -75,6 +75,8 @@ class StepHandle:
     attempt: int
     input_hash: str
     snapshot_before: dict
+    workspace_root: Path | None = None    # trusted root of a project workspace (outside WORKSPACE_ROOT)
+    test_preset: str | None = None        # the task's test preset: selects tool permissions per role
 
 
 @dataclass
@@ -100,12 +102,15 @@ class StepRunner:
 
     # --- begin ---------------------------------------------------------------------------------
     async def begin(self, lease: Lease, task_id: uuid.UUID, step_key: str, role: str, input_hash: str,
-                    workspace: Path) -> StepHandle:
+                    workspace: Path, workspace_root: Path | None = None,
+                    on_begin: Callable[[AsyncSession, Task], Awaitable[None]] | None = None) -> StepHandle:
         snapshot = await asyncio.to_thread(take_snapshot, workspace)
         async with self.db.transaction() as s:
             task = await TaskRepository(s).lock(task_id)
             await self.leases.verify(s, lease)
             await self._preconditions(s, task)
+            if on_begin:
+                await on_begin(s, task)      # e.g. verify the project write lock and start a new write generation
             repo = TaskRepository(s)
             attempt = await repo.max_attempt(task.id, task.plan_revision, task.workflow_iteration, step_key) + 1
             failed = await repo.failed_attempts(task.id, task.plan_revision, task.workflow_iteration, step_key)
@@ -118,7 +123,8 @@ class StepRunner:
                 status=str(StepState.RUNNING), input_hash=input_hash, snapshot_before=snapshot,
                 started_at=self._now()))
             handle = StepHandle(step.id, task.id, step_key, role, task.plan_revision, task.workflow_iteration,
-                                attempt, input_hash, snapshot)
+                                attempt, input_hash, snapshot, workspace_root,
+                                (task.test_policy or {}).get("preset"))
         self.events.publish(task_id, {"event": "step.started", "step": step_key, "attempt": attempt})
         return handle
 
@@ -144,7 +150,8 @@ class StepRunner:
         while True:
             prepared, execution_id = await self._record_start(lease, handle, before_spawn, allow_resume and not replaced_once)
             request = ProviderRequest(role=handle.role, prompt=prompt, cwd=workspace, timeout_seconds=timeout,
-                                      output_schema=schema, run_key=run_key, one_off_tool=one_off_tool)
+                                      output_schema=schema, run_key=run_key, one_off_tool=one_off_tool,
+                                      workspace_root=handle.workspace_root, test_preset=handle.test_preset)
 
             async def on_started(identity: ProcessIdentity | None, _eid=execution_id) -> None:
                 if identity is not None:
@@ -162,13 +169,18 @@ class StepRunner:
             finally:
                 watcher.cancel()
             elapsed = time.monotonic() - started
-            snapshot_after = await asyncio.to_thread(take_snapshot, workspace)
+            # The CLI result and the evidence that the process ended are recorded BEFORE anything that can fail
+            # (a snapshot). LeaseLost -> discarded_result, an unconfirmed termination -> TerminationUnconfirmed: both
+            # surface here, so a later SnapshotError can never overwrite or hide them, and no Execution is left
+            # STARTING / unfinished because a snapshot failed.
             action = await self._record_finish(lease, handle, execution_id, prepared, result, elapsed)
             if result.outcome is CliOutcome.SESSION_MISSING and prepared.resume_id and not replaced_once:
                 replaced_once = True       # explicit evidence that nothing ran: start a fresh native session
-                continue
+                continue                   # (this execution's result is already recorded; no snapshot is needed)
             self.events.publish(handle.task_id, {"event": "execution.finished", "step": handle.step_key,
                                                  "outcome": str(result.outcome)})
+            # SnapshotError propagates: the step is not SUCCEEDED / reusable and the task fails closed.
+            snapshot_after = await asyncio.to_thread(take_snapshot, workspace)
             return StepExecution(result, execution_id, snapshot_after, action)
 
     async def _watch_cancel(self, task_id: uuid.UUID, provider: CliProvider, run_key: str) -> None:

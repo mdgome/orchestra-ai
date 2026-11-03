@@ -24,10 +24,13 @@ class TaskRepository:
         """SELECT ... FOR UPDATE: the serialisation point for lease acquisition and state changes."""
         return (await self.s.execute(select(Task).where(Task.id == task_id).with_for_update())).scalar_one_or_none()
 
-    async def list(self, *, status: str | None = None, limit: int = 50, offset: int = 0) -> list[Task]:
+    async def list(self, *, status: str | None = None, limit: int = 50, offset: int = 0,
+                   project_id: uuid.UUID | None = None) -> list[Task]:
         stmt = select(Task).order_by(Task.created_at.desc()).limit(limit).offset(offset)
         if status:
             stmt = stmt.where(Task.status == status)
+        if project_id is not None:
+            stmt = stmt.where(Task.project_id == project_id)
         return list((await self.s.execute(stmt)).scalars())
 
     async def tasks_in_states(self, states: tuple[str, ...]) -> list[Task]:
@@ -118,6 +121,14 @@ class TaskRepository:
                 TaskStep.task_id == task_id, TaskStep.plan_revision == plan_revision,
                 TaskStep.workflow_iteration == workflow_iteration, TaskStep.step_key == step_key,
                 TaskStep.status.in_(("FAILED", "INTERRUPTED", "NEEDS_MANUAL_RECOVERY"))))).scalar() or 0
+
+    async def count_steps_with_error(self, task_id: uuid.UUID, plan_revision: int, workflow_iteration: int,
+                                     step_key: str, error: str) -> int:
+        return (await self.s.execute(
+            select(func.count()).select_from(TaskStep).where(
+                TaskStep.task_id == task_id, TaskStep.plan_revision == plan_revision,
+                TaskStep.workflow_iteration == workflow_iteration, TaskStep.step_key == step_key,
+                TaskStep.error == error))).scalar() or 0
 
     # --- executions ------------------------------------------------------------------------
     async def add_execution(self, execution: Execution) -> Execution:

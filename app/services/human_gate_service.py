@@ -17,6 +17,7 @@ from app.repositories.approval_repository import ApprovalRepository, ExecutionRe
 from app.repositories.task_repository import TaskRepository
 from app.services.fingerprints import current_basis
 from app.services.hashing import stable_hash
+from app.services.recovery_effects import EffectRetry, RecoveryEffects
 from app.services.state_service import change_step_state, change_task_state
 from app.validation import policies as P
 from app.validation import validators as V
@@ -33,6 +34,10 @@ class IdempotencyConflict(Conflict):
     code = "IDEMPOTENCY_KEY_CONFLICT"
 
 
+class ProofUnstable(Conflict):
+    code = "PROJECT_FINGERPRINT_UNSTABLE"
+
+
 @dataclass(frozen=True)
 class DecisionOutcome:
     decision: ApprovalDecision
@@ -44,9 +49,14 @@ def request_fingerprint(decision: str, selected_option: str | None) -> str:
 
 
 class HumanGateService:
-    def __init__(self, db: Database, clock=lambda: datetime.now(UTC)):
+    def __init__(self, db: Database, clock=lambda: datetime.now(UTC), effects: RecoveryEffects | None = None,
+                 measure=None):
+        """`effects`: recovery kinds with their own effect (looked up by the stable reason_code).
+        `measure`: async task_id -> fingerprint proof (or None); used before a decision that may end the task."""
         self.db = db
         self._now = clock
+        self.effects = effects
+        self._measure = measure
 
     # --- opening gates (always inside the caller's transaction) -----------------------------
     async def open_gate(self, session: AsyncSession, task: Task, step: TaskStep | None, *, type_: ApprovalType,
@@ -70,26 +80,65 @@ class HumanGateService:
         return approval
 
     async def open_recovery(self, session: AsyncSession, task: Task, step: TaskStep | None, *, reason: str,
-                            checkpoint_step_key: str, detail: dict | None = None) -> Approval:
+                            checkpoint_step_key: str, detail: dict | None = None,
+                            reason_code: str = P.RECOVERY_REASON_EXECUTION_UNCERTAIN,
+                            options: tuple[str, ...] = RECOVERY_OPTIONS, target_extra: dict | None = None) -> Approval:
         """Task=WAITING_APPROVAL + Approval(RECOVERY) + Step=NEEDS_MANUAL_RECOVERY in ONE transaction.
-        No separate recovery state machine: only existing states are used."""
+        No separate recovery state machine: only existing states are used.
+
+        `reason_code` is the stable kind of recovery (stored in request_payload AND target); it, never the message
+        text, selects the effect. `step` may be None (a gate opened before any step attempt exists)."""
         if step is not None:
             if StepState(step.status) is StepState.RUNNING:
                 await change_step_state(session, step, StepState.INTERRUPTED)
             if StepState(step.status) is StepState.INTERRUPTED:
                 await change_step_state(session, step, StepState.NEEDS_MANUAL_RECOVERY, error=reason)
-        payload = {"problem": reason, "options": [{"id": o} for o in RECOVERY_OPTIONS],
+        payload = {"problem": reason, "reason_code": reason_code, "options": [{"id": o} for o in options],
                    "recommendation": "abort", "detail": detail or {}}
+        target = {"reason": reason, "reason_code": reason_code, "step_id": str(step.id) if step else None,
+                  "resume_step_key": checkpoint_step_key, **(target_extra or {})}
         return await self.open_gate(
             session, task, step, type_=ApprovalType.RECOVERY, checkpoint_step_key=checkpoint_step_key,
-            request_payload=payload, target={"reason": reason, "step_id": str(step.id) if step else None},
-            scope="STEP")
+            request_payload=payload, target=target, scope="STEP")
 
     # --- decisions --------------------------------------------------------------------------
     async def decide(self, approval_id: uuid.UUID, *, decision: str, selected_option: str | None,
                      rationale: str | None, idempotency_key: str | None) -> DecisionOutcome:
         V.validate_decision(decision, idempotency_key, selected_option)
         fp = request_fingerprint(decision, selected_option)
+        # Optimistic retry: anything that needs the workspace measured is measured OUTSIDE the transaction. If the
+        # proof is stale when it is checked under the project lock, the whole transaction rolled back (no decision,
+        # no status change, no RESUME request was committed) and the decision is retried as ONE logical decision
+        # (same idempotency key) with a fresh measurement.
+        for _ in range(P.PROOF_MAX_ATTEMPTS):
+            prepared = await self._prepare(approval_id, decision, selected_option)
+            try:
+                return await self._decide_once(approval_id, decision, selected_option, rationale, idempotency_key,
+                                               fp, prepared)
+            except EffectRetry:
+                continue
+        raise ProofUnstable("the project workspace kept changing while the decision was being applied; nothing was "
+                            "recorded, please retry")
+
+    async def _prepare(self, approval_id: uuid.UUID, decision: str, option: str | None):
+        async with self.db.transaction() as s:
+            approval = await ApprovalRepository(s).get(approval_id)
+        if approval is None:
+            return None
+        effect = self._effect_for(approval)
+        if effect is not None:
+            return await effect.prepare(approval, decision, option)
+        ends_task = decision != "APPROVED" or (approval.type == str(ApprovalType.RECOVERY) and option == "abort")
+        if ends_task and self._measure is not None:
+            return await self._measure(approval.task_id)       # proof for a possible terminal transition
+        return None
+
+    def _effect_for(self, approval: Approval):
+        if self.effects is None or approval.type != str(ApprovalType.RECOVERY):
+            return None
+        return self.effects.get((approval.target or {}).get("reason_code"))
+
+    async def _decide_once(self, approval_id, decision, selected_option, rationale, idempotency_key, fp, prepared):
         async with self.db.transaction() as s:
             repo = ApprovalRepository(s)
             approval = await repo.lock(approval_id)                     # (1) serialise concurrent decisions
@@ -120,15 +169,22 @@ class HumanGateService:
             if not await repo.insert_decision_if_absent(row):
                 raise Conflict("approval was decided concurrently")
             await repo.mark_decided(approval_id)
-            await self._apply(s, repo, approval, task, row)             # (4) effects, same transaction
+            await self._apply(s, repo, approval, task, row, prepared)   # (4) effects, same transaction
             stored = await repo.get_decision(approval_id)
             return DecisionOutcome(stored, created=True)
 
     async def _apply(self, s: AsyncSession, repo: ApprovalRepository, approval: Approval, task: Task,
-                     decision: ApprovalDecision) -> None:
+                     decision: ApprovalDecision, prepared=None) -> None:
         approved = decision.decision == "APPROVED"
         type_ = ApprovalType(approval.type)
         resume = approved
+        effect = self._effect_for(approval)
+        if effect is not None:
+            result = await effect.apply(s, repo, approval, task, decision, prepared)
+            if result.resume:
+                await ExecutionRequestRepository(s).add(ExecutionRequest(
+                    id=uuid.uuid4(), task_id=task.id, kind="RESUME", status="PENDING", approval_id=approval.id))
+            return
         if type_ is ApprovalType.DESIGN:
             summary = f"{decision.decision}: {decision.selected_option or '-'}: {decision.rationale or ''}"
             await repo.add_design_decision(task.id, approval.id, summary)
@@ -140,14 +196,14 @@ class HumanGateService:
             resume = approved and decision.selected_option in ("continue", "retry")
             if approved and decision.selected_option == "abort":
                 await change_task_state(s, task, TaskState.FAILED, reason="recovery_aborted",
-                                        failure_reason="RECOVERY_ABORTED")
+                                        failure_reason="RECOVERY_ABORTED", project_proof=prepared)
                 return
         elif type_ is ApprovalType.PERMISSION:
             if approved and not approval.target.get("enforceable", False):
                 return           # the CLI cannot enforce a one-off grant: hold, never widen permissions
         if not resume:
             await change_task_state(s, task, TaskState.FAILED, reason=f"{approval.type.lower()}_rejected",
-                                    failure_reason=f"{approval.type}_REJECTED")
+                                    failure_reason=f"{approval.type}_REJECTED", project_proof=prepared)
             return
         # Approval decision and the RESUME request are one transaction; approval_id is UNIQUE.
         await ExecutionRequestRepository(s).add(ExecutionRequest(

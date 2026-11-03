@@ -47,10 +47,40 @@ class Message(Base):
     __table_args__ = (CheckConstraint("role IN ('USER','SYSTEM')", name="ck_messages_role"),)
 
 
+class Project(Base):
+    """A registered workspace that groups tasks. Owns the write lock and the workspace baselines."""
+    __tablename__ = "projects"
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    workspace_path: Mapped[str] = mapped_column(Text, nullable=False)
+    workspace_key: Mapped[str] = mapped_column(Text, nullable=False)     # realpath + normcase, unique
+    repository_url: Mapped[str | None] = mapped_column(Text)            # credentials stripped
+    status: Mapped[str] = mapped_column(String(16), default="ACTIVE", server_default="ACTIVE", nullable=False)
+    test_policy: Mapped[dict | None] = mapped_column(JSONB)
+    write_owner_task_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tasks.id", name="fk_projects_write_owner_task_id", use_alter=True))
+    write_epoch: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0", nullable=False)
+    baseline_fingerprint: Mapped[str | None] = mapped_column(Text)
+    write_baseline_fingerprint: Mapped[str | None] = mapped_column(Text)
+    workspace_state: Mapped[str] = mapped_column(String(24), default="CLEAN", server_default="CLEAN", nullable=False)
+    row_version: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0", nullable=False)
+    created_at: Mapped[datetime] = _now()
+    updated_at: Mapped[datetime] = _now()
+    __table_args__ = (
+        CheckConstraint("status IN ('ACTIVE','ARCHIVED')", name="ck_projects_status"),
+        CheckConstraint("workspace_state IN ('CLEAN','DIRTY_UNRESOLVED')", name="ck_projects_workspace_state"),
+        CheckConstraint("(write_owner_task_id IS NULL) = (write_baseline_fingerprint IS NULL)",
+                        name="ck_projects_write_owner_baseline"),
+        UniqueConstraint("workspace_key", name="uq_projects_workspace_key"),
+    )
+
+
 class Task(Base):
     __tablename__ = "tasks"
     id: Mapped[uuid.UUID] = _uuid_pk()
     conversation_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("conversations.id"), nullable=False, index=True)
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", name="fk_tasks_project_id", ondelete="RESTRICT"), index=True)
     requirements: Mapped[str] = mapped_column(Text, nullable=False)
     requirements_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(24), default="PENDING", nullable=False)
@@ -174,6 +204,9 @@ class Approval(Base):
     __table_args__ = (
         CheckConstraint("type IN ('DESIGN','RECOVERY','PERMISSION')", name="ck_approvals_type"),
         CheckConstraint("status IN ('PENDING','DECIDED')", name="ck_approvals_status"),
+        # At most one pending PROJECT_DIRTY recovery gate per task (back-stop for the row-lock check).
+        Index("uq_approvals_project_dirty_pending", "task_id", unique=True,
+              postgresql_where=text("status = 'PENDING' AND (target ->> 'reason_code') = 'PROJECT_DIRTY'")),
     )
 
 
@@ -214,6 +247,9 @@ class ExecutionRequest(Base):
     task_run_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("task_runs.id"))
     approval_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("approvals.id"), unique=True)
     note: Mapped[str | None] = mapped_column(String(128))
+    claim_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))    # fences a stale coroutine
+    not_before: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))  # persistent backoff
+    defer_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     created_at: Mapped[datetime] = _now()
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__ = (
