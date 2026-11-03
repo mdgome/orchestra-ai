@@ -163,4 +163,3 @@ class ProjectService:
                 await repo.update_fields(project_id, **values)
                 await s.refresh(project)
             return project
-

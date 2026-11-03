@@ -339,4 +339,3 @@ def test_the_preset_reaches_the_claude_command_line(preset):
     assert "Edit(src/test/**)" in allowed and "python -m pytest" not in allowed
     default = provider.build_argv(ProviderRequest(role="TESTER", prompt="p", cwd=Path(".")), None)
     assert "Edit(tests/**)" in default[default.index("--allowedTools") + 1]
-
