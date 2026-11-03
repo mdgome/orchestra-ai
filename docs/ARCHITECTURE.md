@@ -64,6 +64,29 @@ PostgreSQL is the only source of truth: `conversations` (metadata only) and `age
 never written to logs/audit events (events carry an irreversible `sess:xxxxxxxx` tag). A session is invalidated
 only when the CLI explicitly reports it does not exist; timeouts and transient errors never invalidate one.
 
+## Projects, parallel execution and the write lock
+
+* `projects` sit above tasks (`tasks.project_id`; existing tasks keep `NULL` and behave exactly as before). A project
+  workspace may be any absolute path outside `WORKSPACE_ROOT`. It is validated at registration and **before every
+  run** (absolute, no symlink/junction in the chain, accessible), and system paths, orchestrator paths and
+  duplicate/nested projects are rejected.
+* The `Runner` runs tasks in parallel inside ONE process. A free slot is checked before claiming; each claim carries a
+  `claim_token` that fences a stale coroutine; backoff is persisted (`execution_requests.defer_count/not_before`). The
+  global advisory lock remains the "one Runner process" guard.
+* Changing steps (Developer, Tester) and Code Review of a project run only for the task that owns
+  `projects.write_owner_task_id`. Order: `claim -> task lease -> project gate -> step attempt -> CLI`. At a terminal
+  transition `project_terminal.release_on_terminal` clears the lock and write baseline in the SAME transaction, and
+  `workspace_state` is `CLEAN` or `DIRTY_UNRESOLVED` (never `CLEAN` when it cannot be proven). The only way out of
+  `DIRTY_UNRESOLVED` is `continue` on the `PROJECT_DIRTY` RECOVERY gate.
+* Anything that needs the workspace measured measures a `FingerprintProof` (`WORKSPACE_FINGERPRINT_V1`) outside the
+  transaction, then verifies owner and `write_epoch` under the project row lock in a short transaction. A stale proof
+  rolls everything back and is measured again (max 3), then the `UNMEASURED` path runs once. No fingerprint is ever
+  computed while a row lock is held.
+* Test policy presets (pytest / Maven / Gradle) are resolved to ONE command when a task is created and copied into the
+  task. Result files are never deleted; only files created or changed by the current run count. Test processes never
+  receive the CLI authentication variables.
+* Details, diagrams and invariants: `docs/workflow/` (03, 07, 08, 09, 10, 11).
+
 ## Decision log
 
 | Decision | Why |
@@ -91,4 +114,9 @@ CLIs, `--help` support for every flag used, Plan Mode and `-s read-only` refusin
 * Claude path rules such as `Edit(tests/**)` are not relied upon: the Orchestrator re-checks the Tester's changes.
 * Process termination on Windows is verified for tree kill and identity mismatch in unit tests; behaviour under
   `ACCESS_DENIED` is simulated, not reproduced.
-* No load testing; one Runner only.
+* No load testing; one Runner (coordinator) process only, parallelism is per task inside it.
+* External edits to a project workspace while one of its tasks is active are not supported and are not fully
+  detectable (`write_epoch` only counts orchestrator-controlled changes).
+* Real Maven/Gradle builds were **not run** (no JDK/Maven/Gradle here); JUnit parsing, wrapper resolution,
+  permissions and environment rules are unit-tested. File symlink tests are skipped where the account cannot create
+  symlinks. Cloning a private repository that needs credentials is not verified.

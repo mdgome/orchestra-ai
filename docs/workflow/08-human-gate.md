@@ -4,7 +4,12 @@
 
 `approvals.type`은 `DESIGN`, `PERMISSION`, `RECOVERY` 세 가지이며 서로의 효력을 갖지 않습니다. 특히 DESIGN 승인은 CLI 권한을 확대하지 않습니다.
 
-이 문서는 네 개의 다이어그램으로 구성됩니다. 1번은 세 유형이 공유하는 Gate 진입과 Decision API 처리이고, 2~4번은 공통 Decision API를 통과한 뒤 수행되는 유형별 처리입니다. 중심 클래스는 `HumanGateService`(`open_gate`, `open_recovery`, `decide`, `_apply`)입니다.
+RECOVERY는 안정적인 `reason_code`(`request_payload`와 `target`에 모두 저장)로 종류를 구분합니다. 메시지 문자열로 판별하지 않습니다.
+
+- `EXECUTION_UNCERTAIN`(기본값, `reason_code`가 없는 기존 Approval 포함): CLI 종료·Workspace 변경 안전성 불확실. 옵션 `continue`/`retry`/`abort`.
+- `PROJECT_DIRTY`: 이전 Task가 남긴 미해결 변경이 있는 Project에서 새 Task가 write lock을 요청. 옵션 `continue`/`abort`(`retry` 없음). 아래 5번 절.
+
+이 문서는 다섯 개의 다이어그램으로 구성됩니다. 1번은 세 유형이 공유하는 Gate 진입과 Decision API 처리이고, 2~5번은 공통 Decision API를 통과한 뒤 수행되는 유형별 처리입니다. 중심 클래스는 `HumanGateService`(`open_gate`, `open_recovery`, `decide`, `_apply`)입니다. Recovery 종류별 효과는 `HumanGateService`가 아니라 주입된 `RecoveryEffects`(`reason_code → effect`)가 담당하며, `HumanGateService`는 Project 모듈을 import하지 않습니다.
 
 ## 1. 공통: Gate 진입 및 결정 저장
 
@@ -66,6 +71,8 @@ flowchart TD
 | stale basis | 409 (`STALE_BASIS`) |
 
 기존 결정과의 비교가 만료·stale 검사보다 먼저 수행되므로 이미 저장된 결정에 대한 재요청은 만료 뒤에도 200으로 응답합니다.
+
+`HumanGateService.decide`는 Workspace 측정이 필요한 결정(PROJECT_DIRTY `continue`, 그리고 Task를 종료시킬 수 있는 거절·`abort`)에 한해 **트랜잭션 밖에서 먼저 fingerprint proof를 측정**하고 짧은 결정 트랜잭션에서 검증합니다. proof가 오래되었으면(`EffectRetry`) 결정 트랜잭션 전체가 롤백되어 `ApprovalDecision`, Approval `DECIDED`, RESUME 요청이 하나도 커밋되지 않은 채 다시 측정해 재시도합니다(최대 3회, 같은 Idempotency-Key의 하나의 논리 결정). 3회 모두 실패하면 409 `PROJECT_FINGERPRINT_UNSTABLE`이고 아무 것도 기록하지 않습니다.
 
 ## 2. DESIGN Gate
 
@@ -188,13 +195,49 @@ flowchart TD
 - 재개 시 안전성은 다시 검증됩니다. 미종료 Execution이 남아 있으면 승인 후에도 신규 실행을 차단하고 새 RECOVERY Gate를 만듭니다.
 - Recovery 진입 경로별로 Run/Lease 처리가 다릅니다 ([09](09-recovery.md)).
 
+## 5. RECOVERY Gate - PROJECT_DIRTY
+
+프로젝트 Task가 변경 Step을 시작하려는데 `projects.workspace_state`가 `DIRTY_UNRESOLVED`일 때 열립니다. Step attempt가 만들어지기 **전**(`ProjectLockService.ensure_for_step`)에 열리므로 `step_id`는 없고, `checkpoint_step_key`·`resume_step_key`에 시작하려던 Step(예: `DEVELOP`)이 남습니다. Gate 대기는 `step_attempt`, `cli_invocations`, `workflow_iteration`을 소모하지 않습니다.
+
+```mermaid
+flowchart TD
+    subgraph OPEN["Gate 진입 - Step attempt 생성 전"]
+        direction TB
+        A["ProjectLockService.ensure_for_step - workspace_state 가 DIRTY_UNRESOLVED"] --> B["HumanGateService.open_recovery - reason_code PROJECT_DIRTY - 옵션 continue 와 abort"]
+        B --> C["한 트랜잭션: Approval 생성 + Task WAITING_APPROVAL + Lease 반환 - target 에 project_id 와 dirty_epoch"]
+    end
+
+    subgraph DECIDE["결정 - decide 가 측정 후 재시도 가능한 단일 트랜잭션"]
+        direction TB
+        D{"결정"}
+        D -->|"승인 이고 continue"| E["ProjectDirtyRecoveryEffect.apply - proof 검증 후 현재 상태를 baseline_fingerprint 로 수용 + workspace_state CLEAN"]
+        D -->|"승인 이고 abort 또는 거절"| F["change_task_state FAILED - 공통 terminal 정리 - 파일은 건드리지 않음"]
+    end
+
+    subgraph OUTCOME["결과"]
+        direction TB
+        R["RESUME 요청 생성 - 아직 시작되지 않은 변경 Step 을 새 attempt 로 시작"]
+        X(["Task FAILED - PROJECT_DIRTY_ABORTED 또는 PROJECT_DIRTY_REJECTED - Project 는 DIRTY_UNRESOLVED 유지"])
+    end
+
+    C --> D
+    E --> R
+    F --> X
+```
+
+- 같은 Task에는 PENDING `PROJECT_DIRTY` Approval이 하나만 존재합니다(Task 행 잠금 아래 사전 조회 + 부분 unique index `uq_approvals_project_dirty_pending`).
+- `continue`는 현재 Workspace를 새 baseline으로 받아들일 뿐입니다. 이미 다른 결정으로 Project가 `CLEAN`이 되었다면 baseline을 건드리지 않고 재개만 합니다. gate 이후 `dirty_epoch`가 달라졌으면 409 `STALE_PROJECT_GATE`입니다.
+- `abort`와 거절은 Project 파일을 `reset`/`clean`/`checkout`/삭제하지 않습니다. 이 Task는 `FAILED`가 되고 Project는 계속 `DIRTY_UNRESOLVED`이므로, 해결 경로는 이 Gate의 `continue`뿐입니다(`PATCH /projects/{id}`로는 해제할 수 없습니다).
+- `EXECUTION_UNCERTAIN`과 효과가 다릅니다. 후자의 `retry`는 `_recovery_unsafe`로 Workspace 변화를 재검증하지만, `PROJECT_DIRTY`에는 `retry` 옵션이 없고 `continue`는 baseline 수용만 수행합니다.
+
 ## 유형별 결정 결과 비교
 
 | 유형 | 승인 | 거절 | 비고 |
 |---|---|---|---|
 | DESIGN | 결정 저장 + RESUME | 결정 저장 + RESUME (FAILED 아님) | checkpoint 단계부터 재개 |
 | PERMISSION | `enforceable`이면 RESUME, 아니면 결정만 저장하고 `WAITING_APPROVAL` 잔류 | Task FAILED (`PERMISSION_REJECTED`) | 승인은 1회 소진 |
-| RECOVERY | `continue`/`retry`는 RESUME 후 `_recovery_unsafe`, `abort`는 FAILED (`RECOVERY_ABORTED`) | Task FAILED (`recovery_rejected`) | 재개 전 안전성 재검증 |
+| RECOVERY (`EXECUTION_UNCERTAIN`) | `continue`/`retry`는 RESUME 후 `_recovery_unsafe`, `abort`는 FAILED (`RECOVERY_ABORTED`) | Task FAILED (`recovery_rejected`) | 재개 전 안전성 재검증 |
+| RECOVERY (`PROJECT_DIRTY`) | `continue`는 baseline 수용 + RESUME, `abort`는 FAILED (`PROJECT_DIRTY_ABORTED`) | Task FAILED (`PROJECT_DIRTY_REJECTED`) | `retry` 옵션 없음, 파일 무변경 |
 
 ## 현재 구현 제한
 

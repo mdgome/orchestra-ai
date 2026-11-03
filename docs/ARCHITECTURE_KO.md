@@ -67,6 +67,26 @@ PostgreSQL이 유일한 Source of Truth입니다. `conversations`에는 메타�
 CLI가 세션이 존재하지 않는다고 명시적으로 보고한 경우에만 Session을 무효화합니다. Timeout과 일시적 오류는 Session을
 무효화하지 않습니다.
 
+## Project, 병렬 실행 및 write lock
+
+* `projects`는 Task보다 상위의 실행 단위입니다(`tasks.project_id`, 기존 Task는 `NULL`로 그대로 동작). Project Workspace는
+  `WORKSPACE_ROOT` 밖의 임의 절대 경로일 수 있으며, 등록과 **매 실행 전**에 절대 경로·symlink/junction 부재·접근
+  권한을 검증하고 시스템 경로, 오케스트레이터 경로, 다른 Project와의 중복·중첩을 거부합니다.
+* `Runner`는 한 프로세스에서 Task를 병렬 실행합니다. 슬롯을 먼저 확인한 뒤 claim하고, claim마다 `claim_token`을 발급해
+  뒤늦은 이전 coroutine을 fence합니다. 지연(backoff)은 `execution_requests.defer_count/not_before`로 영속화됩니다.
+  전역 advisory lock은 Runner 프로세스 단일화 용도로 유지합니다.
+* 같은 Project의 변경 Step(Developer, Tester)과 Code Review는 `projects.write_owner_task_id`를 가진 Task 하나만
+  실행합니다. 순서는 `claim → Task Lease → Project gate → Step attempt → CLI`이며 terminal 전이와 같은 트랜잭션에서
+  `project_terminal.release_on_terminal`이 lock과 write baseline을 정리합니다. `workspace_state`는 `CLEAN` 또는
+  `DIRTY_UNRESOLVED`이고, 증명할 수 없으면 절대 `CLEAN`이 되지 않습니다. 해결 경로는 `PROJECT_DIRTY` RECOVERY Gate의
+  `continue`입니다.
+* 측정이 필요한 전이는 트랜잭션 밖에서 `FingerprintProof`(`WORKSPACE_FINGERPRINT_V1`)를 측정하고, 짧은 트랜잭션에서
+  Project 행 잠금 아래 owner·`write_epoch`를 검증합니다. stale이면 롤백 후 재측정(최대 3회), 이후 `UNMEASURED` 종료입니다.
+  행 잠금을 잡은 채 fingerprint를 계산하지 않습니다.
+* Test Policy preset(pytest/Maven/Gradle)은 Task 생성 시 하나의 명령으로 해석되어 Task에 복사됩니다. 결과 파일은 삭제하지
+  않고 이번 실행에서 새로 생기거나 바뀐 파일만 사용하며, 테스트 프로세스에는 CLI 인증 변수가 전달되지 않습니다.
+* 상세한 흐름·Mermaid·불변 조건은 `docs/workflow/`(특히 03, 07, 08, 09, 10, 11)에 있습니다.
+
 ## 의사결정 기록
 
 | 결정 | 이유 |
@@ -94,4 +114,8 @@ CLI가 세션이 존재하지 않는다고 명시적으로 보고한 경우에�
 * `Edit(tests/**)`와 같은 Claude 경로 규칙에 의존하지 않습니다. Orchestrator가 Tester의 변경사항을 다시 검사합니다.
 * Windows의 프로세스 종료는 단위 테스트에서 프로세스 트리 종료와 신원 불일치를 검증했습니다. `ACCESS_DENIED` 동작은
   실제 재현이 아니라 시뮬레이션으로 검증했습니다.
-* 부하 테스트는 수행하지 않았으며 단일 Runner만 지원합니다.
+* 부하 테스트는 수행하지 않았으며 Runner(Coordinator) 프로세스는 하나만 지원합니다(병렬성은 한 프로세스 안의 Task 단위).
+* 활성 Project Task가 있는 동안의 외부 프로세스 수정은 지원하지 않으며 fingerprint로도 완전 탐지되지 않습니다.
+* Maven·Gradle 실제 빌드는 이 환경에 JDK/Maven/Gradle이 없어 **실행하지 못했습니다**(JUnit 해석, wrapper 해석, 권한,
+  환경 규칙은 단위 테스트로 검증). Windows에서 파일 symlink를 만들 수 없는 계정에서는 해당 테스트가 skip됩니다.
+* 인증이 필요한 private 저장소 clone은 검증하지 않았습니다(clone 보상과 자격 증명 마스킹은 Fake executor로 검증).

@@ -24,7 +24,7 @@ flowchart TD
 
     subgraph IDLE["Idle 또는 WAITING_APPROVAL 경로"]
         direction TB
-        I["Runner._cancel_idle_tasks"] --> J{"실행 중 Run 없음 및 미종료 Execution 없음?"}
+        I["Runner._cancel_idle_tasks - 매 loop 반복, 실행 슬롯과 무관"] --> J{"실행 중 Run 없음 및 미종료 Execution 없음?"}
     end
 
     subgraph CONFIRM["종료 확인"]
@@ -36,7 +36,7 @@ flowchart TD
         direction TB
         G["Step CANCELLED 및 Task CANCELLED 및 Session CLOSED 및 Lease 반환"]
         H["RECOVERY Gate - CANCELLED 로 전이하지 않음"]
-        K["대기 요청 DONE 및 Session CLOSED 및 Step CANCELLED 및 Task CANCELLED"]
+        K["대기 요청 DONE 및 Session CLOSED 및 Step CANCELLED 및 Task CANCELLED - 같은 트랜잭션에서 Project write lock 해제"]
         L["이 경로에서는 취소하지 않음 - 아직 종료 입증 안 됨"]
     end
 
@@ -51,7 +51,44 @@ flowchart TD
 
 - 대기 중인 Approval 상태에서 취소하면 실행 중 Run이 없고 미종료 Execution이 없는지 확인한 뒤 종료합니다.
 - 종료가 불확실하면 CANCELLED가 아니라 RECOVERY Gate로 이동합니다 ([09](09-recovery.md)).
-- `_cancel_idle_tasks`는 Runner 시작 시와 요청 대기 중 주기적으로 실행됩니다.
+- `_cancel_idle_tasks`는 `Runner.recover` 안에서 Runner 시작 시와 loop 반복마다 실행됩니다. 실행 슬롯이 가득 차 있어도 실행되므로, `WAITING_APPROVAL`에서 write lock을 쥔 Task의 취소가 굶지 않습니다.
+
+## Terminal 전이와 Project write lock 정리
+
+Task의 모든 terminal 전이(`COMPLETED`, `FAILED`, `CANCELLED`)는 `state_service.change_task_state` 한 곳을 지나며, 프로젝트 Task에서는 같은 트랜잭션 안에서 `project_terminal.release_on_terminal`이 Project 정리를 수행합니다(lock 해제 + write baseline 정리 + `write_epoch` 증가 + `workspace_state` 기록). 이 트랜잭션에 ExecutionRequest의 `DONE` 처리는 포함되지 않습니다(`Runner.process`가 별도 트랜잭션으로 처리하고, 누락은 startup recovery가 정리). 이 함수가 terminal 정리의 유일한 소유자이며, `ProjectLockService`에는 일반 release가 없습니다(reconcile 전용 `reconcile`뿐).
+
+프로젝트 Task의 terminal 호출 지점(실패 마감 `_fail`, 취소 `_finalize_cancel`, `max_replans`·반복 한도, COMPLETED, RECOVERY abort·거절, idle/parked 취소)은 `TaskFinalizer.finalize_task_with_proof` 또는 같은 재시도 규칙을 쓰는 단계 완료 래퍼(`WorkflowService._complete_succeeded`, `HumanGateService.decide`)를 통과합니다.
+
+```mermaid
+flowchart TD
+    subgraph MEASURE["1. 트랜잭션 밖"]
+        direction TB
+        A["ProjectLockService.measure_for_task - owner 와 write_epoch 를 읽고 Workspace fingerprint 측정"] --> P["FingerprintProof"]
+    end
+
+    subgraph TXN["2. 짧은 트랜잭션 - 측정 없음"]
+        direction TB
+        B["Task 행 잠금 후 Project 행 잠금"] --> C["change_task_state - terminal 전이"]
+        C --> D["project_terminal.release_on_terminal - owner 와 write_epoch 가 proof 와 같은지 확인"]
+        D --> E{"proof 유효?"}
+        E -->|"Yes"| F["lock 해제 및 write baseline 정리 - CLEAN 또는 DIRTY_UNRESOLVED 기록 - lease 및 request 반영 - commit"]
+    end
+
+    subgraph RETRY["3. 재시도"]
+        direction TB
+        R1["FingerprintProofStale - 트랜잭션 전체 롤백"] --> R2{"3회 초과?"}
+        R2 -->|"No"| A
+        R2 -->|"Yes"| U["UNMEASURED 종료 - 단일 트랜잭션: Task terminal + owner 이면 DIRTY_UNRESOLVED 와 lock 해제 + Lease 와 Request 처리"]
+    end
+
+    P --> B
+    E -->|"No"| R1
+```
+
+- `CLEAN` 판정: 측정이 유효하고 `COMPLETED`이면 최종 fingerprint가 새 `baseline_fingerprint`가 됩니다. `FAILED`/`CANCELLED`는 현재 fingerprint가 `write_baseline_fingerprint`(lock 획득 시 기록)와 같을 때만 `CLEAN`이고, 다르면 `DIRTY_UNRESOLVED`입니다. proof가 없거나 `UNMEASURED`이면 `COMPLETED`라도 `CLEAN`으로 끝나지 않고, write baseline의 fingerprint 버전이 현재와 다르면 `FAILED`/`CANCELLED`에서 비교할 수 없으므로 `DIRTY_UNRESOLVED`입니다.
+- 소유자가 아닌 Task(legacy Task, lock을 얻은 적 없는 Project Task)는 proof 없이 같은 경로를 지나며 Project에는 아무 변경도 하지 않습니다.
+- `UNMEASURED` 종료에서 owner가 이미 다른 Task로 바뀌었다면 그 Project lock은 해제하지 않고 현재 Task만 terminal 처리합니다. 이미 terminal인 Task에 대한 재실행은 아무 것도 하지 않습니다.
+- Task terminal과 Project 정리는 서로 다른 트랜잭션으로 나뉘지 않으므로, 한 쪽만 보이는 중간 상태가 다른 세션에 관찰되지 않습니다(통합 테스트로 확인).
 
 ## Event Streaming
 
@@ -141,7 +178,8 @@ flowchart TD
 - 리뷰 증거: Code Review PASS, CRITICAL Issue 없음, Test Policy Concern 없음, 리뷰도 현재 코드 fingerprint 기준
 - Design Basis 및 Pending Approval: 현재 Design Review Basis에 대한 PASS, 미결 Approval 없음
 
-미충족이 있으면 Review 결과가 `FAIL`로 바뀌어 개선 반복(`RETRYING`)으로 이동하고, `plan_defect`면 재계획으로 이동합니다. FAILED가 되는 경우는 반복 한도(`max_workflow_iterations`) 또는 재계획 한도(`max_replans`) 초과뿐입니다 ([05](05-development-testing.md)).
+미충족이 있으면 Review 결과가 `FAIL`로 바뀌어 개선 반복(`RETRYING`)으로 이동하고, `plan_defect`면 재계획으로 이동합니다. 이 검사에서 FAILED가 되는 경우는 반복 한도(`max_workflow_iterations`) 또는 재계획 한도(`max_replans`) 초과뿐입니다 ([05](05-development-testing.md)). (프로젝트 Task는 이 밖에 `PROJECT_WORKSPACE_UNSTABLE`, `PROJECT_DIRTY_ABORTED`/`PROJECT_DIRTY_REJECTED` 등으로도 FAILED가 될 수 있으며 Completion 검사와는 무관합니다.)
+- COMPLETED가 되는 순간의 Project 정리(최종 fingerprint를 baseline으로 수용)는 위 「Terminal 전이와 Project write lock 정리」를 따릅니다.
 
 ## 현재 구현 제한
 

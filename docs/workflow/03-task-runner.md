@@ -40,13 +40,15 @@ sequenceDiagram
 
     Note over Runner,DB: 2. Execution Request Claim
     Note over Runner,DB: Runner 시작 시 advisory lock 획득 후 recover() 실행
-    loop Runner polling
-        Runner->>DB: PENDING Request claim (FOR UPDATE SKIP LOCKED)
+    loop Runner._loop - recover() 후 Runner._dispatch
+        Note over Runner,DB: 빈 실행 슬롯이 있을 때만 claim - 대기 중인 프로젝트 cap 초과 요청과 not_before 이전 요청은 건너뜀
+        Runner->>DB: PENDING Request claim (FOR UPDATE SKIP LOCKED) + claim_token 발급
         DB-->>Runner: CLAIMED Request
+        Runner->>Runner: asyncio Task 로 process 시작 - registry 등록, 완료 callback 이 슬롯 반환
     end
 
     Note over Runner,PC: 3. Lease 획득
-    Runner->>Lease: acquire(task_id)
+    Runner->>Lease: acquire(task_id, fence=(request, claim_token))
     opt 만료된 Lease 인계 경로에서만
         Lease->>PC: 이전 CLI 프로세스 확인 및 종료
         PC-->>Lease: TerminationResult
@@ -55,18 +57,23 @@ sequenceDiagram
     Note over Runner,Gate: 4. Workflow 실행 및 5. 결과 처리
     alt ACQUIRED
         Lease-->>Runner: Lease
-        Runner->>DB: attach_run(request, run_id)
-        Runner->>WF: run_task(lease, task_id, resume_approval_id)
+        Runner->>DB: attach_run(request, run_id, claim_token)
+        Runner->>WF: run_task(lease, task_id, resume_approval_id, request_id)
         WF->>DB: Step / 상태 / Approval 저장
         WF-->>Runner: 결과 상태
         alt LEASE_LOST
             Runner->>DB: Request requeue (lease_lost)
+        else BLOCKED - 프로젝트 write lock 대기
+            Runner->>DB: Request requeue (project_busy) + 지수 backoff not_before
         else 그 외 - 정상 결과, WAITING_APPROVAL, terminal
-            Runner->>DB: Request DONE
+            Runner->>DB: Request DONE (claim_token 일치 시에만)
         end
+    else FENCED
+        Lease-->>Runner: 요청이 requeue 또는 재claim 되어 이 coroutine 은 소유자가 아님
+        Runner-->>Runner: 아무 것도 기록하지 않고 종료
     else HELD
         Lease-->>Runner: 활성 Lease 또는 인계 경쟁
-        Runner->>DB: Request requeue (held:사유)
+        Runner->>DB: Request requeue (held:사유) + 지수 backoff not_before
     else UNCERTAIN
         Lease-->>Runner: 이전 CLI 종료 미입증
         Runner->>Gate: Runner._park_uncertain - open_recovery (같은 트랜잭션)
@@ -79,12 +86,33 @@ sequenceDiagram
 - `POST /tasks`는 PENDING Task를 만들 뿐 아무것도 실행하지 않습니다.
 - `POST /tasks/{id}/execution-requests`는 신규 요청 여부와 관계없이 현재 Router에서 202를 반환하며, 요청만 저장하고 CLI를 직접 실행하지 않습니다. 종료 상태 Task는 409, `WAITING_APPROVAL` Task도 409(승인 후 자동 재개)입니다.
 - 승인 결정으로 생성되는 RESUME 요청도 같은 `execution_requests` 테이블에 저장되어 같은 경로로 소비됩니다 ([08](08-human-gate.md)).
-- `LeaseService.acquire`는 `ACQUIRED`, `HELD`, `UNCERTAIN`만 반환합니다. `HELD`는 활성(미만료) Lease가 있거나 인계 중 상태가 바뀐 경우이며, 요청은 종료되지 않고 `held:<reason>`과 함께 `PENDING`으로 requeue됩니다.
+- `LeaseService.acquire`는 `ACQUIRED`, `HELD`, `UNCERTAIN`, `FENCED`를 반환합니다. `HELD`는 활성(미만료) Lease가 있거나 인계 중 상태가 바뀐 경우이며, 요청은 종료되지 않고 `held:<reason>`과 함께 `PENDING`으로 requeue됩니다. `FENCED`는 이 coroutine이 claim한 뒤 요청이 requeue되거나 다시 claim되어 `claim_token`이 달라진 경우입니다.
 - `UNCERTAIN`이면 아무 것도 실행하지 않습니다. RECOVERY Approval 생성과 요청 `NEEDS_REVIEW` 처리는 `LeaseService`가 아니라 `Runner._park_uncertain`이 한 트랜잭션에서 수행합니다 ([09](09-recovery.md)).
-- `LEASE_LOST`는 요청을 requeue하고, 정상 결과·`WAITING_APPROVAL`·terminal 상태 결과는 요청을 `DONE`으로 처리합니다.
-- `Runner.recover`는 stale `CLAIMED` 요청을 requeue하고 idle 상태 취소 요청을 처리합니다. Recovery Gate를 직접 만들지 않습니다.
+- `LEASE_LOST`는 요청을 requeue하고, `BLOCKED`(프로젝트 write lock을 다른 Task가 보유)는 지연 requeue합니다. 정상 결과·`WAITING_APPROVAL`·terminal 상태 결과는 요청을 `DONE`으로 처리합니다.
+- **claim fencing**: claim마다 새 `claim_token`이 발급되고, 이후 `process` 시작, `acquire`(Txn A·B), `attach_run`, `finish`, `requeue`가 모두 `status=CLAIMED AND claim_token=<token>` 조건을 확인합니다. 이미 requeue된 요청을 뒤늦게 진행하는 이전 coroutine은 어떤 변경도 남기지 못합니다.
+- **지연(backoff)**: `HELD`·`project_busy` requeue는 `execution_requests.defer_count`를 1 증가시키고 `not_before`를 `min(60s, 5s·2^이전_defer_count)`에 jitter(0.8~1.2)를 곱한 시각으로 저장합니다(jitter 제외 5s, 10s, 20s ...). `claim_next`는 `not_before`가 지난 요청만 claim하며, 값은 PostgreSQL에 있으므로 Runner 재시작 뒤에도 유지됩니다. 재시작 recover의 단순 requeue는 카운터를 올리지 않습니다.
+- `Runner.recover`는 매 loop 반복마다(슬롯 여부와 무관하게) 실행됩니다. `CLAIMED`이고 `claimed_at`이 유예 시간(`claim_timeout_seconds`)을 넘겼으며 **살아 있는(미만료 RUNNING) Lease가 없는** 요청만 stale로 보고 requeue합니다. claim과 Lease 획득 사이의 정상 구간과, Lease를 가진 긴 CLI 실행은 건드리지 않습니다. 이어서 idle 취소 요청(`_cancel_idle_tasks`)을 처리하고, 종료된 Task가 남긴 Project write lock을 정리(`ProjectLockService.reconcile`)합니다. Recovery Gate를 직접 만들지 않습니다.
+
+## 병렬 dispatch
+
+한 애플리케이션 프로세스 안에서 `Runner._dispatch`가 여러 Task를 동시에 실행합니다(프로젝트마다 OS 프로세스를 만들지 않습니다).
+
+- 슬롯은 **claim 전에** 확인합니다(`len(registry) < MAX_CONCURRENT_TASKS`). claim한 요청이 슬롯을 기다리며 대기하는 구조가 아닙니다.
+- 실행 중 요청은 registry(`request id → asyncio.Task`)에 있고, 완료 callback이 예외를 로그로 회수하고 슬롯을 반환하며 loop를 깨웁니다. 한 Task의 예외는 다른 Task에 전파되지 않습니다(요청은 `CLAIMED`로 남아 유예 시간 뒤 recover됩니다).
+- 같은 프로젝트의 동시 실행은 `MAX_TASKS_PER_PROJECT`(기본 1)로 제한합니다. 상한에 도달한 프로젝트의 요청은 `claim_next`가 건너뜁니다(`busy_project_ids`가 비어 있으면 조건 자체를 추가하지 않고, 있으면 UUID 배열로 bind하며 `project_id IS NULL`인 legacy Task는 제외하지 않습니다).
+- `project_id`가 없는 기존 Task는 각자 `WORKSPACE_ROOT/<task_id>`를 쓰므로 프로젝트 cap의 그룹이 아닙니다. 전역 한도와 Task Lease만 적용됩니다.
+- CLI·테스트 자식 프로세스 수는 `CommandExecutor`의 세마포어(`MAX_CONCURRENT_CLI_PROCESSES`)가 제한하며, 슬롯을 기다리는 중에 취소 요청이 오면 spawn 없이 `CANCELLED`로 끝납니다.
+- 종료(`Runner.stop`): 신규 claim 중단 → 진행 중 Task drain(`RUNNER_SHUTDOWN_GRACE_SECONDS`) → 남은 Task의 Lease를 로컬에서 revoke하고 CLI cancel → 그래도 끝나지 않으면 coroutine 취소(Lease는 그대로 두어 다음 시작의 `acquire`가 판정) → advisory lock 해제.
+- Runner 수명 상태는 프로세스 내부 값(`STOPPED → STARTING → RUNNING → STOPPING → STOPPED`, 실패 시 `STOP_INCOMPLETE`)이며 DB에 저장하지 않습니다. `start`는 `STOPPED`에서만, `stop`은 `RUNNING`/`STOP_INCOMPLETE`에서만 동작하고(`STOPPED`는 no-op, `STARTING`/`STOPPING`은 `RuntimeError`), 시작 도중 실패하면 쥐고 있던 connection의 unlock·close를 확인한 뒤 `STOPPED`로 돌아갑니다(close를 확인하지 못하면 아래 `STOP_INCOMPLETE`). 종료/시작 실패의 최종 전환(`STOPPED` 또는 `STOP_INCOMPLETE`)은 취소로부터 보호된 정산 task가 실제 resource를 보고 수행하므로 `STARTING`/`STOPPING`에 남지 않습니다. 상태 전이와 recovery의 짧은 DB 트랜잭션은 `_lifecycle_lock`으로 직렬화하며 CLI 실행·drain에는 걸지 않습니다.
+- `recover(startup=True)`(모든 CLAIMED 요청 재처리)는 `STARTING`이면서 advisory lock을 쥔 때만, 주기 recovery는 `RUNNING`에서만 허용되고 그 밖의 상태에서는 DB를 바꾸지 않고 `RuntimeError`입니다.
+- `STOP_INCOMPLETE`는 **살아 있는 in-flight Task 또는 정리가 확인되지 않은 runtime connection**(advisory lock connection, 또는 시작 실패 뒤 close가 확인되지 않은 connection)이 남은 상태입니다. 살아 있는 Task가 남으면 `RunnerStopIncomplete`가 발생하며, connection close가 실패하면 그 오류가 그대로 전파됩니다. 이때 Runner는 in-flight 목록과 connection을 **유지**하고 `start`·recovery를 거부하며 `stop` 재호출(남은 Task drain과 connection unlock·close 재시도)만 허용합니다. 프로세스가 끝나면 OS가 연결을 닫아 lock이 풀리지만, 같은 프로세스가 계속 살아 있으면 이후 `stop`이 성공할 때까지 해당 connection을 보유합니다. 애플리케이션 lifespan은 stop이 성공한 뒤에만, 그리고 내부에서 만든 DB일 때만 `dispose`합니다.
+- 프로세스 슬롯 대기 중 취소된 명령은 permit을 정확히 한 번만 반환하며, 취소가 이미 설정된 명령은 spawn되지 않습니다(`CommandExecutor`).
+- DB 연결 pool 설정(`DB_POOL_SIZE`, `DB_MAX_OVERFLOW`)은 [README](../../README.md)를 따릅니다.
+- 전역 advisory lock은 그대로 "Runner(Coordinator) 프로세스는 하나"라는 보호입니다. Task 단위 배제는 Lease, Project 단위 배제는 `projects.write_owner_task_id`입니다 ([07](07-lease.md)).
 - `app.infra.process_control` 모듈은 만료된 Lease 인계 중 이전 프로세스 확인이 필요한 경로에서만 호출됩니다. 절차(Txn A → 트랜잭션 밖 프로세스 확인·종료 → Txn B)는 [07](07-lease.md)에 있습니다.
 
 ## 현재 구현 제한
 
-- 단일 Runner만 지원합니다. 두 번째 프로세스는 advisory lock 획득에 실패하면 Runner를 시작하지 않고 요청 저장만 수행합니다.
+- Runner(Coordinator) 프로세스는 하나만 지원합니다. 두 번째 프로세스는 advisory lock 획득에 실패하면 Runner를 시작하지 않고 요청 저장만 수행합니다. 병렬성은 한 프로세스 안의 asyncio Task입니다.
+- 정확히 한 번 실행은 보장하지 않습니다(at-least-once + 변경 감지). 불확실한 실행은 자동 재실행하지 않고 RECOVERY Gate로 갑니다.
+- 병렬 실행 한도(`MAX_CONCURRENT_TASKS`, `MAX_TASKS_PER_PROJECT`, `MAX_CONCURRENT_CLI_PROCESSES`)는 설정값이며, DB pool은 기본값(10+10) 그대로입니다. 한도를 크게 올릴 때는 pool 크기를 함께 검토해야 합니다.

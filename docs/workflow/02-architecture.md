@@ -29,6 +29,12 @@ flowchart TB
         SESSION["SessionService"]
         TEST["TestPolicyService"]
         COMPLETE["completion_checker.check_definition_of_done - 함수"]
+        PROJ["ProjectService"]
+        LOCK["ProjectLockService"]
+        FIN["TaskFinalizer"]
+        EFFECTS["RecoveryEffects 와 ProjectDirtyRecoveryEffect"]
+        PTERM["project_terminal.release_on_terminal - 함수"]
+        STATE["state_service.change_task_state - 함수"]
     end
 
     subgraph PROVIDERS["Provider Layer"]
@@ -44,6 +50,7 @@ flowchart TB
         PROC["process_control 모듈"]
         GUARD["Workspace Guard"]
         SNAP["Workspace Snapshot"]
+        FPRINT["workspace_fingerprint 모듈"]
     end
 
     subgraph DATA["Persistence Layer"]
@@ -61,6 +68,22 @@ flowchart TB
     USER --> API
     API -->|"Task 생성 및 Execution Request 저장"| TASK
     API -->|"Approval 결정"| GATE
+    API -->|"Project 등록 및 조회"| PROJ
+    PROJ -->|"git clone"| EXEC
+    PROJ --> FPRINT
+    PROJ --> REPO
+    WF -->|"ensure_for_step"| LOCK
+    WF -->|"finalize_task_with_proof"| FIN
+    FIN -->|"measure_for_task"| LOCK
+    LOCK --> FPRINT
+    LOCK --> REPO
+    GATE -->|"reason_code 로 효과 조회"| EFFECTS
+    EFFECTS --> LOCK
+    EFFECTS --> STATE
+    FIN --> STATE
+    WF --> STATE
+    STATE -->|"terminal 전이"| PTERM
+    PTERM --> REPO
     RUNNER -->|"acquire / heartbeat / release"| LEASE
     RUNNER -->|"run_task"| WF
     RUNNER -->|"open_recovery"| GATE
@@ -100,7 +123,20 @@ flowchart TB
 ```
 
 - `Runner`는 Service Layer와 분리된 구역으로 표시했지만 `LeaseService`와 `WorkflowService`를 호출하는 Service 계층의 소비자입니다.
-- Router는 `TaskService`와 `HumanGateService`만 호출하며 `Runner`를 직접 실행하지 않습니다(결정·요청 저장 뒤 `Runner.notify`로 깨우기만 합니다).
+- Router는 `TaskService`, `ProjectService`, `HumanGateService`만 호출하며 `Runner`를 직접 실행하지 않습니다(결정·요청 저장 뒤 `Runner.notify`로 깨우기만 합니다).
+
+## Project 관련 책임과 의존 방향
+
+| 모듈 | 책임 |
+|---|---|
+| `ProjectService` | 기존 로컬 Workspace 등록 또는 `git clone` 후 등록, 이름·상태 변경(`ARCHIVED`는 미종료 Task가 있으면 409). 경로 검증, 중복·중첩 차단, clone 보상(이번 요청이 만든 디렉터리만 정리) |
+| `ProjectLockService` | proof 측정(`measure_for_task`, `measure_project`), Step 시작 전 write lock 획득·검증·PROJECT_DIRTY Gate(`ensure_for_step`), `reconcile`. **terminal 정리 없음, Task 상태 변경 없음** |
+| `project_terminal` | `release_on_terminal` - terminal 전이 때 lock 해제·write baseline 정리·`workspace_state` 기록의 **단독 소유자**. 트랜잭션을 열지 않고 측정하지 않으며 `FingerprintProofStale`을 던짐 |
+| `TaskFinalizer` | `finalize_task_with_proof` - 측정(트랜잭션 밖) → 짧은 트랜잭션 → 재시도/`UNMEASURED` 종료 |
+| `RecoveryEffects`, `ProjectDirtyRecoveryEffect` | Recovery 종류(`reason_code`)별 효과. `HumanGateService`는 이 레지스트리만 알고 Project 모듈을 import하지 않음 |
+| `workspace_fingerprint` | `WORKSPACE_FINGERPRINT_V1` 측정 ([10](10-invalidation.md)) |
+
+의존은 한 방향입니다: `state_service → project_terminal → ProjectRepository`. `project_terminal`과 `ProjectLockService`는 `state_service`를 import하지 않고, `state_service`는 `ProjectLockService`를 import하지 않습니다. 상태 전이와 Project 효과의 조합은 상위 계층(`TaskFinalizer`, `WorkflowService`, `Runner`, `ProjectDirtyRecoveryEffect`)이 합니다(구조 테스트 `tests/architecture/test_project_rules.py`).
 
 ## Recovery 책임 분산
 
@@ -108,9 +144,10 @@ flowchart TB
 
 | 모듈 | 담당 |
 |---|---|
-| `Runner` | 시작 시 `recover()`(stale CLAIMED 요청 requeue, 대기 중 취소 처리), `_park_uncertain`(Lease 인계 UNCERTAIN 시 RECOVERY Gate와 요청 `NEEDS_REVIEW`) |
+| `Runner` | 시작 시와 loop마다 `recover()`(Lease 없는 stale CLAIMED 요청 requeue, 대기 중 취소 처리, 종료 Task가 남긴 Project lock reconcile), `_park_uncertain`(Lease 인계 UNCERTAIN 시 RECOVERY Gate와 요청 `NEEDS_REVIEW`) |
 | `WorkflowService` | `_park_for_recovery`, `_interrupted_needs_human`, `_recovery_unsafe`(승인 후 재검증), `_finalize_cancel` |
-| `HumanGateService` | `open_recovery`(Task/Approval/Step을 한 트랜잭션에서 전환), RECOVERY 결정 처리 |
+| `HumanGateService` | `open_recovery`(Task/Approval/Step을 한 트랜잭션에서 전환, `reason_code` 기록), RECOVERY 결정 처리(`RecoveryEffects`에 위임) |
+| `ProjectLockService` | PROJECT_DIRTY Gate 진입(`ensure_for_step`), 남은 Project lock `reconcile` |
 | `LeaseService` | `acquire`의 만료 Lease 인계 및 `UNCERTAIN` 판정 |
 | `StepRunner` | 종료 미확인 결과를 `TerminationUnconfirmed`로 올림, Lease 상실 결과를 `discarded_result`로 격리 |
 

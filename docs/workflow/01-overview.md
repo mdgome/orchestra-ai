@@ -16,13 +16,13 @@ Task 생성부터 COMPLETED까지의 정상 흐름입니다. 중심 클래스는
 flowchart TD
     subgraph API["1. API 및 요청 영속화"]
         direction TB
-        U(["사용자"]) --> T["POST /tasks - Task PENDING 생성"]
+        U(["사용자"]) --> T["POST /tasks 또는 POST /projects/id/tasks - Task PENDING 생성"]
         T --> ER["POST /tasks/id/execution-requests - START 요청 저장"]
     end
 
     subgraph RUNNER["2. Runner 및 Lease"]
         direction TB
-        R["Runner.process - request claim"] --> L{"LeaseService.acquire"}
+        R["Runner._dispatch 가 슬롯 확인 후 claim - Runner.process"] --> L{"LeaseService.acquire"}
         L -->|"ACQUIRED"| RT["WorkflowService.run_task"]
     end
 
@@ -37,7 +37,8 @@ flowchart TD
 
     subgraph DEVTEST["4. Development 및 Testing"]
         direction TB
-        DEV["DEVELOPING - Claude Developer"] --> TEST["TESTING - Claude Tester 후 Orchestrator 독립 테스트"]
+        PG["프로젝트 Task 만 - ProjectLockService.ensure_for_step - write lock 획득 또는 대기"] --> DEV["DEVELOPING - Claude Developer"]
+        DEV --> TEST["TESTING - Claude Tester 후 Orchestrator 독립 테스트"]
         TEST -->|"테스트 PASS"| REV["REVIEWING 진입"]
     end
 
@@ -54,7 +55,7 @@ flowchart TD
 
     ER --> R
     RT --> PLAN
-    BASIS -->|"Yes"| DEV
+    BASIS -->|"Yes"| PG
     REV --> CR
     DOD -->|"충족"| DONE
     PV -->|"No"| PF["예외 - step_attempt 재시도 또는 FAILED"]
@@ -69,6 +70,7 @@ flowchart TD
 - Design Review PASS 뒤에는 일반적인 "Human Gate 필요 여부" 판정 단계가 없습니다. PASS이면 `Development 직전 Basis 재비교` 후 곧바로 DEVELOPING입니다.
 - 다이어그램의 `Runner`는 `Runner.process`를 의미하며 `LeaseService.acquire` 성공 후 `WorkflowService.run_task`를 호출합니다 ([03](03-task-runner.md)). `HELD`/`UNCERTAIN` 결과는 [03](03-task-runner.md), 만료 Lease 인계는 [07](07-lease.md)을 참고하십시오.
 - Planning 상세는 [04](04-planning-review.md), Development·Testing·Code Review 상세는 [05](05-development-testing.md)에 있습니다.
+- **Project Task**: `POST /projects`로 등록한 Workspace(기존 로컬 경로 또는 clone)를 여러 Task가 공유합니다. 읽기 전용 Step(Plan, Design Review)은 병렬로 실행할 수 있지만, 변경 Step(Developer, Tester)과 Code Review는 Project write lock을 가진 Task 하나만 실행합니다. lock은 첫 변경 Step 앞에서 얻고 Task가 terminal이 될 때(같은 트랜잭션에서) 해제되며, `WAITING_APPROVAL` 동안에도 유지됩니다. 서로 다른 Project의 Task와 `project_id`가 없는 기존 Task는 병렬로 실행됩니다([03](03-task-runner.md), [07](07-lease.md)).
 
 ## 2. 예외 흐름: Human Gate, Recovery, Retry, Replan
 
@@ -86,6 +88,8 @@ flowchart TD
     subgraph RECOVERY["Recovery"]
         direction TB
         RC["RECOVERY 조건 - 09 문서 참조"] --> RG["HumanGateService.open_recovery - RECOVERY Gate"]
+        RP["PROJECT_DIRTY - 이전 Task 의 미해결 변경 - Step attempt 생성 전"] --> RG
+        BUSY["프로젝트 write lock 을 다른 Task 가 보유 - BLOCKED - 지연 requeue"] -.-> RS
     end
 
     subgraph RETRYREPLAN["Retry 및 Replan"]
@@ -112,7 +116,7 @@ flowchart TD
     RG --> W
     DEC -->|"DESIGN 승인 또는 거절 - RESUME 생성"| RS
     DEC -->|"PERMISSION 승인 및 enforceable - RESUME 생성"| RS
-    DEC -->|"RECOVERY continue 또는 retry - RESUME 생성"| RS
+    DEC -->|"RECOVERY continue 또는 retry - RESUME 생성 - PROJECT_DIRTY 는 continue 만"| RS
     DEC -->|"PERMISSION 거절 또는 RECOVERY abort 또는 거절"| FAILED
     DEC -->|"PERMISSION 승인 및 enforceable 아님 - RESUME 없음"| W
     RL -->|"No - MAX_ITERATIONS_EXCEEDED"| FAILED

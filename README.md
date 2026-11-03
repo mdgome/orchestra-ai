@@ -21,8 +21,15 @@ PLAN (Claude, Plan Mode) -> DESIGN_REVIEW (Codex, read-only) -> [Human Gate] -> 
 
 ## 지원 범위(먼저 읽어주세요)
 
-* **단일 Runner, 신뢰할 수 있는 로컬 환경.** 데이터베이스당 하나의 Runner 프로세스만 사용할 수 있습니다(PostgreSQL advisory
-  lock으로 강제되며, 두 번째 프로세스는 Runner 시작을 거부합니다). `uvicorn app.main:app --workers 1`로 실행하세요.
+* **하나의 Runner(Coordinator) 프로세스, 신뢰할 수 있는 로컬 환경.** 데이터베이스당 하나의 Runner 프로세스만 사용할 수
+  있습니다(PostgreSQL advisory lock으로 강제되며, 두 번째 프로세스는 Runner 시작을 거부합니다).
+  `uvicorn app.main:app --workers 1`로 실행하세요. 병렬성은 이 프로세스 **안의** Task 단위입니다(서로 다른 Project의
+  Task는 병렬, 같은 Project의 변경 Step은 Project write lock으로 직렬).
+* **Project 사용 규칙.** 활성 Project Task가 있는 동안의 외부 프로세스(에디터, 빌드 도구 등)의 직접 수정은 **지원하지
+  않습니다.** 파일시스템과 DB는 하나의 원자 트랜잭션이 될 수 없고 측정과 커밋 사이의 변경은 완전히 탐지되지 않을 수
+  있습니다(감지되면 읽기 단계는 재시도, 변경 단계는 Recovery 대상). Task 사이(Project가 유휴)의 사용자 수정은
+  허용되며 다음 Task가 처음 write lock을 얻을 때 baseline으로 수용됩니다. 오케스트레이터는 Project 파일을 `reset`,
+  `clean`, `checkout`하거나 삭제하지 않습니다.
 * CLI 권한 플래그는 **도구 정책이지 OS 샌드박스가 아닙니다.** 악의적이거나 손상된 모델 또는 CLI 버그를 격리하지
   못합니다. OS/컨테이너 격리는 3단계 항목입니다. 잃어서는 안 되는 비밀 정보가 저장된 시스템에서 신뢰할 수 없는
   요구사항을 대상으로 실행하지 마세요.
@@ -56,6 +63,10 @@ URI에는 명사를 사용하고 동작은 HTTP 메서드로 표현합니다. �
 | POST | `/conversations` | 201 |
 | GET | `/conversations/{id}` | |
 | POST | `/conversations/{id}/messages` | 201, 대화가 CLOSED/EXPIRED 상태이면 409 |
+| POST | `/projects` | 201. `workspace_path`(기존 로컬 Workspace) **또는** `repository_url`(`PROJECT_CLONE_ROOT` 아래로 clone)을 정확히 하나 지정. 선택 `test_policy`(예: `{"preset": "maven"}`) |
+| GET | `/projects` · `/projects/{id}` | |
+| PATCH | `/projects/{id}` | `name`, `status`(`ARCHIVED`는 미종료 Task가 있으면 409), `test_policy`(생략=유지, 객체=검증 후 교체, `null`=제거, `name`/`status`의 `null`은 422. 이미 만든 Task의 정책 복사본은 바뀌지 않음) |
+| GET/POST | `/projects/{id}/tasks` | Project Workspace를 공유하는 Task 목록/생성(201, 실행은 하지 않음) |
 | GET/POST | `/tasks` | POST는 PENDING 작업을 **생성만** 하며(201), 아무 작업도 실행하지 않음 |
 | GET/PATCH | `/tasks/{id}` | GET 응답에 현재 lease, 최신 checkpoint 및 미결 승인 포함 |
 | POST | `/tasks/{id}/execution-requests` | 202. 요청을 저장하고 Runner가 실행함. 미결 요청이 있는 동안 멱등성 보장 |
@@ -67,6 +78,41 @@ URI에는 명사를 사용하고 동작은 HTTP 메서드로 표현합니다. �
 
 결정을 승인하면 결정 내용과 `RESUME` 실행 요청을 하나의 트랜잭션에 저장합니다. 따라서 승인 직후 장애가 발생해도 다음
 Runner 시작 시 작업이 재개됩니다.
+
+## Project 사용
+
+```bash
+# 1) 기존 로컬 프로젝트를 등록(절대 경로, 링크/junction 불가, 시스템·오케스트레이터 경로·다른 Project와 겹치는 경로 불가)
+curl -X POST localhost:8000/projects -H 'content-type: application/json' \
+     -d '{"name": "Service A", "workspace_path": "D:\\Projects\\Service-A", "test_policy": {"preset": "pytest"}}'
+# 2) 자연어 Task 생성 -> 실행 요청
+curl -X POST localhost:8000/projects/{id}/tasks -d '{"requirements": "..."}' -H 'content-type: application/json'
+curl -X POST localhost:8000/tasks/{task_id}/execution-requests
+```
+
+* `repository_url`은 `https://`, `ssh://`, `git@host:path` 형식만 허용하며 자격 증명이 포함된 URL(`user:token@host`)은
+  거부합니다. 인증은 시스템 credential helper 또는 ssh-agent에 맡기며, URL·오류 메시지의 자격 증명은 로그, DB,
+  API 응답에서 마스킹합니다.
+* Test Policy preset: `pytest`(기본), `maven`, `gradle`. Task 생성 시 프로젝트의 `mvnw`/`gradlew`(없으면 시스템 도구)
+  하나로 해석되며, 도구가 없으면 Task 생성이 422로 거부됩니다. 테스트 결과(JUnit XML)는 삭제하지 않고 **이번 실행이
+  새로 만들었거나 바꾼 파일만** 판정에 사용합니다.
+* 이전 Task가 미해결 변경을 남긴 Project(`workspace_state: DIRTY_UNRESOLVED`)에서 다음 Task가 변경 Step을 시작하면
+  `PROJECT_DIRTY` RECOVERY Gate가 열립니다. `continue`는 현재 상태를 새 baseline으로 수용하고, `abort`는 Task를
+  실패시킵니다(파일은 건드리지 않음).
+
+설정(`.env`): `MAX_CONCURRENT_TASKS`(기본 2), `MAX_TASKS_PER_PROJECT`(기본 1), `MAX_CONCURRENT_CLI_PROCESSES`(기본 4),
+`RUNNER_SHUTDOWN_GRACE_SECONDS`(기본 30), `PROJECT_CLONE_ROOT`(기본 `./project-clones`).
+
+**DB pool** (`DB_POOL_SIZE`, `DB_MAX_OVERFLOW`): 이 절이 정본입니다(`.env.example`은 키와 기본값만 적습니다).
+
+* 필수 조건은 하나뿐입니다. `DB_POOL_SIZE + DB_MAX_OVERFLOW`(총 capacity)가 **2 이상**이어야 합니다. Runner의
+  advisory lock이 연결 하나를 Runner 수명 동안 점유하므로, 업무 트랜잭션용 연결이 하나 더 있어야 하기 때문입니다.
+  `DB_POOL_SIZE`는 1 이상, `DB_MAX_OVERFLOW`는 0 이상이며 `0`(고정 pool)도 유효합니다.
+* `DB_POOL_SIZE`를 지정하지 않으면 **권장값** `4 × MAX_CONCURRENT_TASKS + 6`을 씁니다(기본 14). 권장값은 처리량과
+  Lease heartbeat 지연 위험을 낮추기 위한 **추정치**이며 강제되지 않습니다: 실행 중인 Task마다 짧은 트랜잭션
+  (Step 기록·Lease heartbeat·취소 확인)이 겹칠 수 있고, Runner loop·API 요청이 추가로 연결을 씁니다. 권장값보다 작은
+  유효한 pool도 거부하지 않습니다. 작은 pool은 오류가 아니라 **대기**로 나타납니다(연결을 얻을 때까지 기다림).
+* `MAX_CONCURRENT_TASKS`를 올리면 명시하지 않은 pool 크기도 함께 늘어납니다. 명시한 `DB_POOL_SIZE`는 바뀌지 않습니다.
 
 ## 테스트
 
