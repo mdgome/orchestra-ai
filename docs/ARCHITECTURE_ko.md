@@ -1,5 +1,7 @@
 # 아키텍처 및 의사결정 기록
 
+> English: [ARCHITECTURE.md](ARCHITECTURE.md)
+
 ## 계층 구조(DDD를 사용하지 않는 Layered Architecture)
 
 ```

@@ -1,14 +1,16 @@
-# Lease 및 Runner Ownership
+# Lease and Runner Ownership
 
-> 현재 구현 코드를 기준으로 정리한 흐름입니다. 코드로 확인되지 않았거나 검증되지 않은 동작은 현재 구현 제한으로 구분합니다.
+> 한국어: [07-lease_ko.md](07-lease_ko.md)
 
-세 가지 보호 장치가 서로 다른 문제를 막습니다.
+> This flow is organized based on the current implementation code. Behavior that is not confirmed by code or not verified is marked as a current implementation limitation.
 
-- Advisory Lock(프로세스 수준): PostgreSQL session advisory lock (`pg_try_advisory_lock`)으로 Runner(Coordinator) 프로세스의 중복 실행을 막습니다. 두 번째 Runner 프로세스는 시작하지 못합니다. 한 프로세스 안에서는 여러 Task가 병렬로 실행됩니다 ([03](03-task-runner.md)).
-- Task Lease(Task 수준): `task_runs`의 Lease(부분 unique index로 Task당 RUNNING Run 1개)와 `tasks` 행 잠금으로 Task별 RUNNING Run 소유권을 보장합니다. execution request의 `claim_token`이 이 단계에서도 확인됩니다(`FENCED`).
-- Project write lock(Project 수준): 같은 Workspace를 공유하는 Task 중 변경 Step을 실행하는 Task를 하나로 제한합니다(아래 "Project write lock과의 순서").
+Three protective mechanisms prevent different problems.
 
-아래 다이어그램은 Runner 시작부터 Lease 획득(만료 Lease 인계 포함), Heartbeat, 결과 커밋 또는 Lease 상실까지를 보여줍니다. 정상 흐름과 인계·상실 예외 흐름이 함께 있으며 중심 클래스는 `LeaseService`입니다. OS 프로세스 확인·종료는 `app.infra.process_control` 모듈이 수행합니다.
+- Advisory Lock (process level): A PostgreSQL session advisory lock (`pg_try_advisory_lock`) prevents duplicate execution of the Runner (Coordinator) process. A second Runner process cannot start. Within one process, multiple Tasks run in parallel ([03](03-task-runner.md)).
+- Task Lease (Task level): A Lease in `task_runs` (a partial unique index limiting one RUNNING Run per Task) and row locking on `tasks` guarantee ownership of the RUNNING Run per Task. The execution request's `claim_token` is also checked at this stage (`FENCED`).
+- Project write lock (Project level): Among Tasks sharing the same Workspace, limits the Task executing change Steps to only one (see "Ordering with the Project write lock" below).
+
+The diagram below shows the flow from Runner startup, through Lease acquisition (including takeover of an expired Lease), Heartbeat, and result commit or Lease loss. The normal flow and the takeover/loss exception flows are shown together, and the central class is `LeaseService`. OS process verification and termination are performed by the `app.infra.process_control` module.
 
 ```mermaid
 sequenceDiagram
@@ -32,97 +34,97 @@ sequenceDiagram
         participant CLI as ClaudeCliProvider / CodexCliProvider
     end
 
-    Note over R,DB: 1. Advisory Lock 획득 - Runner 프로세스 중복 방지
-    R->>DB: Runner 전용 연결에서 pg_try_advisory_lock
-    alt 획득 실패
-        R-->>R: RunnerAlreadyActive - Runner 시작 안 함
-    else 획득 성공
-        R->>R: recover() 후 loop 시작
+    Note over R,DB: 1. Acquire Advisory Lock - prevent duplicate Runner process
+    R->>DB: pg_try_advisory_lock on the Runner-dedicated connection
+    alt Acquisition failed
+        R-->>R: RunnerAlreadyActive - Runner does not start
+    else Acquisition succeeded
+        R->>R: start loop after recover()
     end
 
-    Note over R,DB: 2. Txn A - Task Lease 조회
+    Note over R,DB: 2. Txn A - Task Lease lookup
     R->>LS: acquire(task_id, fence = request id + claim_token)
-    LS->>DB: tasks FOR UPDATE 및 현재 RUNNING Run 조회
-    alt claim_token 불일치 - 요청이 requeue 또는 재claim 됨
-        LS-->>R: FENCED - Lease 를 만들지도 인계하지도 않음 - Txn B 에서도 같은 확인
-    else RUNNING Run 없음
-        LS->>DB: 신규 RUNNING Run 생성
+    LS->>DB: tasks FOR UPDATE and current RUNNING Run lookup
+    alt claim_token mismatch - request was requeued or reclaimed
+        LS-->>R: FENCED - neither creates nor takes over a Lease - same check in Txn B
+    else No RUNNING Run
+        LS->>DB: Create new RUNNING Run
         LS-->>R: ACQUIRED
-    else Lease 미만료
+    else Lease not expired
         LS-->>R: HELD
-    else Lease 만료
-        LS->>DB: Run id 와 row_version 및 미종료 Execution 수집 후 커밋 - 잠금 해제
+    else Lease expired
+        LS->>DB: Collect Run id, row_version, and unfinished Executions, then commit - release lock
 
-        Note over LS,PC: 3. OS 프로세스 검사 - 트랜잭션 밖
-        LS->>PC: 프로세스 신원 확인 및 트리 종료 (terminate_tree)
+        Note over LS,PC: 3. OS process check - outside the transaction
+        LS->>PC: Verify process identity and terminate tree (terminate_tree)
         PC-->>LS: TerminationResult
 
-        alt 모두 종료 입증
-            Note over LS,DB: 4. Txn B - 재검증 후 인계
-            LS->>DB: 잠금 후 같은 Run id 와 row_version 및 만료 재검증
-            alt 재검증 통과
-                LS->>DB: 이전 Run ABANDONED 및 신규 RUNNING Run 생성
+        alt All termination proven
+            Note over LS,DB: 4. Txn B - revalidate then take over
+            LS->>DB: Lock, then revalidate same Run id, row_version, and expiry
+            alt Revalidation passed
+                LS->>DB: Mark previous Run ABANDONED and create new RUNNING Run
                 LS-->>R: ACQUIRED
-            else 재검증 실패
+            else Revalidation failed
                 LS-->>R: HELD - takeover raced
             end
-        else 종료 입증 불가
+        else Termination could not be proven
             LS-->>R: UNCERTAIN
-            R->>DB: Runner._park_uncertain - RECOVERY Gate 생성 - 새 실행 없음
+            R->>DB: Runner._park_uncertain - create RECOVERY Gate - no new execution
         end
     end
 
-    Note over R,CLI: 5. Heartbeat 및 실행
+    Note over R,CLI: 5. Heartbeat and execution
     opt ACQUIRED
         R->>WF: run_task
-        WF->>CLI: Agent Step 실행 (StepRunner 경유)
-        loop TTL 의 3분의 1 주기
+        WF->>CLI: Execute Agent Step (via StepRunner)
+        loop Every 1/3 of TTL
             R->>LS: heartbeat
-            LS->>DB: Heartbeat 및 ownership 확인
+            LS->>DB: Heartbeat and ownership check
         end
 
-        Note over WF,DB: 6. 결과 커밋 또는 Lease 상실
-        WF->>DB: Step 결과 커밋 전 Lease verify
-        alt Lease 상실
-            R->>CLI: on_lost - 해당 run 의 CLI 프로세스 cancel
-            WF->>DB: Step INTERRUPTED 및 discarded_result 만 기록 - Task 전이 없음
-        else Lease 유지
-            WF->>DB: Step 결과 커밋
+        Note over WF,DB: 6. Commit result or Lease loss
+        WF->>DB: Verify Lease before committing Step result
+        alt Lease lost
+            R->>CLI: on_lost - cancel the CLI process for that run
+            WF->>DB: Record Step INTERRUPTED and discarded_result only - no Task transition
+        else Lease retained
+            WF->>DB: Commit Step result
         end
     end
-    Note over R,DB: Runner.stop - drain 후 남은 Run 은 LeaseService.revoke 로 로컬 차단 및 CLI cancel - DB Lease 는 만료에 맡김
-    Note over R,DB: Runner.stop 시 advisory unlock
+    Note over R,DB: Runner.stop - after drain, remaining Runs are locally blocked via LeaseService.revoke and CLI cancel - DB Lease is left to expire
+    Note over R,DB: advisory unlock on Runner.stop
     R->>DB: pg_advisory_unlock
 
-    Note over R,DB: 현재 구현 제한 - Advisory Lock 연결 상실을 지속 감시하지 않음
+    Note over R,DB: Current implementation limitation - Advisory Lock connection loss is not continuously monitored
 ```
 
-## 읽는 방법
+## How to read this
 
-- Lease 획득은 3단계입니다. Txn A는 기존 Run을 확인하고 커밋합니다. 이후 트랜잭션 밖에서 프로세스를 확인·종료합니다. Txn B는 같은 Run id와 `row_version`, 만료 상태를 다시 검증한 뒤에만 인계합니다. OS 작업 중에는 행 잠금을 잡지 않습니다.
-- 종료를 입증할 수 없으면(`pid` 또는 생성 시각이 기록되지 않은 `STARTING` Execution 포함) `UNCERTAIN`을 반환하고 아무 것도 시작하지 않습니다. RECOVERY Gate는 `LeaseService`가 아니라 `Runner._park_uncertain`이 엽니다 ([09](09-recovery.md)).
-- Heartbeat의 `rowcount`가 0이거나 갱신이 실패하면 Lease 상실로 보고 해당 Run의 CLI 프로세스를 취소합니다. 이후 도착한 결과는 정상 완료로 기록되지 않고 `StepRunner._discard_result`가 `discarded_result`로만 남깁니다. `run_task`는 `LEASE_LOST`를 반환하고 `Runner.process`가 요청을 requeue합니다 ([09](09-recovery.md)).
-- Human Gate에 정상 진입하면 CLI 반환 후 Approval 생성과 Lease 반환(`FINISHED`)이 같은 트랜잭션에서 일어납니다 ([08](08-human-gate.md)).
-- `process_control`은 클래스가 아니라 `app.infra.process_control` 모듈이며 `ProcessIdentity`, `TerminationResult`, `capture_identity`, `check_alive`, `terminate_tree`로 구성됩니다.
-- `LeaseService.revoke(run_id)`는 이 프로세스의 메모리에서만 해당 Run을 "상실"로 표시합니다. 이후 `verify`는 `LeaseLost`를 던져 진행 중 Run이 아무 것도 기록하지 못하게 하고, DB의 Lease는 만료되도록 둡니다. `Runner.stop`이 grace 시간 뒤에도 끝나지 않는 Task에 사용하며, 다음 시작의 `acquire`가 프로세스 종료를 입증하거나 `UNCERTAIN`으로 RECOVERY Gate를 엽니다.
+- Lease acquisition has 3 stages. Txn A checks and commits the existing Run. Afterward, outside the transaction, the process is checked and terminated. Txn B only takes over after revalidating the same Run id, `row_version`, and expiry status. No row lock is held during the OS operation.
+- If termination cannot be proven (including a `STARTING` Execution whose `pid` or creation time was not recorded), it returns `UNCERTAIN` and starts nothing. The RECOVERY Gate is opened by `Runner._park_uncertain`, not by `LeaseService` ([09](09-recovery.md)).
+- If the Heartbeat's `rowcount` is 0 or the update fails, it is treated as Lease loss and the CLI process for that Run is canceled. A result arriving afterward is not recorded as a normal completion; `StepRunner._discard_result` records it only as `discarded_result`. `run_task` returns `LEASE_LOST` and `Runner.process` requeues the request ([09](09-recovery.md)).
+- When normally entering a Human Gate, Approval creation and Lease return (`FINISHED`) happen in the same transaction after the CLI returns ([08](08-human-gate.md)).
+- `process_control` is not a class but the `app.infra.process_control` module, composed of `ProcessIdentity`, `TerminationResult`, `capture_identity`, `check_alive`, and `terminate_tree`.
+- `LeaseService.revoke(run_id)` only marks that Run as "lost" in this process's memory. Afterward, `verify` throws `LeaseLost`, preventing the in-progress Run from recording anything, and leaves the DB's Lease to expire. `Runner.stop` uses this for Tasks that have not finished even after the grace period; the next startup's `acquire` either proves process termination or opens a RECOVERY Gate with `UNCERTAIN`.
 
-## Project write lock과의 순서
+## Ordering with the Project write lock
 
-프로젝트에 속한 Task는 Task Lease 위에 Project write lock(`projects.write_owner_task_id`)을 더 가집니다. 순서는 항상 다음과 같습니다.
+A Task belonging to a project additionally carries a Project write lock (`projects.write_owner_task_id`) on top of the Task Lease. The order is always as follows.
 
-`claim(claim_token)` → `Task Lease` → `[Step 시작 전 Project gate]` → `Step attempt` → `CLI / Workspace 명령`
+`claim(claim_token)` → `Task Lease` → `[Project gate before Step start]` → `Step attempt` → `CLI / Workspace command`
 
-- Project gate(`ProjectLockService.ensure_for_step`)는 변경 Step(`DEVELOPER`, `TESTER`)과 Code Review 앞에서 실행됩니다. 소유자가 없으면 획득하고, 이미 이 Task가 소유자이면 재진입(기존 write baseline 유지), 다른 Task가 소유자이면 `BLOCKED`(Lease 반납 후 지연 requeue)입니다. 대기는 `step_attempt`, `cli_invocations`, `workflow_iteration`을 소모하지 않습니다.
-- 해제 순서는 반대입니다. Project lock은 Task의 **terminal 전이와 같은 트랜잭션**에서 해제되고(`project_terminal.release_on_terminal`), Lease는 기존 경로가 반환합니다. Lease 로직 자체는 바뀌지 않았습니다.
-- `WAITING_APPROVAL`에 들어가면 CLI와 Task Lease는 반환하지만 Project write lock은 유지합니다. 아직 정리되지 않은 Workspace 변경이 있을 수 있기 때문입니다 ([08](08-human-gate.md), [11](11-task-lifecycle.md)).
-- 소유자 Task의 Lease가 만료되어도 Project lock을 자동으로 풀지 않습니다. 불확실한 실행은 기존 `UNCERTAIN` → RECOVERY 경로가 판단합니다.
+- The Project gate (`ProjectLockService.ensure_for_step`) runs before change Steps (`DEVELOPER`, `TESTER`) and Code Review. If there is no owner, it acquires the lock; if this Task is already the owner, it re-enters (keeping the existing write baseline); if another Task is the owner, it is `BLOCKED` (Lease returned, then delayed requeue). Waiting does not consume `step_attempt`, `cli_invocations`, or `workflow_iteration`.
+- The release order is the reverse. The Project lock is released in the **same transaction as the Task's terminal transition** (`project_terminal.release_on_terminal`), and the Lease is returned by the existing path. The Lease logic itself is unchanged.
+- Upon entering `WAITING_APPROVAL`, the CLI and Task Lease are returned, but the Project write lock is retained, because there may be Workspace changes that have not yet been cleaned up ([08](08-human-gate.md), [11](11-task-lifecycle.md)).
+- Even if the owning Task's Lease expires, the Project lock is not automatically released. Uncertain executions are judged through the existing `UNCERTAIN` → RECOVERY path.
 
-## 현재 구현 제한
+## Current implementation limitations
 
-- Advisory Lock은 `Runner.start`에서 한 번 획득하고 `Runner.stop`에서 해제하지만, 연결이 끊어졌는지 지속적으로 감시하는 코드가 없습니다. 연결 상실 시 신규 CLI 실행을 막는 로직은 구현되어 있지 않습니다. (Task 수준 중복 실행은 Lease와 부분 unique index가 계속 차단합니다.)
-- 프로세스 종료 대상은 `(pid, create_time)`(psutil)으로만 식별합니다. `runner_id`와 실행 명령 hash는 실제 종료 판단에 사용하지 않습니다.
+- The Advisory Lock is acquired once in `Runner.start` and released in `Runner.stop`, but there is no code that continuously monitors whether the connection has dropped. Logic to block new CLI execution upon connection loss is not implemented. (Task-level duplicate execution continues to be blocked by the Lease and the partial unique index.)
+- The process termination target is identified only by `(pid, create_time)` (psutil). `runner_id` and the execution command hash are not used in the actual termination decision.
 
-## 향후 보완
+## Future improvements
 
-- Advisory Lock 연결 상실 감시와 상실 시 신규 CLI 실행 차단.
-- 프로세스 신원에 `runner_id`와 실행 명령 hash 검증을 포함.
+- Monitor Advisory Lock connection loss and block new CLI execution upon loss.
+- Include `runner_id` and execution command hash verification in process identity.

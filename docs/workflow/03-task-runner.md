@@ -1,10 +1,12 @@
-# Task 생성 및 Runner 실행
+# Task Creation and Runner Execution
 
-> 현재 구현 코드를 기준으로 정리한 흐름입니다. 코드로 확인되지 않았거나 검증되지 않은 동작은 현재 구현 제한으로 구분합니다.
+> 한국어: [03-task-runner_ko.md](03-task-runner_ko.md).
 
-Task 생성과 Execution Request 생성은 별도 API 호출입니다. Workflow 실행은 `Runner`가 시작합니다.
+> This flow is organized based on the current implementation code. Behavior that is not confirmed by code or has not been verified is distinguished as a current implementation limitation.
 
-아래 다이어그램은 정상 흐름과 `LeaseService.acquire`의 세 가지 결과(`ACQUIRED`, `HELD`, `UNCERTAIN`) 처리를 한 번에 보여줍니다. 중심 클래스는 `Runner.process`이며, 단계 구분은 Note로 표시했습니다.
+Task creation and Execution Request creation are separate API calls. Workflow execution is started by `Runner`.
+
+The diagram below shows the normal flow and the handling of the three outcomes of `LeaseService.acquire` (`ACQUIRED`, `HELD`, `UNCERTAIN`) all at once. The central class is `Runner.process`, and phase boundaries are marked with Notes.
 
 ```mermaid
 sequenceDiagram
@@ -30,89 +32,92 @@ sequenceDiagram
         participant PC as process_control
     end
 
-    Note over User,DB: 1. Task 및 Execution Request 생성
+    Note over User,DB: 1. Create Task and Execution Request
     User->>API: POST /tasks
-    API->>DB: Task 생성 (PENDING)
+    API->>DB: Create Task (PENDING)
     API-->>User: 201 Created
     User->>API: POST /tasks/{id}/execution-requests
-    API->>DB: START Request 저장 (미결 요청이 있으면 기존 요청 반환)
+    API->>DB: Store START Request (returns existing request if a pending one exists)
     API-->>User: 202 Accepted
 
     Note over Runner,DB: 2. Execution Request Claim
-    Note over Runner,DB: Runner 시작 시 advisory lock 획득 후 recover() 실행
-    loop Runner._loop - recover() 후 Runner._dispatch
-        Note over Runner,DB: 빈 실행 슬롯이 있을 때만 claim - 대기 중인 프로젝트 cap 초과 요청과 not_before 이전 요청은 건너뜀
-        Runner->>DB: PENDING Request claim (FOR UPDATE SKIP LOCKED) + claim_token 발급
+    Note over Runner,DB: On Runner startup, acquire advisory lock then run recover()
+    loop Runner._loop - after recover(), Runner._dispatch
+        Note over Runner,DB: Claim only when a free execution slot exists - skips requests over the waiting project cap and requests before not_before
+        Runner->>DB: Claim PENDING Request (FOR UPDATE SKIP LOCKED) + issue claim_token
         DB-->>Runner: CLAIMED Request
-        Runner->>Runner: asyncio Task 로 process 시작 - registry 등록, 완료 callback 이 슬롯 반환
+        Runner->>Runner: Start process as an asyncio Task - registered in registry, completion callback returns the slot
     end
 
-    Note over Runner,PC: 3. Lease 획득
+    Note over Runner,PC: 3. Lease Acquisition
     Runner->>Lease: acquire(task_id, fence=(request, claim_token))
-    opt 만료된 Lease 인계 경로에서만
-        Lease->>PC: 이전 CLI 프로세스 확인 및 종료
+    opt Only on the expired Lease handover path
+        Lease->>PC: Check and terminate the previous CLI process
         PC-->>Lease: TerminationResult
     end
 
-    Note over Runner,Gate: 4. Workflow 실행 및 5. 결과 처리
+    Note over Runner,Gate: 4. Workflow Execution and 5. Result Handling
     alt ACQUIRED
         Lease-->>Runner: Lease
         Runner->>DB: attach_run(request, run_id, claim_token)
         Runner->>WF: run_task(lease, task_id, resume_approval_id, request_id)
-        WF->>DB: Step / 상태 / Approval 저장
-        WF-->>Runner: 결과 상태
+        WF->>DB: Store Step / status / Approval
+        WF-->>Runner: Result status
         alt LEASE_LOST
-            Runner->>DB: Request requeue (lease_lost)
-        else BLOCKED - 프로젝트 write lock 대기
-            Runner->>DB: Request requeue (project_busy) + 지수 backoff not_before
-        else 그 외 - 정상 결과, WAITING_APPROVAL, terminal
-            Runner->>DB: Request DONE (claim_token 일치 시에만)
+            Runner->>DB: Requeue Request (lease_lost)
+        else BLOCKED - waiting on a project write lock
+            Runner->>DB: Requeue Request (project_busy) + exponential backoff not_before
+        else Other - normal result, WAITING_APPROVAL, terminal
+            Runner->>DB: Mark Request DONE (only if claim_token matches)
         end
     else FENCED
-        Lease-->>Runner: 요청이 requeue 또는 재claim 되어 이 coroutine 은 소유자가 아님
-        Runner-->>Runner: 아무 것도 기록하지 않고 종료
+        Lease-->>Runner: The request was requeued or re-claimed, so this coroutine is not the owner
+        Runner-->>Runner: Exits without recording anything
     else HELD
-        Lease-->>Runner: 활성 Lease 또는 인계 경쟁
-        Runner->>DB: Request requeue (held:사유) + 지수 backoff not_before
+        Lease-->>Runner: Active Lease or handover contention
+        Runner->>DB: Requeue Request (held:<reason>) + exponential backoff not_before
     else UNCERTAIN
-        Lease-->>Runner: 이전 CLI 종료 미입증
-        Runner->>Gate: Runner._park_uncertain - open_recovery (같은 트랜잭션)
-        Runner->>DB: Request NEEDS_REVIEW
+        Lease-->>Runner: Prior CLI termination not proven
+        Runner->>Gate: Runner._park_uncertain - open_recovery (same transaction)
+        Runner->>DB: Mark Request NEEDS_REVIEW
     end
 ```
 
-## 읽는 방법
+## How to read this
 
-- `POST /tasks`는 PENDING Task를 만들 뿐 아무것도 실행하지 않습니다.
-- `POST /tasks/{id}/execution-requests`는 신규 요청 여부와 관계없이 현재 Router에서 202를 반환하며, 요청만 저장하고 CLI를 직접 실행하지 않습니다. 종료 상태 Task는 409, `WAITING_APPROVAL` Task도 409(승인 후 자동 재개)입니다.
-- 승인 결정으로 생성되는 RESUME 요청도 같은 `execution_requests` 테이블에 저장되어 같은 경로로 소비됩니다 ([08](08-human-gate.md)).
-- `LeaseService.acquire`는 `ACQUIRED`, `HELD`, `UNCERTAIN`, `FENCED`를 반환합니다. `HELD`는 활성(미만료) Lease가 있거나 인계 중 상태가 바뀐 경우이며, 요청은 종료되지 않고 `held:<reason>`과 함께 `PENDING`으로 requeue됩니다. `FENCED`는 이 coroutine이 claim한 뒤 요청이 requeue되거나 다시 claim되어 `claim_token`이 달라진 경우입니다.
-- `UNCERTAIN`이면 아무 것도 실행하지 않습니다. RECOVERY Approval 생성과 요청 `NEEDS_REVIEW` 처리는 `LeaseService`가 아니라 `Runner._park_uncertain`이 한 트랜잭션에서 수행합니다 ([09](09-recovery.md)).
-- `LEASE_LOST`는 요청을 requeue하고, `BLOCKED`(프로젝트 write lock을 다른 Task가 보유)는 지연 requeue합니다. 정상 결과·`WAITING_APPROVAL`·terminal 상태 결과는 요청을 `DONE`으로 처리합니다.
-- **claim fencing**: claim마다 새 `claim_token`이 발급되고, 이후 `process` 시작, `acquire`(Txn A·B), `attach_run`, `finish`, `requeue`가 모두 `status=CLAIMED AND claim_token=<token>` 조건을 확인합니다. 이미 requeue된 요청을 뒤늦게 진행하는 이전 coroutine은 어떤 변경도 남기지 못합니다.
-- **지연(backoff)**: `HELD`·`project_busy` requeue는 `execution_requests.defer_count`를 1 증가시키고 `not_before`를 `min(60s, 5s·2^이전_defer_count)`에 jitter(0.8~1.2)를 곱한 시각으로 저장합니다(jitter 제외 5s, 10s, 20s ...). `claim_next`는 `not_before`가 지난 요청만 claim하며, 값은 PostgreSQL에 있으므로 Runner 재시작 뒤에도 유지됩니다. 재시작 recover의 단순 requeue는 카운터를 올리지 않습니다.
-- `Runner.recover`는 매 loop 반복마다(슬롯 여부와 무관하게) 실행됩니다. `CLAIMED`이고 `claimed_at`이 유예 시간(`claim_timeout_seconds`)을 넘겼으며 **살아 있는(미만료 RUNNING) Lease가 없는** 요청만 stale로 보고 requeue합니다. claim과 Lease 획득 사이의 정상 구간과, Lease를 가진 긴 CLI 실행은 건드리지 않습니다. 이어서 idle 취소 요청(`_cancel_idle_tasks`)을 처리하고, 종료된 Task가 남긴 Project write lock을 정리(`ProjectLockService.reconcile`)합니다. Recovery Gate를 직접 만들지 않습니다.
+- `POST /tasks` only creates a PENDING Task and executes nothing.
+- `POST /tasks/{id}/execution-requests` returns 202 from the current Router regardless of whether the request is new, only stores the request, and does not directly execute the CLI. A Task in a terminal state returns 409, and a Task in `WAITING_APPROVAL` also returns 409 (it resumes automatically after approval).
+- RESUME requests created by approval decisions are also stored in the same `execution_requests` table and consumed through the same path ([08](08-human-gate.md)).
+- `LeaseService.acquire` returns `ACQUIRED`, `HELD`, `UNCERTAIN`, or `FENCED`. `HELD` means an active (unexpired) Lease exists or the state changed during handover; the request is not terminated and is requeued as `PENDING` with `held:<reason>`. `FENCED` means that after this coroutine claimed the request, the request was requeued or re-claimed, so the `claim_token` no longer matches.
+- If `UNCERTAIN`, nothing is executed. Creating a RECOVERY Approval and setting the request to `NEEDS_REVIEW` are performed not by `LeaseService` but by `Runner._park_uncertain` in a single transaction ([09](09-recovery.md)).
+- `LEASE_LOST` requeues the request, and `BLOCKED` (another Task holds the project write lock) requeues it with a delay. Normal results, `WAITING_APPROVAL`, and terminal-state results mark the request as `DONE`.
+- **Claim fencing**: a new `claim_token` is issued for every claim, and subsequently `process` start, `acquire` (Txn A·B), `attach_run`, `finish`, and `requeue` all check the condition `status=CLAIMED AND claim_token=<token>`. A previous coroutine that belatedly proceeds on an already-requeued request cannot leave any change behind.
+- **Backoff**: `HELD`/`project_busy` requeues increment `execution_requests.defer_count` by 1 and store `not_before` as `min(60s, 5s·2^previous_defer_count)` multiplied by jitter (0.8–1.2) (excluding jitter: 5s, 10s, 20s ...). `claim_next` only claims requests whose `not_before` has passed, and since the value lives in PostgreSQL it persists across Runner restarts. A simple requeue from startup recovery does not increment the counter.
+- `Runner.recover` runs on every loop iteration (regardless of slot availability). It only treats a request as stale and requeues it if it is `CLAIMED`, its `claimed_at` has exceeded the grace period (`claim_timeout_seconds`), **and no live (unexpired RUNNING) Lease exists**. It does not touch the normal window between claim and Lease acquisition, nor a long-running CLI execution that holds a Lease. It then processes idle cancellation requests (`_cancel_idle_tasks`), and cleans up (`ProjectLockService.reconcile`) any Project write lock left behind by a finished Task. It does not directly create a Recovery Gate.
 
-## 병렬 dispatch
+## Parallel dispatch
 
-한 애플리케이션 프로세스 안에서 `Runner._dispatch`가 여러 Task를 동시에 실행합니다(프로젝트마다 OS 프로세스를 만들지 않습니다).
+Within a single application process, `Runner._dispatch` executes multiple Tasks concurrently (it does not spawn an OS process per project).
 
-- 슬롯은 **claim 전에** 확인합니다(`len(registry) < MAX_CONCURRENT_TASKS`). claim한 요청이 슬롯을 기다리며 대기하는 구조가 아닙니다.
-- 실행 중 요청은 registry(`request id → asyncio.Task`)에 있고, 완료 callback이 예외를 로그로 회수하고 슬롯을 반환하며 loop를 깨웁니다. 한 Task의 예외는 다른 Task에 전파되지 않습니다(요청은 `CLAIMED`로 남아 유예 시간 뒤 recover됩니다).
-- 같은 프로젝트의 동시 실행은 `MAX_TASKS_PER_PROJECT`(기본 1)로 제한합니다. 상한에 도달한 프로젝트의 요청은 `claim_next`가 건너뜁니다(`busy_project_ids`가 비어 있으면 조건 자체를 추가하지 않고, 있으면 UUID 배열로 bind하며 `project_id IS NULL`인 legacy Task는 제외하지 않습니다).
-- `project_id`가 없는 기존 Task는 각자 `WORKSPACE_ROOT/<task_id>`를 쓰므로 프로젝트 cap의 그룹이 아닙니다. 전역 한도와 Task Lease만 적용됩니다.
-- CLI·테스트 자식 프로세스 수는 `CommandExecutor`의 세마포어(`MAX_CONCURRENT_CLI_PROCESSES`)가 제한하며, 슬롯을 기다리는 중에 취소 요청이 오면 spawn 없이 `CANCELLED`로 끝납니다.
-- 종료(`Runner.stop`): 신규 claim 중단 → 진행 중 Task drain(`RUNNER_SHUTDOWN_GRACE_SECONDS`) → 남은 Task의 Lease를 로컬에서 revoke하고 CLI cancel → 그래도 끝나지 않으면 coroutine 취소(Lease는 그대로 두어 다음 시작의 `acquire`가 판정) → advisory lock 해제.
-- Runner 수명 상태는 프로세스 내부 값(`STOPPED → STARTING → RUNNING → STOPPING → STOPPED`, 실패 시 `STOP_INCOMPLETE`)이며 DB에 저장하지 않습니다. `start`는 `STOPPED`에서만, `stop`은 `RUNNING`/`STOP_INCOMPLETE`에서만 동작하고(`STOPPED`는 no-op, `STARTING`/`STOPPING`은 `RuntimeError`), 시작 도중 실패하면 쥐고 있던 connection의 unlock·close를 확인한 뒤 `STOPPED`로 돌아갑니다(close를 확인하지 못하면 아래 `STOP_INCOMPLETE`). 종료/시작 실패의 최종 전환(`STOPPED` 또는 `STOP_INCOMPLETE`)은 취소로부터 보호된 정산 task가 실제 resource를 보고 수행하므로 `STARTING`/`STOPPING`에 남지 않습니다. 상태 전이와 recovery의 짧은 DB 트랜잭션은 `_lifecycle_lock`으로 직렬화하며 CLI 실행·drain에는 걸지 않습니다.
-- `recover(startup=True)`(모든 CLAIMED 요청 재처리)는 `STARTING`이면서 advisory lock을 쥔 때만, 주기 recovery는 `RUNNING`에서만 허용되고 그 밖의 상태에서는 DB를 바꾸지 않고 `RuntimeError`입니다.
-- `STOP_INCOMPLETE`는 **살아 있는 in-flight Task 또는 정리가 확인되지 않은 runtime connection**(advisory lock connection, 또는 시작 실패 뒤 close가 확인되지 않은 connection)이 남은 상태입니다. 살아 있는 Task가 남으면 `RunnerStopIncomplete`가 발생하며, connection close가 실패하면 그 오류가 그대로 전파됩니다. 이때 Runner는 in-flight 목록과 connection을 **유지**하고 `start`·recovery를 거부하며 `stop` 재호출(남은 Task drain과 connection unlock·close 재시도)만 허용합니다. 프로세스가 끝나면 OS가 연결을 닫아 lock이 풀리지만, 같은 프로세스가 계속 살아 있으면 이후 `stop`이 성공할 때까지 해당 connection을 보유합니다. 애플리케이션 lifespan은 stop이 성공한 뒤에만, 그리고 내부에서 만든 DB일 때만 `dispose`합니다.
-- 프로세스 슬롯 대기 중 취소된 명령은 permit을 정확히 한 번만 반환하며, 취소가 이미 설정된 명령은 spawn되지 않습니다(`CommandExecutor`).
-- DB 연결 pool 설정(`DB_POOL_SIZE`, `DB_MAX_OVERFLOW`)은 [README](../../README.md)를 따릅니다.
-- 전역 advisory lock은 그대로 "Runner(Coordinator) 프로세스는 하나"라는 보호입니다. Task 단위 배제는 Lease, Project 단위 배제는 `projects.write_owner_task_id`입니다 ([07](07-lease.md)).
-- `app.infra.process_control` 모듈은 만료된 Lease 인계 중 이전 프로세스 확인이 필요한 경로에서만 호출됩니다. 절차(Txn A → 트랜잭션 밖 프로세스 확인·종료 → Txn B)는 [07](07-lease.md)에 있습니다.
+- Slots are checked **before claiming** (`len(registry) < MAX_CONCURRENT_TASKS`). There is no structure where a claimed request waits for a slot.
+- In-flight requests live in the registry (`request id → asyncio.Task`), and the completion callback catches exceptions into the log, returns the slot, and wakes the loop. An exception in one Task does not propagate to other Tasks (the request remains `CLAIMED` and is recovered after the grace period).
+- Concurrent execution for the same project is limited by `MAX_TASKS_PER_PROJECT` (default 1). Requests for a project that has reached the cap are skipped by `claim_next` (if `busy_project_ids` is empty, the condition itself is not added; if not empty, it is bound as a UUID array, and legacy Tasks with `project_id IS NULL` are not excluded).
+- Existing Tasks without a `project_id` each use `WORKSPACE_ROOT/<task_id>`, so they are not part of any project cap group. Only the global limit and the Task Lease apply.
+- The number of CLI/test child processes is limited by `CommandExecutor`'s semaphore (`MAX_CONCURRENT_CLI_PROCESSES`); if a cancellation request arrives while waiting for a slot, it ends as `CANCELLED` without spawning.
+- Shutdown (`Runner.stop`): stop accepting new claims → drain in-flight Tasks (`RUNNER_SHUTDOWN_GRACE_SECONDS`) → locally revoke the Lease of remaining Tasks and cancel the CLI → if still not finished, cancel the coroutine (leaving the Lease as-is so the next startup's `acquire` makes the determination) → release the advisory lock.
+- Runner lifecycle state is an in-process value (`STOPPED → STARTING → RUNNING → STOPPING → STOPPED`, or `STOP_INCOMPLETE` on failure) and is not stored in the DB. `start` only works from `STOPPED`, and `stop` only works from `RUNNING`/`STOP_INCOMPLETE` (`STOPPED` is a no-op, `STARTING`/`STOPPING` raise `RuntimeError`); if startup fails, it confirms the unlock/close of the connection it was holding before reverting to `STOPPED` (if close cannot be confirmed, it becomes `STOP_INCOMPLETE` as described below). The final transition for shutdown/startup failure (`STOPPED` or `STOP_INCOMPLETE`) is performed by a settlement task protected from cancellation that inspects the actual resources, so it does not remain stuck in `STARTING`/`STOPPING`. The `_lifecycle_lock` is an in-process mutex used only for state transitions, recovery permission checks, and registering/reclaiming recovery tasks. It is not held during CLI execution or draining, nor **during recovery's DB I/O**, so `stop` can transition immediately to `STOPPING` even if the DB is delayed.
+- `recover(startup=True)` (reprocessing all CLAIMED requests) is allowed only while in `STARTING` and holding the advisory lock; periodic recovery is allowed only in `RUNNING`; in any other state it raises `RuntimeError` without changing the DB.
+- **Recovery work**: the permission check and registration happen together under `_lifecycle_lock` (only one recovery task is registered per Runner; if a periodic call encounters an already-running task, it returns `SKIPPED`, and if a startup call does, it errors), while DB work runs outside the lock in a separate task. Request changes happen in a single transaction, and each UPDATE conditions on the `claim_token` as read at query time (if the condition doesn't match, it leaves the row untouched), so a request taken over by another owner after the query is not overwritten. A recovery where nothing applies ends safely with no DB changes.
+- **Recovery waiting and post-cancellation settlement are bounded**. It waits for `RUNNER_RECOVERY_TIMEOUT_SECONDS` (default 20), and if exceeded, requests cancellation once and then waits for settlement for `RUNNER_RECOVERY_SHUTDOWN_WAIT_SECONDS` (default 5). Even if a rollback etc. is confirmed within this time, it is still a `RecoveryTimeout`, and work that hasn't finished is not treated as cancelled but is left as-is. The server-side statement is limited by `RECOVERY_STATEMENT_TIMEOUT_SECONDS` (default 15, transaction-local), but this is not an upper bound on commit, network, or connection close. If the caller is cancelled, the original `CancelledError` is re-raised as-is. During stop settlement, cleanup and reconciliation may each run as a separate bounded operation, so the recovery timeout cannot be assumed to apply only once.
+- **DB result and connection cleanup are judged separately**. If commit returns normally, the result is COMMITTED even if the subsequent close fails, and the connection attempts disposal via `invalidate`. If cleanup cannot be confirmed, ownership is retained, and during that time subsequent work (such as `_cancel_idle_tasks`) and releasing the advisory lock do not happen. If the result is unknown after the commit request, it is recorded as UNCERTAIN, and without changing any new requests, a single read-only query checks whether all target requests are either entirely in their original state or entirely in the intended state (if mixed or the query fails, the evidence is preserved and it proceeds to `STOP_INCOMPLETE` or a subsequent attempt). Having a timeout does not mean every commit result is confirmed as a rollback.
+- `STOP_INCOMPLETE` is a state where **live in-flight Tasks, recovery that hasn't finished or whose result isn't confirmed, or a runtime connection whose cleanup isn't confirmed** (the advisory lock connection, or a connection whose close wasn't confirmed after a startup failure) remain. Shutdown settlement attempts each stage fully in order — loop exit → recovery settlement → drain → advisory connection cleanup — collecting and reporting errors. If a live or unconfirmed recovery remains, the advisory lock connection is not closed, in order to block other Runners from starting and preserve singleton ownership (the recovery DB connection and the advisory lock connection are separate). Sections this document does not bound, such as advisory connection close, may have no upper bound under the current contract, so **the entirety of Runner stop is not guaranteed to be bounded**. If live Tasks remain, `RunnerStopIncomplete` is raised, and if connection close fails, that error propagates as-is. In this case the Runner **retains** the in-flight list and connections, rejects `start`/recovery, and only allows re-calling `stop` (retrying the drain of remaining Tasks and connection unlock/close). Once the process ends, the OS closes the connection and releases the lock, but as long as the same process stays alive, it keeps holding that connection until a subsequent `stop` succeeds. The application lifespan only `dispose`s the DB after `stop` succeeds, and only if the DB was created internally.
+- A command cancelled while waiting for a process slot returns the permit exactly once, and a command whose cancellation is already set is not spawned (`CommandExecutor`).
+- DB connection pool settings (`DB_POOL_SIZE`, `DB_MAX_OVERFLOW`) follow the [README](../../README.md).
+- The global advisory lock is retained at this stage as well, and is used to guarantee a multi-process singleton (switching to an OS lock or similar is a separate decision to be made after confirming the deployment topology). As-is, it protects the invariant that "there is only one Runner (Coordinator) process." Task-level exclusion is via Lease, and Project-level exclusion is via `projects.write_owner_task_id` ([07](07-lease.md)).
+- The `app.infra.process_control` module is only invoked on the path where checking the previous process is needed during an expired Lease handover. The procedure (Txn A → process check/termination outside the transaction → Txn B) is in [07](07-lease.md).
 
-## 현재 구현 제한
+## Current implementation limitations
 
-- Runner(Coordinator) 프로세스는 하나만 지원합니다. 두 번째 프로세스는 advisory lock 획득에 실패하면 Runner를 시작하지 않고 요청 저장만 수행합니다. 병렬성은 한 프로세스 안의 asyncio Task입니다.
-- 정확히 한 번 실행은 보장하지 않습니다(at-least-once + 변경 감지). 불확실한 실행은 자동 재실행하지 않고 RECOVERY Gate로 갑니다.
-- 병렬 실행 한도(`MAX_CONCURRENT_TASKS`, `MAX_TASKS_PER_PROJECT`, `MAX_CONCURRENT_CLI_PROCESSES`)는 설정값이며, DB pool은 기본값(10+10) 그대로입니다. 한도를 크게 올릴 때는 pool 크기를 함께 검토해야 합니다.
+- Only one Runner (Coordinator) process is supported. A second process, if it fails to acquire the advisory lock, does not start a Runner and only stores requests. Parallelism is via asyncio Tasks within one process.
+- Exactly-once execution is not guaranteed (at-least-once + change detection). Uncertain executions are not automatically re-run and instead go to the RECOVERY Gate.
+- The concurrency limits (`MAX_CONCURRENT_TASKS`, `MAX_TASKS_PER_PROJECT`, `MAX_CONCURRENT_CLI_PROCESSES`) are configuration values, and the DB pool remains at its default (10+10). When raising the limits significantly, pool size should be reviewed together.

@@ -1,5 +1,7 @@
 # Architecture and decision log
 
+> 한국어: [ARCHITECTURE_ko.md](ARCHITECTURE_ko.md)
+
 ## Layers (Layered Architecture, no DDD)
 
 ```

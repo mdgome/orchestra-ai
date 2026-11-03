@@ -1,61 +1,63 @@
-# Planning 및 Design Review
+# Planning and Design Review
 
-> 현재 구현 코드를 기준으로 정리한 흐름입니다. 코드로 확인되지 않았거나 검증되지 않은 동작은 현재 구현 제한으로 구분합니다.
+> 한국어: [04-planning-review_ko.md](04-planning-review_ko.md)
 
-아래 다이어그램은 PLANNING 진입부터 DEVELOPING 진입까지의 정상 흐름과 `NEEDS_REVISION`·Design Human Gate 재개 경로를 보여줍니다. 중심 클래스는 `WorkflowService`(`_do_plan`, `_do_design_review`, `_verdict_transition`)이며 Human Gate 결정 처리는 `HumanGateService`가 맡습니다.
+> This flow is organized based on the current implementation code. Behavior that is not confirmed by code or not verified is distinguished as a current implementation limitation.
+
+The diagram below shows the normal flow from PLANNING entry to DEVELOPING entry, and the `NEEDS_REVISION`/Design Human Gate resume paths. The central class is `WorkflowService` (`_do_plan`, `_do_design_review`, `_verdict_transition`), and Human Gate decision handling is the responsibility of `HumanGateService`.
 
 ```mermaid
 flowchart TD
     subgraph PLANNING["1. Planning"]
         direction TB
-        A(["PLANNING"]) --> RV{"input_hash 가 같은 유효한 SUCCEEDED Plan?"}
-        RV -->|"No"| B["Claude Planner - Plan Mode - 읽기 전용 도구만"]
-        B --> C{"Workspace Snapshot 변경 없음?"}
-        C -->|"변경됨"| PF["PLANNER_MODIFIED_FILES - Step FAILED 및 Task FAILED"]
+        A(["PLANNING"]) --> RV{"Is there a valid SUCCEEDED Plan with the same input_hash?"}
+        RV -->|"No"| B["Claude Planner - Plan Mode - read-only tools only"]
+        B --> C{"No Workspace Snapshot changes?"}
+        C -->|"Changed"| PF["PLANNER_MODIFIED_FILES - Step FAILED and Task FAILED"]
     end
 
-    subgraph ARTIFACT["2. Plan Artifact 검증"]
+    subgraph ARTIFACT["2. Plan Artifact Validation"]
         direction TB
         D{"human_gate_request?"}
-        D -->|"No"| E{"Orchestrator 가 Plan Artifact 검증"}
-        E -->|"실패"| F["step_attempt 재시도 또는 STEP_ATTEMPTS_EXHAUSTED"]
-        E -->|"성공"| G["Plan Artifact 저장 및 plan_hash 계산"]
+        D -->|"No"| E{"Orchestrator validates Plan Artifact"}
+        E -->|"Failure"| F["step_attempt retry or STEP_ATTEMPTS_EXHAUSTED"]
+        E -->|"Success"| G["Save Plan Artifact and compute plan_hash"]
     end
 
     subgraph REVIEW["3. Design Review"]
         direction TB
-        H["DESIGN_REVIEWING - Codex Design Reviewer - 저장된 Plan Artifact 만 검토"] --> I{"verdict"}
-        I -->|"PASS 이지만 CRITICAL issue 포함"| NR
-        I -->|"NEEDS_REVISION"| NR{"replan_count 가 max_replans 미만?"}
+        H["DESIGN_REVIEWING - Codex Design Reviewer - reviews only the stored Plan Artifact"] --> I{"verdict"}
+        I -->|"PASS but contains a CRITICAL issue"| NR
+        I -->|"NEEDS_REVISION"| NR{"Is replan_count below max_replans?"}
         NR -->|"No"| FAIL(["FAILED - MAX_REPLANS_EXCEEDED"])
-        I -->|"PASS"| L["PASS 와 design_review_basis 기록"]
+        I -->|"PASS"| L["Record PASS and design_review_basis"]
     end
 
     subgraph GATE["4. Design Human Gate"]
         direction TB
-        HG["DESIGN Human Gate - checkpoint PLAN"] --> HD["결정 저장 - 승인과 거절 모두 design_decisions 및 decisions_hash 갱신"]
-        HD --> RS["RESUME Execution Request 생성"]
-        RS --> PR["재개 시 plan_revision 증가"]
+        HG["DESIGN Human Gate - checkpoint PLAN"] --> HD["Save decision - both approval and rejection update design_decisions and decisions_hash"]
+        HD --> RS["Create RESUME Execution Request"]
+        RS --> PR["plan_revision increments on resume"]
     end
 
-    subgraph BASIS["5. Basis 재검증"]
+    subgraph BASIS["5. Basis Revalidation"]
         direction TB
-        BS{"Development 직전 - 현재 Basis 와 PASS Basis 일치?"}
+        BS{"Right before Development - does the current Basis match the PASS Basis?"}
     end
 
-    subgraph NEXT["6. 종료 및 다음 단계"]
+    subgraph NEXT["6. Completion and Next Step"]
         direction TB
         DEV(["DEVELOPING"])
     end
 
     RV -->|"Yes - plan_reused"| H
-    C -->|"변경 없음"| D
+    C -->|"No change"| D
     D -->|"Yes"| HG
     G --> H
-    NR -->|"Yes - NEEDS_REVISION 처리: replan_count 및 plan_revision 증가 후 PLANNING 전이"| K["PLANNING - Planner 세션 resume"]
+    NR -->|"Yes - Handle NEEDS_REVISION: increment replan_count and plan_revision, then transition to PLANNING"| K["PLANNING - resume Planner session"]
     K --> B
     I -->|"NEEDS_HUMAN_REVIEW"| HG
-    PR -->|"Gate 결정 재개: PLANNING 복귀"| A
+    PR -->|"Resume after Gate decision: return to PLANNING"| A
     L --> BS
     BS -->|"No - design_review_basis_changed"| H
     BS -->|"Yes"| DEV
@@ -63,19 +65,19 @@ flowchart TD
 
 ## design_review_basis
 
-`design_review_basis = hash(requirements_hash, plan_hash, decisions_hash, review_policy_hash)`입니다 (`app/services/fingerprints.py`의 `design_review_basis`).
+`design_review_basis = hash(requirements_hash, plan_hash, decisions_hash, review_policy_hash)` (the `design_review_basis` function in `app/services/fingerprints.py`).
 
-- Design Review 결과(`task_steps.output`)에 검토 시점의 basis가 저장됩니다.
-- `WorkflowService._do_develop`는 저장된 PASS의 `basis_hash`가 현재 basis와 다르면 Development를 시작하지 않고 DEVELOPING → DESIGN_REVIEWING으로 되돌립니다 (`design_review_basis_changed`).
-- Human Gate가 요청 시점에 저장하는 `approvals.basis`(`current_basis`)는 `requirements_hash`, `plan_hash`, `decisions_hash` 3개로 구성되며 `review_policy_hash`를 포함하지 않습니다. 이 값은 결정이 stale한지 판단하는 데만 사용됩니다.
+- The Design Review result (`task_steps.output`) stores the basis as of the time of review.
+- If the stored PASS's `basis_hash` differs from the current basis, `WorkflowService._do_develop` does not start Development and reverts DEVELOPING → DESIGN_REVIEWING (`design_review_basis_changed`).
+- The `approvals.basis` (`current_basis`) that the Human Gate stores at request time consists of the three values `requirements_hash`, `plan_hash`, and `decisions_hash`, and does not include `review_policy_hash`. This value is used only to determine whether a decision is stale.
 
-## 읽는 방법
+## How to read this
 
-- Planner는 Plan Mode와 읽기 도구만 사용합니다. Plan Artifact는 Planner가 파일로 쓰지 않고 Orchestrator가 CLI 출력에서 검증·저장합니다. 실행 전후 Snapshot 비교에서 변경이 감지되면 Step은 성공할 수 없습니다.
-- Design Reviewer는 저장된 Plan Artifact만 검토합니다. verdict가 `PASS`여도 CRITICAL issue가 있으면 `NEEDS_REVISION`으로 처리됩니다.
-- PLANNING으로 돌아오는 경로는 두 가지이며 원인과 처리 메서드가 다릅니다.
-  - `NEEDS_REVISION`: `WorkflowService._verdict_transition`이 `replan_count`와 `plan_revision`을 증가시키고 PLANNING으로 전이합니다. `max_replans`를 따르며 Planner는 자신의 Native Session을 resume합니다 (Session이 유효한 경우, [06](06-session.md)).
-  - DESIGN Human Gate 결정: 승인이든 거절이든 `design_decisions`가 저장되고 `decisions_hash`가 갱신됩니다. 결정과 RESUME 요청은 같은 트랜잭션에 저장되며, Runner가 요청을 소비해 `WorkflowService._resume_from_approval`이 재개할 때 `plan_revision`이 증가하고 PLANNING부터 다시 수행합니다. `replan_count`는 증가하지 않습니다. 즉시 DEVELOPING으로 가지 않습니다 ([08](08-human-gate.md)).
-- Design Review PASS 뒤에는 별도의 일반적인 Human Gate 판정이 없습니다.
-- `PLAN` Step 자체가 `human_gate_request`를 반환하는 경우에도 같은 DESIGN Gate 경로입니다.
-- 다음 단계(`DEVELOPING`)는 [05](05-development-testing.md)에서 이어집니다.
+- The Planner uses only Plan Mode and read-only tools. The Plan Artifact is not written to a file by the Planner — the Orchestrator validates and stores it from the CLI output. If a change is detected when comparing Snapshots before and after execution, the Step cannot succeed.
+- The Design Reviewer reviews only the stored Plan Artifact. Even if the verdict is `PASS`, if there is a CRITICAL issue it is treated as `NEEDS_REVISION`.
+- There are two paths back to PLANNING, and their causes and handling methods differ.
+  - `NEEDS_REVISION`: `WorkflowService._verdict_transition` increments `replan_count` and `plan_revision` and transitions to PLANNING. It follows `max_replans`, and the Planner resumes its own Native Session (if the Session is valid, [06](06-session.md)).
+  - DESIGN Human Gate decision: Whether approved or rejected, `design_decisions` is stored and `decisions_hash` is updated. The decision and the RESUME request are stored in the same transaction, and when the Runner consumes the request and `WorkflowService._resume_from_approval` resumes, `plan_revision` increments and execution resumes from PLANNING. `replan_count` does not increment. It does not go directly to DEVELOPING ([08](08-human-gate.md)).
+- After Design Review PASS, there is no separate general Human Gate judgment.
+- Even when the `PLAN` Step itself returns `human_gate_request`, it is the same DESIGN Gate path.
+- The next step (`DEVELOPING`) continues in [05](05-development-testing.md).

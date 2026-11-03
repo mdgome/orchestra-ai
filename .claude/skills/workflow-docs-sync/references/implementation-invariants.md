@@ -39,7 +39,7 @@
 
 ## 알려진 제한
 - Advisory Lock 연결 상실을 지속 감시하지 않는다.
-- Runner 수명 상태(`STOPPED/STARTING/RUNNING/STOPPING/STOP_INCOMPLETE`)는 프로세스 내부 값이며, recovery는 STARTING(startup)/RUNNING(주기)에서만 `_lifecycle_lock` 아래 실행된다. `STOP_INCOMPLETE`는 살아 있는 in-flight Task 또는 정리가 확인되지 않은 runtime connection이 남은 상태이며 start·recovery를 거부하고 stop 재호출만 허용한다(advisory lock이 반드시 남는다고 단정하지 않는다).
+- Runner 수명 상태(`STOPPED/STARTING/RUNNING/STOPPING/STOP_INCOMPLETE`)는 프로세스 내부 값이며, recovery는 STARTING(startup)/RUNNING(주기)에서만 허용된다. lifecycle 허용 검사와 recovery task의 등록·회수는 `_lifecycle_lock` 아래에서 수행하고, recovery DB I/O는 lifecycle lock 밖에서 수행한다. Runner별 recovery operation은 하나만 등록된다(등록 자체가 단일 실행 gate). unresolved recovery(live task, commit 결과 불명, connection 정리 미확인)는 `STOP_INCOMPLETE`와 advisory lock 유지의 원인이 된다. `STOP_INCOMPLETE`는 살아 있는 in-flight Task, 미해결 recovery 또는 정리가 확인되지 않은 runtime connection이 남은 상태이며 start·recovery를 거부하고 stop 재호출만 허용한다(advisory lock이 반드시 남는다고 단정하지 않는다). advisory connection close 등 bound를 두지 않은 구간이 있으므로 stop 전체가 bounded라고 쓰지 않는다.
 - Snapshot 실패는 이미 기록된 CLI 결과를 바꾸지 않고 `SNAPSHOT_FAILED`로 fail-closed 한다. Terminal 트랜잭션과 ExecutionRequest `DONE`은 별도 트랜잭션이다.
 - 프로세스 종료 신원이 `(pid, create_time)`에 한정된다.
 - Codex 역할의 PERMISSION 승인은 `enforceable=false`이면 RESUME이 생성되지 않아 Task가 `WAITING_APPROVAL`에 남고 자동 복구 경로가 없다.

@@ -1,50 +1,52 @@
 # Session Management
 
-> 현재 구현 코드를 기준으로 정리한 흐름입니다. 코드로 확인되지 않았거나 검증되지 않은 동작은 현재 구현 제한으로 구분합니다.
+> 한국어: [06-session_ko.md](06-session_ko.md).
 
-Session 처리는 `StepRunner`가 호출하는 `SessionService`(검증·기록)와 `PostgresSessionStore`(저장)로 이루어집니다. API가 `SessionService`를 직접 호출하지 않습니다.
+> This flow is organized based on the current implementation code. Behaviors not confirmed in code or not verified are distinguished as current implementation limitations.
 
-아래 다이어그램은 Agent Step 하나가 시작되어 Session이 기록되기까지의 정상 흐름과 Session 관련 실패 경로를 보여줍니다. 중심 클래스는 `StepRunner`(호출자)와 `SessionService`이며, Lease·Pending Approval·실행 한도 검증은 `SessionService`가 아니라 호출자 구역에 둡니다.
+Session handling consists of `SessionService` (validation·recording), which `StepRunner` calls, and `PostgresSessionStore` (storage). The API does not call `SessionService` directly.
+
+The diagram below shows the normal flow from the start of a single Agent Step to the recording of the Session, and the Session-related failure paths. The central classes are `StepRunner` (caller) and `SessionService`; Lease, Pending Approval, and execution-limit validation reside in the caller's zone, not in `SessionService`.
 
 ```mermaid
 flowchart TD
-    subgraph CALLER["1. 호출자 사전 검증 - StepRunner"]
+    subgraph CALLER["1. Caller pre-validation - StepRunner"]
         direction TB
-        A["WorkflowService 가 Agent Step 시작"] --> B["StepRunner.begin - Lease verify 및 사전 조건"]
-        B --> C{"Lease 소유 및 Pending Approval 없음 및 실행 한도 이내?"}
-        C -->|"Yes"| D["StepRunner._record_start - 짧은 트랜잭션"]
+        A["WorkflowService starts Agent Step"] --> B["StepRunner.begin - Lease verify and preconditions"]
+        B --> C{"Lease owned, no Pending Approval, and within execution limits?"}
+        C -->|"Yes"| D["StepRunner._record_start - short transaction"]
     end
 
     subgraph PREPARE["2. SessionService.prepare"]
         direction TB
-        E["SessionService.prepare"] --> F{"Conversation 이 ACTIVE 이고 만료 전?"}
-        F -->|"Yes"| G{"Task 와 Conversation 결속 및 Role 과 Provider 일치?"}
-        G -->|"Yes"| H{"Agent Session 상태"}
+        E["SessionService.prepare"] --> F{"Is Conversation ACTIVE and not expired?"}
+        F -->|"Yes"| G{"Task-Conversation binding and Role-Provider match?"}
+        G -->|"Yes"| H{"Agent Session state"}
     end
 
-    subgraph PROVIDER["3. Provider 실행 또는 Resume"]
+    subgraph PROVIDER["3. Provider execution or Resume"]
         direction TB
-        NEW["신규 Native Session 으로 실행"] --> J["CLI 실행 - 트랜잭션 밖"]
-        RES["Provider Native Resume"] --> I{"CLI 결과"}
+        NEW["Execute with new Native Session"] --> J["CLI execution - outside transaction"]
+        RES["Provider Native Resume"] --> I{"CLI result"}
     end
 
     subgraph RECORD["4. SessionService.record_result"]
         direction TB
-        K["StepRunner._record_finish - Lease verify 후 SessionService.record_result"]
+        K["StepRunner._record_finish - SessionService.record_result after Lease verify"]
     end
 
-    subgraph CAS["5. CAS 및 감사 기록"]
+    subgraph CAS["5. CAS and audit recording"]
         direction TB
-        L{"version CAS 성공?"}
-        L -->|"Yes"| ACT(["Session ACTIVE - 감사 이벤트에는 fingerprint 만 기록"])
+        L{"version CAS succeeded?"}
+        L -->|"Yes"| ACT(["Session ACTIVE - only fingerprint recorded in audit event"])
     end
 
-    subgraph FAILURE["6. 실패 처리"]
+    subgraph FAILURE["6. Failure handling"]
         direction TB
-        STOP["실행 차단 - LeaseLost 또는 FailClosed 또는 LimitExceeded 또는 Session 검증 실패"]
-        INV["Session INVALID 로 version CAS 갱신"] --> ONCE{"이번 Step 실행에서 첫 번째 교체?"}
-        RET["Session 은 INVALID 로 바꾸지 않음 - Step FAILED 후 step_attempt 정책"]
-        CF["SessionConflict 예외 전파"]
+        STOP["Execution blocked - LeaseLost or FailClosed or LimitExceeded or Session validation failure"]
+        INV["Update Session to INVALID via version CAS"] --> ONCE{"First replacement in this Step execution?"}
+        RET["Session not changed to INVALID - step_attempt policy after Step FAILED"]
+        CF["SessionConflict exception propagates"]
     end
 
     C -->|"No"| STOP
@@ -52,45 +54,44 @@ flowchart TD
     F -->|"No"| STOP
     G -->|"No"| STOP
     H -->|"CLOSED"| STOP
-    H -->|"없음 또는 INVALID 또는 만료 또는 native id 없음 또는 allow_resume 거짓"| NEW
-    H -->|"ACTIVE 이고 만료 전 이고 native id 있음"| RES
+    H -->|"None or INVALID or expired or no native id or allow_resume false"| NEW
+    H -->|"ACTIVE and not expired and native id present"| RES
     J --> K
-    I -->|"성공"| K
-    I -->|"SESSION_MISSING 명시"| INV
-    ONCE -->|"Yes - 한 번만"| D
+    I -->|"Success"| K
+    I -->|"Explicit SESSION_MISSING"| INV
+    ONCE -->|"Yes - only once"| D
     ONCE -->|"No"| RET
-    I -->|"TIMEOUT 또는 IDLE 또는 ERROR"| RET
+    I -->|"TIMEOUT or IDLE or ERROR"| RET
     K --> L
     L -->|"No"| CF
 ```
 
-- 구역 1은 `SessionService` 밖의 호출자 책임입니다. 구역 2~5가 `SessionService`와 저장소 책임이며, 구역 6은 각 구역에서 발생하는 실패의 결과입니다.
-- `SESSION_MISSING`으로 신규 Native Session 교체가 일어나면 `_record_start`부터 다시 시작합니다(간선 `ONCE → D`).
+- Zone 1 is the caller's responsibility, outside `SessionService`. Zones 2–5 are the responsibility of `SessionService` and the store, and Zone 6 is the result of failures occurring in each zone.
+- When a new Native Session replacement happens due to `SESSION_MISSING`, it restarts from `_record_start` (edge `ONCE → D`).
 
-## SessionService가 직접 검증하는 범위
+## Scope directly validated by SessionService
 
-`SessionService.prepare` / `record_result`가 직접 검증합니다.
+`SessionService.prepare` / `record_result` validate directly.
 
-- Conversation 존재, `ACTIVE` 상태, 만료
-- Task와 Conversation 결속(`task.conversation_id`와 Session의 `conversation_id` 일치)
-- Agent Role과 Provider 결속 (`validate_session_binding`)
-- Agent Session 상태(`CLOSED`는 차단) 및 만료 — `ACTIVE`이고 만료 전이며 native id가 있고 `allow_resume`일 때만 resume
-- `version` CAS (`record_result`)
+- Conversation existence, `ACTIVE` state, expiration
+- Task-Conversation binding (match between `task.conversation_id` and the Session's `conversation_id`)
+- Agent Role-Provider binding (`validate_session_binding`)
+- Agent Session state (`CLOSED` is blocked) and expiration — resume only when `ACTIVE`, not expired, native id is present, and `allow_resume`
 
-## 호출자가 검증하는 범위
+## Scope validated by the caller
 
-- Lease 소유권(`LeaseService.verify`), Pending Approval 존재, 실행 한도(`task_max_wall_seconds`, `max_cli_invocations`), 취소 요청은 `StepRunner.begin` / `_record_start`의 `_preconditions`가 검증합니다.
-- Resume 허용 여부(`allow_resume`)는 `WorkflowService`가 결정합니다. 예를 들어 Developer는 직전 Develop의 `plan_hash`가 현재 Plan과 같을 때만 resume합니다.
+- Lease ownership (`LeaseService.verify`), Pending Approval existence, execution limits (`task_max_wall_seconds`, `max_cli_invocations`), and cancellation requests are validated by `_preconditions` in `StepRunner.begin` / `_record_start`.
+- Whether resume is allowed (`allow_resume`) is decided by `WorkflowService`. For example, Developer resumes only when the `plan_hash` of the immediately preceding Develop matches the current Plan.
 
-## Native Session 실패 처리
+## Native Session failure handling
 
-- CLI가 명시적으로 `SESSION_MISSING`을 반환하고 resume 중이었던 경우에만 Session을 `INVALID` 처리하고, 한 번만 신규 Native Session으로 재시도합니다 (`StepRunner.execute`의 `replaced_once`).
-- Timeout이나 일시적 오류(`TIMEOUT`, `IDLE`, `ERROR`)만으로 Session을 무효화하지 않습니다. Step은 FAILED로 기록되고 기존 `step_attempt` 정책을 따릅니다.
-- Native Session ID는 API 응답과 감사 이벤트에 노출되지 않습니다. `state_transitions`의 `SESSION_EVENT`에는 비가역 fingerprint만 기록됩니다.
-- 작업이 종료(COMPLETED/FAILED/CANCELLED)되면 `close_all_for_task`가 ACTIVE Session을 `CLOSED`로 바꿉니다.
+- Session is set to `INVALID` and retried once with a new Native Session only when the CLI explicitly returns `SESSION_MISSING` and it was during resume (`replaced_once` in `StepRunner.execute`).
+- Timeout or transient errors (`TIMEOUT`, `IDLE`, `ERROR`) alone do not invalidate the Session. The Step is recorded as FAILED and follows the existing `step_attempt` policy.
+- Native Session ID is not exposed in API responses or audit events. The `SESSION_EVENT` in `state_transitions` records only an irreversible fingerprint.
+- When a task terminates (COMPLETED/FAILED/CANCELLED), `close_all_for_task` changes ACTIVE Sessions to `CLOSED`.
 
-## 현재 구현 제한
+## Current implementation limitations
 
-- CAS 충돌은 Recovery Gate가 아니라 fail-closed 실패로 처리됩니다. `SessionConflict`는 `WorkflowService.run_task`의 예외 처리 목록에 없으므로 결과 기록 트랜잭션이 롤백되고 예외가 `Runner` 루프로 전파되어 로그만 남습니다. 해당 요청은 `CLAIMED`로 남아 stale-claim 복구 대상이 됩니다.
-- 위 상황 이후의 복구 경로(미종료로 남은 Execution이 다음 Lease 인계에서 `UNCERTAIN`이 될 수 있음)는 코드 추정이며 테스트로 검증하지 않았습니다. 이 사실을 확인된 동작으로 간주하지 마십시오.
-- Session 기록 실패가 Task 상태를 직접 FAILED로 바꾸지 않습니다.
+- CAS conflicts are treated as fail-closed failures rather than going through the Recovery Gate. Since `SessionConflict` is not in the exception handling list of `WorkflowService.run_task`, the result-recording transaction is rolled back and the exception propagates to the `Runner` loop, leaving only a log entry. The corresponding request remains `CLAIMED` and becomes a target for stale-claim recovery.
+- The recovery path following the above situation (an Execution left unterminated may become `UNCERTAIN` at the next Lease handover) is a code-based inference and has not been verified by tests. Do not treat this as a confirmed behavior.
+- Session recording failure does not directly change the Task state to FAILED.

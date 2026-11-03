@@ -1,10 +1,12 @@
-# 전체 아키텍처 및 모듈 관계
+# Overall Architecture and Module Relationships
 
-> 현재 구현 코드를 기준으로 정리한 흐름입니다. 코드로 확인되지 않았거나 검증되지 않은 동작은 현재 구현 제한으로 구분합니다.
+> 한국어: [02-architecture_ko.md](02-architecture_ko.md)
 
-호출 방향은 `Router → Service → 구체 Repository / Provider`입니다. Workflow 실행은 API가 아니라 `Runner`가 시작합니다.
+> This is the flow organized based on the current implementation code. Behavior that is not confirmed or verified by code is classified as a current implementation limitation.
 
-아래 다이어그램은 모듈 간 호출 관계를 Layer별로 보여주는 구조도이며 실행 순서가 아닙니다. 중심 클래스는 `Runner`와 `WorkflowService`입니다. 별도 `RecoveryService`는 없으며 Recovery 관련 호출은 `open_recovery` 간선으로 표시했습니다.
+The call direction is `Router → Service → Concrete Repository / Provider`. Workflow execution is started by `Runner`, not by the API.
+
+The diagram below is a structural diagram showing call relationships between modules by Layer, not an execution order. The central classes are `Runner` and `WorkflowService`. There is no separate `RecoveryService`; Recovery-related calls are shown as the `open_recovery` edge.
 
 ```mermaid
 flowchart TB
@@ -28,29 +30,29 @@ flowchart TB
         STEP["StepRunner"]
         SESSION["SessionService"]
         TEST["TestPolicyService"]
-        COMPLETE["completion_checker.check_definition_of_done - 함수"]
+        COMPLETE["completion_checker.check_definition_of_done - function"]
         PROJ["ProjectService"]
         LOCK["ProjectLockService"]
         FIN["TaskFinalizer"]
-        EFFECTS["RecoveryEffects 와 ProjectDirtyRecoveryEffect"]
-        PTERM["project_terminal.release_on_terminal - 함수"]
-        STATE["state_service.change_task_state - 함수"]
+        EFFECTS["RecoveryEffects and ProjectDirtyRecoveryEffect"]
+        PTERM["project_terminal.release_on_terminal - function"]
+        STATE["state_service.change_task_state - function"]
     end
 
     subgraph PROVIDERS["Provider Layer"]
         direction TB
         CLAUDE["ClaudeCliProvider"]
         CODEX["CodexCliProvider"]
-        MOCK["Mock Provider - 테스트용"]
+        MOCK["Mock Provider - for testing"]
     end
 
     subgraph INFRA["Infrastructure Layer"]
         direction TB
         EXEC["Command Executor"]
-        PROC["process_control 모듈"]
+        PROC["process_control module"]
         GUARD["Workspace Guard"]
         SNAP["Workspace Snapshot"]
-        FPRINT["workspace_fingerprint 모듈"]
+        FPRINT["workspace_fingerprint module"]
     end
 
     subgraph DATA["Persistence Layer"]
@@ -66,9 +68,9 @@ flowchart TB
     end
 
     USER --> API
-    API -->|"Task 생성 및 Execution Request 저장"| TASK
-    API -->|"Approval 결정"| GATE
-    API -->|"Project 등록 및 조회"| PROJ
+    API -->|"Create Task and store Execution Request"| TASK
+    API -->|"Approval decision"| GATE
+    API -->|"Register and look up Project"| PROJ
     PROJ -->|"git clone"| EXEC
     PROJ --> FPRINT
     PROJ --> REPO
@@ -77,12 +79,12 @@ flowchart TB
     FIN -->|"measure_for_task"| LOCK
     LOCK --> FPRINT
     LOCK --> REPO
-    GATE -->|"reason_code 로 효과 조회"| EFFECTS
+    GATE -->|"Look up effect by reason_code"| EFFECTS
     EFFECTS --> LOCK
     EFFECTS --> STATE
     FIN --> STATE
     WF --> STATE
-    STATE -->|"terminal 전이"| PTERM
+    STATE -->|"terminal transition"| PTERM
     PTERM --> REPO
     RUNNER -->|"acquire / heartbeat / release"| LEASE
     RUNNER -->|"run_task"| WF
@@ -122,40 +124,40 @@ flowchart TB
     EVENT --> USER
 ```
 
-- `Runner`는 Service Layer와 분리된 구역으로 표시했지만 `LeaseService`와 `WorkflowService`를 호출하는 Service 계층의 소비자입니다.
-- Router는 `TaskService`, `ProjectService`, `HumanGateService`만 호출하며 `Runner`를 직접 실행하지 않습니다(결정·요청 저장 뒤 `Runner.notify`로 깨우기만 합니다).
+- `Runner` is shown as an area separate from the Service Layer, but it is a consumer of the Service layer that calls `LeaseService` and `WorkflowService`.
+- The Router only calls `TaskService`, `ProjectService`, and `HumanGateService`, and does not execute `Runner` directly (after storing a decision/request, it only wakes it via `Runner.notify`).
 
-## Project 관련 책임과 의존 방향
+## Project-related responsibilities and dependency direction
 
-| 모듈 | 책임 |
+| Module | Responsibility |
 |---|---|
-| `ProjectService` | 기존 로컬 Workspace 등록 또는 `git clone` 후 등록, 이름·상태 변경(`ARCHIVED`는 미종료 Task가 있으면 409). 경로 검증, 중복·중첩 차단, clone 보상(이번 요청이 만든 디렉터리만 정리) |
-| `ProjectLockService` | proof 측정(`measure_for_task`, `measure_project`), Step 시작 전 write lock 획득·검증·PROJECT_DIRTY Gate(`ensure_for_step`), `reconcile`. **terminal 정리 없음, Task 상태 변경 없음** |
-| `project_terminal` | `release_on_terminal` - terminal 전이 때 lock 해제·write baseline 정리·`workspace_state` 기록의 **단독 소유자**. 트랜잭션을 열지 않고 측정하지 않으며 `FingerprintProofStale`을 던짐 |
-| `TaskFinalizer` | `finalize_task_with_proof` - 측정(트랜잭션 밖) → 짧은 트랜잭션 → 재시도/`UNMEASURED` 종료 |
-| `RecoveryEffects`, `ProjectDirtyRecoveryEffect` | Recovery 종류(`reason_code`)별 효과. `HumanGateService`는 이 레지스트리만 알고 Project 모듈을 import하지 않음 |
-| `workspace_fingerprint` | `WORKSPACE_FINGERPRINT_V1` 측정 ([10](10-invalidation.md)) |
+| `ProjectService` | Register an existing local Workspace or register after `git clone`, change name/status (`ARCHIVED` returns 409 if there are non-terminal Tasks). Path validation, blocking duplicates/nesting, clone compensation (cleans up only the directory this request created) |
+| `ProjectLockService` | proof measurement (`measure_for_task`, `measure_project`), acquiring/validating write lock before Step start, PROJECT_DIRTY Gate (`ensure_for_step`), `reconcile`. **No terminal cleanup, no Task state changes** |
+| `project_terminal` | `release_on_terminal` - the **sole owner** of lock release, write baseline cleanup, and `workspace_state` recording on terminal transition. Does not open a transaction, does not measure, and throws `FingerprintProofStale` |
+| `TaskFinalizer` | `finalize_task_with_proof` - measure (outside the transaction) → short transaction → retry/terminate as `UNMEASURED` |
+| `RecoveryEffects`, `ProjectDirtyRecoveryEffect` | Effects per Recovery kind (`reason_code`). `HumanGateService` only knows this registry and does not import the Project module |
+| `workspace_fingerprint` | `WORKSPACE_FINGERPRINT_V1` measurement ([10](10-invalidation.md)) |
 
-의존은 한 방향입니다: `state_service → project_terminal → ProjectRepository`. `project_terminal`과 `ProjectLockService`는 `state_service`를 import하지 않고, `state_service`는 `ProjectLockService`를 import하지 않습니다. 상태 전이와 Project 효과의 조합은 상위 계층(`TaskFinalizer`, `WorkflowService`, `Runner`, `ProjectDirtyRecoveryEffect`)이 합니다(구조 테스트 `tests/architecture/test_project_rules.py`).
+The dependency is one-directional: `state_service → project_terminal → ProjectRepository`. `project_terminal` and `ProjectLockService` do not import `state_service`, and `state_service` does not import `ProjectLockService`. The combination of state transitions and Project effects is handled by the upper layers (`TaskFinalizer`, `WorkflowService`, `Runner`, `ProjectDirtyRecoveryEffect`) (structural test `tests/architecture/test_project_rules.py`).
 
-## Recovery 책임 분산
+## Recovery responsibility distribution
 
-별도의 `RecoveryService`는 존재하지 않습니다. Recovery 관련 책임은 다음 모듈에 분산되어 있습니다.
+There is no separate `RecoveryService`. Recovery-related responsibilities are distributed across the following modules.
 
-| 모듈 | 담당 |
+| Module | Responsibility |
 |---|---|
-| `Runner` | 시작 시와 loop마다 `recover()`(Lease 없는 stale CLAIMED 요청 requeue, 대기 중 취소 처리, 종료 Task가 남긴 Project lock reconcile), `_park_uncertain`(Lease 인계 UNCERTAIN 시 RECOVERY Gate와 요청 `NEEDS_REVIEW`) |
-| `WorkflowService` | `_park_for_recovery`, `_interrupted_needs_human`, `_recovery_unsafe`(승인 후 재검증), `_finalize_cancel` |
-| `HumanGateService` | `open_recovery`(Task/Approval/Step을 한 트랜잭션에서 전환, `reason_code` 기록), RECOVERY 결정 처리(`RecoveryEffects`에 위임) |
-| `ProjectLockService` | PROJECT_DIRTY Gate 진입(`ensure_for_step`), 남은 Project lock `reconcile` |
-| `LeaseService` | `acquire`의 만료 Lease 인계 및 `UNCERTAIN` 판정 |
-| `StepRunner` | 종료 미확인 결과를 `TerminationUnconfirmed`로 올림, Lease 상실 결과를 `discarded_result`로 격리 |
+| `Runner` | `recover()` at startup and on every loop (requeueing stale CLAIMED requests with no Lease, handling pending cancellations, reconciling Project locks left by terminated Tasks), `_park_uncertain` (RECOVERY Gate and request `NEEDS_REVIEW` when Lease handover is UNCERTAIN) |
+| `WorkflowService` | `_park_for_recovery`, `_interrupted_needs_human`, `_recovery_unsafe` (re-validation after approval), `_finalize_cancel` |
+| `HumanGateService` | `open_recovery` (transitions Task/Approval/Step within a single transaction, records `reason_code`), handling RECOVERY decisions (delegated to `RecoveryEffects`) |
+| `ProjectLockService` | Entering PROJECT_DIRTY Gate (`ensure_for_step`), `reconcile` of remaining Project locks |
+| `LeaseService` | Expired Lease handover and `UNCERTAIN` determination in `acquire` |
+| `StepRunner` | Raises unconfirmed-termination results as `TerminationUnconfirmed`, isolates results that lost their Lease as `discarded_result` |
 
-## 읽는 방법
+## How to read this
 
-- Router는 `TaskService`(요청 저장·조회)와 `HumanGateService`(결정)만 호출합니다. API가 `SessionService`를 직접 호출하지 않습니다.
-- `SessionService`는 `StepRunner`(`prepare`, `record_result`)와 `WorkflowService`·`Runner`(`close_all_for_task`)가 호출합니다. 실제 저장은 `StepRunner`가 만든 `PostgresSessionStore`를 통해서만 일어납니다.
-- `TaskService`는 Workflow를 시작하지 않습니다. `execution_requests`에 저장하면 `Runner`가 PostgreSQL에서 claim합니다 ([03](03-task-runner.md)).
-- Completion Checker는 별도의 Agent나 Service가 아니라 `WorkflowService`가 Code Review PASS를 처리하는 중에 호출하는 `check_definition_of_done` 함수입니다 ([11](11-task-lifecycle.md)).
-- `process_control`은 클래스가 아니라 `app.infra.process_control` 모듈입니다(`ProcessIdentity`, `TerminationResult`, `capture_identity`, `check_alive`, `terminate_tree`).
-- Event Bus는 in-memory이며 best-effort입니다. 진실 원천은 PostgreSQL입니다.
+- The Router only calls `TaskService` (storing/looking up requests) and `HumanGateService` (decisions). The API does not call `SessionService` directly.
+- `SessionService` is called by `StepRunner` (`prepare`, `record_result`) and by `WorkflowService`/`Runner` (`close_all_for_task`). Actual storage only happens through the `PostgresSessionStore` created by `StepRunner`.
+- `TaskService` does not start a Workflow. Once stored in `execution_requests`, `Runner` claims it from PostgreSQL ([03](03-task-runner.md)).
+- The Completion Checker is not a separate Agent or Service; it is the `check_definition_of_done` function that `WorkflowService` calls while processing a Code Review PASS ([11](11-task-lifecycle.md)).
+- `process_control` is not a class but the `app.infra.process_control` module (`ProcessIdentity`, `TerminationResult`, `capture_identity`, `check_alive`, `terminate_tree`).
+- The Event Bus is in-memory and best-effort. The source of truth is PostgreSQL.

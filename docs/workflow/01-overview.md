@@ -1,54 +1,56 @@
-# 전체 Workflow
+# Overall Workflow
 
-> 현재 구현 코드를 기준으로 정리한 흐름입니다. 코드로 확인되지 않았거나 검증되지 않은 동작은 현재 구현 제한으로 구분합니다.
+> 한국어: [01-overview_ko.md](01-overview_ko.md).
 
-## 최초 실행과 개선 반복
+> This is a flow organized based on the current implementation code. Behavior that is not confirmed or verified in the code is classified as a current implementation limitation.
 
-- 최초 실행은 `workflow_iteration = 0`입니다.
-- 테스트 실패 또는 Code Review 실패는 `RETRYING`을 거쳐 `workflow_iteration`을 1씩 증가시키며, 최대 `max_workflow_iterations`(기본 3)회의 개선만 수행합니다. 초과하면 `MAX_ITERATIONS_EXCEEDED`로 FAILED 처리합니다.
-- Code Reviewer가 `plan_defect`를 반환하면 개선이 아니라 재계획 경로(`replan_count`, `plan_revision` 증가 후 PLANNING)로 이동하며 `max_replans`를 따릅니다.
+## Initial Execution and Improvement Iterations
 
-## 1. 정상 Workflow
+- The initial execution is `workflow_iteration = 0`.
+- Test failure or Code Review failure goes through `RETRYING` and increments `workflow_iteration` by 1, performing improvements only up to a maximum of `max_workflow_iterations` (default 3) times. If exceeded, it is processed as FAILED with `MAX_ITERATIONS_EXCEEDED`.
+- If the Code Reviewer returns `plan_defect`, it moves not to improvement but to the replan path (incrementing `replan_count`, `plan_revision`, then PLANNING), following `max_replans`.
 
-Task 생성부터 COMPLETED까지의 정상 흐름입니다. 중심 클래스는 `Runner`와 `WorkflowService`이며, Human Gate·Retry·Replan은 `HG`, `RETRY`, `REPLAN` 노드로만 표시하고 상세는 아래 예외 흐름 다이어그램에서 다룹니다.
+## 1. Normal Workflow
+
+The normal flow from Task creation to COMPLETED. The central classes are `Runner` and `WorkflowService`; Human Gate, Retry, and Replan are shown only as `HG`, `RETRY`, `REPLAN` nodes, with details covered in the exception flow diagram below.
 
 ```mermaid
 flowchart TD
-    subgraph API["1. API 및 요청 영속화"]
+    subgraph API["1. API and Request Persistence"]
         direction TB
-        U(["사용자"]) --> T["POST /tasks 또는 POST /projects/id/tasks - Task PENDING 생성"]
-        T --> ER["POST /tasks/id/execution-requests - START 요청 저장"]
+        U(["User"]) --> T["POST /tasks or POST /projects/id/tasks - Task PENDING created"]
+        T --> ER["POST /tasks/id/execution-requests - START request stored"]
     end
 
-    subgraph RUNNER["2. Runner 및 Lease"]
+    subgraph RUNNER["2. Runner and Lease"]
         direction TB
-        R["Runner._dispatch 가 슬롯 확인 후 claim - Runner.process"] --> L{"LeaseService.acquire"}
+        R["Runner._dispatch checks slot then claims - Runner.process"] --> L{"LeaseService.acquire"}
         L -->|"ACQUIRED"| RT["WorkflowService.run_task"]
     end
 
-    subgraph PLANNING["3. Planning 및 Design Review"]
+    subgraph PLANNING["3. Planning and Design Review"]
         direction TB
-        PLAN["PLANNING - Claude Planner"] --> PV{"Plan Artifact 검증 및 Workspace 변경 없음?"}
-        PV -->|"Yes - 저장 및 plan_hash"| DR["DESIGN_REVIEWING - Codex Design Reviewer"]
+        PLAN["PLANNING - Claude Planner"] --> PV{"Plan Artifact validated and no Workspace changes?"}
+        PV -->|"Yes - save and plan_hash"| DR["DESIGN_REVIEWING - Codex Design Reviewer"]
         DR --> V{"verdict"}
-        V -->|"PASS"| BASIS{"현재 Basis 가 PASS Basis 와 일치?"}
+        V -->|"PASS"| BASIS{"Does the current Basis match the PASS Basis?"}
         BASIS -->|"No"| DR
     end
 
-    subgraph DEVTEST["4. Development 및 Testing"]
+    subgraph DEVTEST["4. Development and Testing"]
         direction TB
-        PG["프로젝트 Task 만 - ProjectLockService.ensure_for_step - write lock 획득 또는 대기"] --> DEV["DEVELOPING - Claude Developer"]
-        DEV --> TEST["TESTING - Claude Tester 후 Orchestrator 독립 테스트"]
-        TEST -->|"테스트 PASS"| REV["REVIEWING 진입"]
+        PG["Project Task only - ProjectLockService.ensure_for_step - acquire or wait for write lock"] --> DEV["DEVELOPING - Claude Developer"]
+        DEV --> TEST["TESTING - Claude Tester then Orchestrator independent test"]
+        TEST -->|"Test PASS"| REV["Enter REVIEWING"]
     end
 
-    subgraph REVIEW["5. Code Review 및 Completion"]
+    subgraph REVIEW["5. Code Review and Completion"]
         direction TB
         CR["Codex Code Reviewer"] --> CV{"verdict"}
         CV -->|"PASS"| DOD{"check_definition_of_done"}
     end
 
-    subgraph TERMINAL["종료 상태"]
+    subgraph TERMINAL["Terminal State"]
         direction TB
         DONE(["COMPLETED"])
     end
@@ -57,77 +59,77 @@ flowchart TD
     RT --> PLAN
     BASIS -->|"Yes"| PG
     REV --> CR
-    DOD -->|"충족"| DONE
-    PV -->|"No"| PF["예외 - step_attempt 재시도 또는 FAILED"]
-    V -->|"NEEDS_HUMAN_REVIEW"| HG["예외 - Human Gate"]
+    DOD -->|"Satisfied"| DONE
+    PV -->|"No"| PF["Exception - step_attempt retry or FAILED"]
+    V -->|"NEEDS_HUMAN_REVIEW"| HG["Exception - Human Gate"]
     CV -->|"NEEDS_HUMAN_REVIEW"| HG
-    V -->|"NEEDS_REVISION"| REPLAN["예외 - Replan"]
+    V -->|"NEEDS_REVISION"| REPLAN["Exception - Replan"]
     CV -->|"plan_defect"| REPLAN
-    TEST -->|"테스트 실패"| RETRY["예외 - Retry"]
-    CV -->|"FAIL 또는 DoD 미충족"| RETRY
+    TEST -->|"Test failed"| RETRY["Exception - Retry"]
+    CV -->|"FAIL or DoD not satisfied"| RETRY
 ```
 
-- Design Review PASS 뒤에는 일반적인 "Human Gate 필요 여부" 판정 단계가 없습니다. PASS이면 `Development 직전 Basis 재비교` 후 곧바로 DEVELOPING입니다.
-- 다이어그램의 `Runner`는 `Runner.process`를 의미하며 `LeaseService.acquire` 성공 후 `WorkflowService.run_task`를 호출합니다 ([03](03-task-runner.md)). `HELD`/`UNCERTAIN` 결과는 [03](03-task-runner.md), 만료 Lease 인계는 [07](07-lease.md)을 참고하십시오.
-- Planning 상세는 [04](04-planning-review.md), Development·Testing·Code Review 상세는 [05](05-development-testing.md)에 있습니다.
-- **Project Task**: `POST /projects`로 등록한 Workspace(기존 로컬 경로 또는 clone)를 여러 Task가 공유합니다. 읽기 전용 Step(Plan, Design Review)은 병렬로 실행할 수 있지만, 변경 Step(Developer, Tester)과 Code Review는 Project write lock을 가진 Task 하나만 실행합니다. lock은 첫 변경 Step 앞에서 얻고 Task가 terminal이 될 때(같은 트랜잭션에서) 해제되며, `WAITING_APPROVAL` 동안에도 유지됩니다. 서로 다른 Project의 Task와 `project_id`가 없는 기존 Task는 병렬로 실행됩니다([03](03-task-runner.md), [07](07-lease.md)).
+- After Design Review PASS, there is no general "is Human Gate needed" determination step. If PASS, it goes directly to DEVELOPING after a `Basis re-comparison right before Development`.
+- `Runner` in the diagram refers to `Runner.process`, which calls `WorkflowService.run_task` after `LeaseService.acquire` succeeds ([03](03-task-runner.md)). For `HELD`/`UNCERTAIN` results, see [03](03-task-runner.md); for expired Lease handover, see [07](07-lease.md).
+- Planning details are in [04](04-planning-review.md), and Development·Testing·Code Review details are in [05](05-development-testing.md).
+- **Project Task**: A Workspace (an existing local path or a clone) registered via `POST /projects` is shared by multiple Tasks. Read-only Steps (Plan, Design Review) can run in parallel, but change Steps (Developer, Tester) and Code Review are executed by only the single Task holding the Project write lock. The lock is acquired before the first change Step and released when the Task becomes terminal (within the same transaction), and is retained even during `WAITING_APPROVAL`. Tasks of different Projects and existing Tasks without `project_id` run in parallel ([03](03-task-runner.md), [07](07-lease.md)).
 
-## 2. 예외 흐름: Human Gate, Recovery, Retry, Replan
+## 2. Exception Flow: Human Gate, Recovery, Retry, Replan
 
-정상 흐름에서 벗어나는 경로만 모은 다이어그램입니다. 중심 클래스는 `HumanGateService`, `Runner`, `WorkflowService`이며 별도 `RecoveryService`는 없습니다. 정상 흐름의 `HG`, `RETRY`, `REPLAN` 노드가 이 다이어그램의 진입점이며, Planner·Developer·Tester의 `human_gate_request`와 CLI 권한 요청도 같은 Human Gate로 이어집니다.
+A diagram collecting only the paths that deviate from the normal flow. The central classes are `HumanGateService`, `Runner`, `WorkflowService`; there is no separate `RecoveryService`. The `HG`, `RETRY`, `REPLAN` nodes of the normal flow are the entry points of this diagram, and the `human_gate_request` from Planner·Developer·Tester and CLI permission requests also lead to the same Human Gate.
 
 ```mermaid
 flowchart TD
     subgraph GATE["Human Gate"]
         direction TB
-        G1["DESIGN - Agent 의 human_gate_request 또는 NEEDS_HUMAN_REVIEW"] --> W["Task WAITING_APPROVAL - Approval PENDING"]
+        G1["DESIGN - Agent's human_gate_request or NEEDS_HUMAN_REVIEW"] --> W["Task WAITING_APPROVAL - Approval PENDING"]
         G2["PERMISSION - CLI PERMISSION_REQUESTED"] --> W
-        W --> DEC["POST /approvals/id/decisions - 결정 저장"]
+        W --> DEC["POST /approvals/id/decisions - decision stored"]
     end
 
     subgraph RECOVERY["Recovery"]
         direction TB
-        RC["RECOVERY 조건 - 09 문서 참조"] --> RG["HumanGateService.open_recovery - RECOVERY Gate"]
-        RP["PROJECT_DIRTY - 이전 Task 의 미해결 변경 - Step attempt 생성 전"] --> RG
-        BUSY["프로젝트 write lock 을 다른 Task 가 보유 - BLOCKED - 지연 requeue"] -.-> RS
+        RC["RECOVERY condition - see document 09"] --> RG["HumanGateService.open_recovery - RECOVERY Gate"]
+        RP["PROJECT_DIRTY - unresolved changes from a previous Task - before Step attempt creation"] --> RG
+        BUSY["Project write lock held by another Task - BLOCKED - delayed requeue"] -.-> RS
     end
 
-    subgraph RETRYREPLAN["Retry 및 Replan"]
+    subgraph RETRYREPLAN["Retry and Replan"]
         direction TB
-        RETRY["RETRYING - 테스트 또는 Review 실패"] --> RL{"workflow_iteration 이 max_workflow_iterations 미만?"}
-        RL -->|"Yes - workflow_iteration 증가"| RD["DEVELOPING 으로 복귀"]
-        REPLAN["plan_defect 또는 NEEDS_REVISION"] --> PL{"replan_count 가 max_replans 미만?"}
-        PL -->|"Yes - replan_count 및 plan_revision 증가"| RP["PLANNING 으로 복귀"]
+        RETRY["RETRYING - Test or Review failure"] --> RL{"Is workflow_iteration less than max_workflow_iterations?"}
+        RL -->|"Yes - increment workflow_iteration"| RD["Return to DEVELOPING"]
+        REPLAN["plan_defect or NEEDS_REVISION"] --> PL{"Is replan_count less than max_replans?"}
+        PL -->|"Yes - increment replan_count and plan_revision"| RP["Return to PLANNING"]
     end
 
-    subgraph RESUME["재개"]
+    subgraph RESUME["Resume"]
         direction TB
-        RS["Runner 가 RESUME 요청 소비"] --> CK{"checkpoint"}
+        RS["Runner consumes RESUME request"] --> CK{"checkpoint"}
         CK -->|"PLAN"| P1["PLANNING"]
         CK -->|"DEVELOP"| P2["DEVELOPING"]
         CK -->|"TEST"| P3["TESTING"]
     end
 
-    subgraph TERM["종료 상태"]
+    subgraph TERM["Terminal State"]
         direction TB
         FAILED(["FAILED"])
     end
 
     RG --> W
-    DEC -->|"DESIGN 승인 또는 거절 - RESUME 생성"| RS
-    DEC -->|"PERMISSION 승인 및 enforceable - RESUME 생성"| RS
-    DEC -->|"RECOVERY continue 또는 retry - RESUME 생성 - PROJECT_DIRTY 는 continue 만"| RS
-    DEC -->|"PERMISSION 거절 또는 RECOVERY abort 또는 거절"| FAILED
-    DEC -->|"PERMISSION 승인 및 enforceable 아님 - RESUME 없음"| W
+    DEC -->|"DESIGN approved or rejected - RESUME created"| RS
+    DEC -->|"PERMISSION approved and enforceable - RESUME created"| RS
+    DEC -->|"RECOVERY continue or retry - RESUME created - PROJECT_DIRTY is continue only"| RS
+    DEC -->|"PERMISSION rejected or RECOVERY abort or rejected"| FAILED
+    DEC -->|"PERMISSION approved and not enforceable - no RESUME"| W
     RL -->|"No - MAX_ITERATIONS_EXCEEDED"| FAILED
     PL -->|"No - MAX_REPLANS_EXCEEDED"| FAILED
 ```
 
-- Human Gate는 다음 조건에서만 열립니다.
-  - Planner, Design Reviewer, Developer, Tester, Code Reviewer가 `human_gate_request` 또는 `NEEDS_HUMAN_REVIEW`를 반환한 경우 (DESIGN Gate)
-  - CLI가 명시적으로 권한을 요청(`PERMISSION_REQUESTED`)한 경우 (PERMISSION Gate)
-  - 종료·변경 안전성이 불확실한 Recovery 조건 (RECOVERY Gate, [09](09-recovery.md))
-- DESIGN Gate의 checkpoint가 `PLAN`이면 승인·거절 모두 설계 결정으로 저장되고 재개 시 `plan_revision`이 증가하며 PLANNING부터 다시 수행합니다. "Human Gate 승인 → 즉시 DEVELOPING"은 아닙니다 ([08](08-human-gate.md)).
-- PERMISSION을 `enforceable=false`로 승인하면 RESUME이 만들어지지 않고 Task는 `WAITING_APPROVAL`에 남습니다 (다이어그램의 `W`로 돌아가는 간선, [08](08-human-gate.md)).
-- `RETRYING`은 `workflow_iteration` 한도(`MAX_ITERATIONS_EXCEEDED`), Replan은 `max_replans` 한도(`MAX_REPLANS_EXCEEDED`)가 각각 FAILED 조건입니다.
-- Recovery 책임은 별도 서비스가 아니라 `Runner`, `WorkflowService`, `HumanGateService`, `LeaseService`, `StepRunner`에 분산되어 있습니다 ([02](02-architecture.md), [09](09-recovery.md)).
+- Human Gate opens only under the following conditions.
+  - When Planner, Design Reviewer, Developer, Tester, or Code Reviewer returns `human_gate_request` or `NEEDS_HUMAN_REVIEW` (DESIGN Gate)
+  - When the CLI explicitly requests permission (`PERMISSION_REQUESTED`) (PERMISSION Gate)
+  - Recovery conditions where termination/change safety is uncertain (RECOVERY Gate, [09](09-recovery.md))
+- If the DESIGN Gate's checkpoint is `PLAN`, both approval and rejection are stored as design decisions, and upon resumption `plan_revision` is incremented and execution restarts from PLANNING. It is not the case that "Human Gate approval → immediately DEVELOPING" ([08](08-human-gate.md)).
+- If PERMISSION is approved with `enforceable=false`, no RESUME is created and the Task remains in `WAITING_APPROVAL` (the edge in the diagram returning to `W`, [08](08-human-gate.md)).
+- `RETRYING` has the `workflow_iteration` limit (`MAX_ITERATIONS_EXCEEDED`) as its FAILED condition, and Replan has the `max_replans` limit (`MAX_REPLANS_EXCEEDED`) as its FAILED condition.
+- Recovery responsibility is distributed not to a separate service but across `Runner`, `WorkflowService`, `HumanGateService`, `LeaseService`, and `StepRunner` ([02](02-architecture.md), [09](09-recovery.md)).
