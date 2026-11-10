@@ -1,6 +1,6 @@
 # 전체 아키텍처 및 모듈 관계
 
-> English: [02-architecture.md](02-architecture_ko.md)
+> English: [02-architecture.md](02-architecture.md)
 
 > 현재 구현 코드를 기준으로 정리한 흐름입니다. 코드로 확인되지 않았거나 검증되지 않은 동작은 현재 구현 제한으로 구분합니다.
 
