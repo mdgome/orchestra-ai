@@ -56,6 +56,18 @@ CODE_REVIEW_SCHEMA = _obj({
     "test_policy_concern": {"type": "boolean", "description": "true when required verification was weakened"},
     "human_gate_request": NULLABLE_GATE,
 })
+_CRITERION = _obj({"id": _str("the criterion id exactly as given"), "met": {"type": "boolean"},
+                   "evidence": _str("what shows the criterion is met (or why it is not)")})
+
+
+def code_review_schema(criteria: list[dict] | None) -> dict:
+    """The code review output schema. A task whose profile defines completion criteria needs the reviewer to evaluate each
+    of them (`profile_criteria`); every other task keeps the original schema."""
+    if not criteria:
+        return CODE_REVIEW_SCHEMA
+    return _obj({**CODE_REVIEW_SCHEMA["properties"], "profile_criteria": _arr(_CRITERION)})
+
+
 DEV_SCHEMA = _obj({"summary": _str(), "files_changed": _arr(_str()), "human_gate_request": NULLABLE_GATE})
 TEST_AGENT_SCHEMA = _obj({"summary": _str(), "tests_added": _arr(_str()), "human_gate_request": NULLABLE_GATE})
 

@@ -1,6 +1,6 @@
 # Recovery 및 Checkpoint
 
-> English: [09-recovery.md](09-recovery_ko.md)
+> English: [09-recovery.md](09-recovery.md)
 
 > 현재 구현 코드를 기준으로 정리한 흐름입니다. 코드로 확인되지 않았거나 검증되지 않은 동작은 현재 구현 제한으로 구분합니다.
 
@@ -130,6 +130,13 @@ flowchart TD
 | Runner 재시작 중 backoff 중인 요청 | `not_before`, `defer_count` 보존 | 재시작 뒤에도 backoff 유지 |
 
 위 표의 근거와 `write_epoch`의 의미는 [10](10-invalidation_ko.md)에 있습니다. 운영 규칙(threat model): **활성 Project Task가 있는 동안의 외부 수정은 지원하지 않습니다.** 감지되면 읽기 단계는 epoch 재시도, 변경 단계는 Recovery 대상입니다. Task 사이(Project 유휴)의 사용자 수정은 허용되며 다음 Task가 처음 write lock을 얻을 때 baseline으로 수용됩니다. 파일시스템과 DB는 하나의 원자 트랜잭션이 될 수 없으므로 측정과 커밋 사이의 외부 변경은 완전히 탐지되지 않을 수 있습니다.
+
+## 4. baseline 행이 없는 owner (crash gap, 또는 이 기능 이전의 owner)
+
+`_ensure_baseline`은 이미 Project를 소유한 Task가 gate에 다시 들어올 때 실행됩니다. 행이 있으면 epoch만 검사합니다(mutating step 전에는 정확히 `acquired_epoch`, 이후에는 최소 `acquired_epoch`. mutating step 시작마다 epoch가 증가하기 때문이며, acquisition epoch가 없는 복구 행은 `recorded_epoch`가 하한일 뿐). 행이 없으면 READY를 반환하지 않습니다.
+- **mutating step이 이미 실행됨**(DEVELOP/TEST 행 존재): `proof_epoch = acquired_epoch = NULL`, `recorded_epoch` = 현재 epoch인 명시적 `UNAVAILABLE(BASELINE_MISSING_AT_REENTRY)` 행. 최초 acquisition epoch는 증명할 수 없으므로 현재 epoch로 지어내지 않습니다.
+- **아직 아무것도 바꾸지 않음**: fingerprint와 manifest를 트랜잭션 밖에서 측정한 뒤, 한 트랜잭션(task·project 행 lock, owner·epoch 재확인)에서 새 fingerprint를 `write_baseline_fingerprint`와 비교합니다. 같으면 acquisition 이후 workspace가 변하지 않았음이 증명되므로 `proof_epoch = acquired_epoch = recorded_epoch` = 현재 owner epoch인 AVAILABLE `REENTRY_RECOVERY` 행입니다. 다르거나 측정할 수 없으면 `UNAVAILABLE(BASELINE_MISSING_AT_REENTRY)`.
+다른 identity(project, proof epoch, fingerprint)의 행은 충돌이며 fail closed하고 아무것도 덮어쓰지 않습니다. identity가 같고 status만 다르면 기존 행을 유지합니다(AVAILABLE을 교체하지 않고 UNAVAILABLE을 승격하지 않음).
 
 ## 현재 구현 제한
 

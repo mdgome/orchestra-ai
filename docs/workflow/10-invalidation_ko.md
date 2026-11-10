@@ -1,6 +1,6 @@
 # Context Invalidation
 
-> English: [10-invalidation.md](10-invalidation_ko.md)
+> English: [10-invalidation.md](10-invalidation.md)
 
 > 현재 구현 코드를 기준으로 정리한 흐름입니다. 코드로 확인되지 않았거나 검증되지 않은 동작은 현재 구현 제한으로 구분합니다.
 
@@ -101,6 +101,8 @@ flowchart TD
 - 재사용 판단은 각 Step 자신의 `input_hash`와 `output_hash`로만 합니다. WorkspaceSnapshot은 중단된 Step의 재실행 안전성 확인에만 사용합니다 ([09](09-recovery_ko.md)).
 - 요구사항 수정(`PATCH /tasks/{id}`)은 PENDING Task에서만 가능합니다 (`TaskService.update_task`). 실행이 시작된 뒤에는 요구사항이 바뀌지 않습니다.
 - Human Gate 결정은 `decisions_hash`를 바꾸므로 이를 입력으로 쓰는 Step(PLAN, DESIGN_REVIEW, DEVELOP, CODE_REVIEW)이 재실행 대상이 됩니다.
+
+**Project Profile.** Profile snapshot이 있는 Task에서는 `profile_hash`가 PLAN, DEVELOP, CODE_REVIEW의 `input_hash`와 `design_review_basis`(및 `current_basis`)에 추가됩니다. TEST는 사용하지 않습니다(명령은 `test_policy_hash`에서 옴). Profile이 없는 Task에는 아무것도 추가되지 않으므로 hash와 저장된 step의 재사용은 Profile 도입 이전과 똑같습니다. snapshot은 Task 생성 시 한 번 복사되므로 Project profile을 바꿔도 이미 있는 Task는 바뀌지 않고, 이후 Task의 hash만 달라집니다.
 
 ## 3. Project Workspace fingerprint (`WORKSPACE_FINGERPRINT_V1`)
 

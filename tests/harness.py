@@ -179,8 +179,6 @@ __all__ = ["Harness", "PLAN", "GATE", "GOOD_CODE", "BAD_CODE", "TEST_CODE", "str
 
 
 async def recover_for_test(runner, startup=False):
-    """Runs one recovery pass on a Runner that was never start()ed (a test-only shortcut around the lifecycle gate):
-    the same request-recovery transaction and remainder `Runner.recover` runs, taken under the lifecycle lock."""
-    async with runner._lifecycle_lock:
-        summary = await runner._recover_requests_locked(startup)
-    return await runner._recover_rest(summary)
+    """Runs one recovery pass on a Runner that was never start()ed (a test-only shortcut around the lifecycle-state check):
+    the same operation, gate and follow-up `Runner.recover` runs, minus the STARTING / RUNNING requirement."""
+    return await runner._recover(startup, checked=False)

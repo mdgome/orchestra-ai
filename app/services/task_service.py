@@ -1,4 +1,5 @@
 """Application operations behind the REST resources. Routers only call these methods."""
+import copy
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -11,6 +12,7 @@ from app.models.states import TERMINAL_TASK_STATES, TaskState
 from app.models.tables import Approval, Conversation, Execution, ExecutionRequest, Message, StateTransition, Task
 from app.repositories.approval_repository import ApprovalRepository, ExecutionRequestRepository
 from app.repositories.conversation_repository import ConversationRepository
+from app.repositories.profile_repository import ProfileRepository
 from app.repositories.project_repository import ProjectRepository
 from app.repositories.task_repository import TaskRepository
 from app.services.hashing import stable_hash
@@ -102,6 +104,10 @@ class TaskService:
                     raise NotFound("conversation not found")
                 if conv.status != "ACTIVE":
                     raise Conflict("conversation is not ACTIVE", {"status": conv.status})
+            # the active profile version is copied (number, hash, content) under the same project row lock that
+            # serialises profile changes, so a task sees exactly one version and a later change cannot alter it
+            profile = (await ProfileRepository(s).get(project.id, project.profile_version)
+                       if project is not None and project.profile_version else None)
             task_id = uuid.uuid4()
             # project tasks share the registered workspace (re-validated here and before every run)
             workspace = project_root if project else self.guard.task_workspace(task_id)
@@ -111,7 +117,9 @@ class TaskService:
                 limits={k: getattr(limit_values, k) for k in P.LIMIT_BOUNDS}, test_policy=policy,
                 test_policy_hash=hash_test_policy(policy), workspace_path=str(workspace), plan_revision=0,
                 workflow_iteration=0, replan_count=0, cli_invocations=0, run_seconds=0.0, decisions_hash="",
-                row_version=0))
+                profile_version=profile.version if profile else None,
+                profile_hash=profile.content_hash if profile else None,
+                profile_snapshot=copy.deepcopy(profile.content) if profile else None, row_version=0))
             await TaskRepository(s).add_transition(task.id, str(TaskState.PENDING), None, "created")
             return task
 

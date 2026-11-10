@@ -1,6 +1,6 @@
 # Development, Testing 및 Code Review
 
-> English: [05-development-testing.md](05-development-testing_ko.md)
+> English: [05-development-testing.md](05-development-testing.md)
 
 > 현재 구현 코드를 기준으로 정리한 흐름입니다. 코드로 확인되지 않았거나 검증되지 않은 동작은 현재 구현 제한으로 구분합니다.
 
@@ -128,6 +128,10 @@ flowchart TD
 - Completion Checker는 별도의 Agent가 아닙니다. `WorkflowService._review_transition`이 Code Review PASS를 처리하면서 호출하는 `check_definition_of_done` 함수이며, 검사 조건은 [11](11-task-lifecycle_ko.md)에 있습니다.
 - Reviewer에게는 현재 코드(`code_fingerprint`)로 만든 테스트 결과만 전달됩니다. 불일치하면 TESTING부터 다시 수행합니다.
 - 다이어그램 1의 `RETRYING`·`REVIEWING` 노드가 이 다이어그램의 진입점입니다.
+
+## Profile 완료 기준(completion criteria)
+
+Task의 Profile snapshot이 `completion_criteria`를 정의하면 코드 리뷰 schema에 필수 `profile_criteria`(criterion마다 `{id, met, evidence}`)가 추가되고 저장된 리뷰에 `profile_hash`가 담깁니다. 그러면 `check_definition_of_done`이 **조건 하나를 더**(`profile_criteria_met`) 저장된 평가에 대해 결정적으로 검사합니다. 평가는 현재 Profile의 것이고, 현재 id들을 정확히 한 번씩 담아야 하며, 모든 항목이 `met`이고 `evidence`가 비어 있지 않아야 합니다. 아니면 리뷰는 `FAIL`로 처리되어(`Definition of Done: ...`) 일반 개선 루프가 적용됩니다. criterion이 실제로 충족되었는지는 리뷰어의 판단이며 오케스트레이터는 검증하지 않습니다. 다른 어떤 조건도 약화되지 않습니다.
 
 ## 현재 구현 제한
 

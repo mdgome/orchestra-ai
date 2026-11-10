@@ -2,9 +2,12 @@
 based final transition, cancellation safety, exception priority), connection ownership and the `_prune_done` /
 done-callback split. Waiting is done with Events and controllable futures, never with sleep lengths."""
 import asyncio
+import inspect
 import logging
+import sys
 import uuid
 from types import SimpleNamespace
+from typing import NamedTuple
 
 import pytest
 from sqlalchemy import select, text
@@ -184,6 +187,96 @@ def counts(proxy: ConnProxy):
     return proxy.proxy_close_attempts, proxy.underlying_close_calls
 
 
+# --- best-effort cleanup for tests that end with a failing assertion ----------------------------------------------------------
+class Entry(NamedTuple):
+    """One Runner a test's `finally` has to clean up."""
+    name: str
+    runner: Runner
+    stop_task: asyncio.Task | None = None           # the task that ran the original Runner.stop() call (None: awaited directly)
+    expected: tuple[type, ...] = ()                 # exception types the test body verifies for that task
+    observed: dict | None = None                    # shared with the body: {"stop_result": bool, "exception": exception | None}
+    settle_finished: asyncio.Event | None = None    # only says that _settle_stop ran to its end; never decides the cleanup
+
+
+def ensure(condition: bool, message: str) -> None:
+    if not condition:
+        raise AssertionError(message)
+
+
+async def lock_returned(db) -> None:
+    ensure(await asyncio.wait_for(lock_free(db), 10), "the advisory lock was not returned")
+
+
+def _verified(entry: Entry, exc: BaseException | None) -> bool:
+    """True only when the test body finished verifying the stop task's outcome AND it is of an expected type."""
+    seen = entry.observed
+    return bool(seen and seen.get("stop_result") is True and exc is not None and isinstance(exc, entry.expected))
+
+
+async def stop_if_needed(entry: Entry) -> None:
+    """Brings one Runner to STOPPED. The stop task (if any) is dealt with first, so that a STOPPED Runner can never hide
+    an unverified cancellation or error of the original stop() call. No sleeps, no polling."""
+    task, runner = entry.stop_task, entry.runner
+    if task is not None:
+        if not task.done():
+            await asyncio.wait({task}, timeout=10)                    # bounded, and it never cancels the task
+            if not task.done():
+                raise RuntimeError(f"the stop task of {entry.name} did not finish")
+        if task.cancelled():                                          # the original CancelledError cannot be read back
+            if not _verified(entry, (entry.observed or {}).get("exception")):
+                error = RuntimeError("stop task was cancelled before its result was verified")
+                error.add_note("the stop task was in the cancelled state")
+                raise error
+        else:
+            exc = task.exception()
+            if exc is None:
+                task.result()
+            elif not _verified(entry, exc):
+                raise exc
+    if runner.lifecycle in (L.RUNNING, L.STOP_INCOMPLETE):
+        await asyncio.wait_for(runner.stop(), 10)
+    elif runner.lifecycle is L.STOPPING:
+        raise RuntimeError(f"{entry.name} is stuck in STOPPING although its stop task ended" if task is not None
+                           else "cleanup impossible: STOPPING without its stop task")
+    elif runner.lifecycle is not L.STOPPED:                           # STARTING (or anything unknown)
+        raise RuntimeError(f"cannot clean up {entry.name} from {runner.lifecycle}")
+    ensure(runner.lifecycle is L.STOPPED, f"{entry.name} is {runner.lifecycle} after its cleanup")
+
+
+async def cleanup_and_verify(entries: list[Entry], checks: list, body_error: BaseException | None) -> None:
+    """Runs in a test's `finally`. Every Runner is cleaned up even if another cleanup fails; the checks (lock returned,
+    resources gone, ...) run only when every cleanup succeeded, each on its own. Nothing is raised when all is well (the
+    body's own error then keeps its traceback); otherwise the body error and all cleanup / verification errors travel
+    together. `checks` are (label, callable) pairs; a callable raises to fail and may return an awaitable."""
+    cleanup_errors, verification_errors, done = [], [], set()
+    for entry in entries:
+        if id(entry.runner) in done:                                  # a duplicate would drop its stop_task information
+            cleanup_errors.append(RuntimeError(f"duplicate cleanup entry for runner '{entry.name}'"))
+            continue
+        done.add(id(entry.runner))
+        try:
+            await stop_if_needed(entry)
+        except BaseException as exc:  # noqa: BLE001 - CancelledError included: one failing cleanup must not skip the rest
+            exc.add_note(f"cleanup of {entry.name} failed")
+            cleanup_errors.append(exc)
+    if not cleanup_errors:
+        for label, check in checks:
+            try:
+                result = check()
+                if inspect.isawaitable(result):
+                    await result
+            except BaseException as exc:  # noqa: BLE001
+                exc.add_note(f"verification '{label}' failed")
+                verification_errors.append(exc)
+    problems = [*cleanup_errors, *verification_errors]
+    if not problems:
+        return
+    if body_error is None and len(problems) == 1:
+        raise problems[0]
+    raise BaseExceptionGroup("runner cleanup / verification failed",
+                             [*([body_error] if body_error is not None else []), *problems])
+
+
 # --- basic transitions -----------------------------------------------------------------------------------------------------
 async def test_transitions_and_resources(db, tmp_path):
     h = Harness(db, tmp_path)
@@ -219,14 +312,14 @@ async def test_startup_recovery_runs_inside_start(db, tmp_path, monkeypatch):
     await claimed_request(h)
     r = make_runner(h)
     seen = {}
-    real = r._recover_requests_locked
+    real = r._recovery_body
 
-    async def spy(startup):
-        summary = await real(startup)
+    async def spy(startup, session, evidence):
+        summary = await real(startup, session, evidence)
         seen.setdefault("first", (startup, summary["requeued"]))
         return summary
 
-    monkeypatch.setattr(r, "_recover_requests_locked", spy)
+    monkeypatch.setattr(r, "_recovery_body", spy)
     await r.start()
     try:
         assert seen["first"] == (True, 1)                            # every CLAIMED request of a dead runner
@@ -448,21 +541,84 @@ async def test_the_recover_failure_inside_start_with_a_proxy_installed_by_the_te
 async def test_a_cancelled_stop_still_settles_to_stopped_and_then_raises_the_cancellation(db, tmp_path, monkeypatch):
     h = Harness(db, tmp_path)
     r = make_runner(h)
-    await r.start()
-    _entered, finished, calls = track(r, "_settle_stop", monkeypatch)
-    drain_entered, drain_proceed = stalled(r, "_drain", monkeypatch)
-    stopping = asyncio.create_task(r.stop())
-    await wait(drain_entered)
-    assert r.lifecycle is L.STOPPING                                 # observable only while the settle task runs
-    stopping.cancel()
-    await asyncio.sleep(0)                                           # let the first cancellation be consumed
-    stopping.cancel()                                                # a second one must not stop the settle either
-    drain_proceed.set()
-    with pytest.raises(asyncio.CancelledError):
-        await stopping
-    assert calls == [1] and finished.is_set()
-    assert r.lifecycle is L.STOPPED and resources(r) == (False, False, 0)      # nothing left behind
-    assert await lock_free(db)
+    # `asyncio.shield` is called in exactly one place of the Runner: `_wait_shielded`, which stop() awaits. A probe around
+    # it (installed only while this test's stop runs, and acting only for the stop task) shows WHERE each cancellation is
+    # consumed, so the production `_wait_shielded` is exercised unchanged and no sleep or yield is needed to order the
+    # two cancellations.
+    original_shield = asyncio.shield
+    holder, shield_calls, seen, unexpected_calls = {}, [], [], []
+    shield_started = [asyncio.Event() for _ in range(3)]              # the 1st / 2nd / 3rd wait of stop() on its settle task
+    consumed = [asyncio.Event() for _ in range(2)]                    # the 1st / 2nd CancelledError reached `_wait_shielded`
+    observed = {"stop_result": False, "exception": None}
+    stopping = drain_proceed = finished = None
+
+    async def probe(fut):
+        mine = asyncio.current_task() is holder.get("stop")
+        if mine:
+            n = len(shield_calls)
+            shield_calls.append(n)
+            if n < len(shield_started):
+                shield_started[n].set()
+            else:
+                unexpected_calls.append(n)                           # recorded only: the probe never raises by itself
+        try:
+            return await original_shield(fut)                        # the original result / exception, unchanged
+        except asyncio.CancelledError as exc:
+            if mine and len(seen) < len(consumed):
+                seen.append(exc)
+                consumed[len(seen) - 1].set()
+            raise                                                    # `_wait_shielded` catches it in this same task step
+
+    try:
+        await r.start()
+        _entered, finished, settle_calls = track(r, "_settle_stop", monkeypatch)
+        drain_entered, drain_proceed = stalled(r, "_drain", monkeypatch)
+        with monkeypatch.context() as patch:
+            patch.setattr(asyncio, "shield", probe)
+            try:
+                stopping = asyncio.create_task(r.stop())
+                holder["stop"] = stopping
+                await wait(drain_entered)
+                assert r.lifecycle is L.STOPPING                     # observable only while the settle task runs
+                await wait(shield_started[0])
+                assert shield_calls == [0]                           # stop() is waiting on its settle task
+                stopping.cancel()                                    # first cancellation
+                await wait(consumed[0])
+                # The probe re-raised inside the stop task, whose `_wait_shielded` caught the error and started its next
+                # `shield` in the same task step; the test only runs after that, so the 2nd wait must already exist.
+                await wait(shield_started[1])
+                assert stopping.cancelling() >= 1                    # auxiliary only
+                stopping.cancel()                                    # second cancellation: sent only after that proof
+                await wait(consumed[1])
+                await wait(shield_started[2])                        # and stop() is still waiting for the settle task
+                assert not finished.is_set() and not stopping.done()
+                drain_proceed.set()
+                with pytest.raises(asyncio.CancelledError) as info:
+                    await stopping
+                assert info.value is seen[0]                         # stop() raises the FIRST CancelledError it consumed
+                observed["stop_result"], observed["exception"] = True, info.value
+            finally:
+                drain_proceed.set()
+                if stopping is not None:
+                    await asyncio.gather(stopping, return_exceptions=True)
+        assert asyncio.shield is original_shield                     # the probe is gone again
+        assert len(seen) == 2 and all(e.is_set() for e in consumed)
+        assert settle_calls == [1] and finished.is_set()             # the settle task ran exactly once, to its end
+        assert r.lifecycle is L.STOPPED and resources(r) == (False, False, 0)      # nothing left behind
+        assert await lock_free(db)                                   # ... so the second cancellation did not stop it
+    finally:
+        body_error = sys.exc_info()[1]
+        if drain_proceed is not None:
+            drain_proceed.set()
+        await cleanup_and_verify(
+            [Entry("main r", r, stop_task=stopping, expected=(asyncio.CancelledError,), observed=observed,
+                   settle_finished=finished)],
+            [("no runtime resources left", lambda: ensure(resources(r) == (False, False, 0), f"left: {resources(r)}")),
+             ("stop task waited exactly three times", lambda: ensure(shield_calls == [0, 1, 2], f"{shield_calls}")),
+             ("no unexpected shield call", lambda: ensure(not unexpected_calls, f"{unexpected_calls}")),
+             ("the shield probe was removed", lambda: ensure(asyncio.shield is original_shield, "still patched")),
+             ("advisory lock returned", lambda: lock_returned(db))],
+            body_error)
 
 
 async def test_a_loop_task_that_delays_its_cancellation_is_waited_for_even_when_stop_is_cancelled(db, tmp_path, monkeypatch):
@@ -567,6 +723,8 @@ async def test_stop_incomplete_keeps_the_lock_until_a_later_stop_succeeds(db, tm
     h = Harness(db, tmp_path)
     r = make_runner(h)
     started, release = asyncio.Event(), asyncio.Event()
+    extra: list[Entry] = []                                           # every other Runner this test creates, in order
+    finished = None
 
     async def stubborn(request, *, on_lease=None):
         started.set()
@@ -577,33 +735,43 @@ async def test_stop_incomplete_keeps_the_lock_until_a_later_stop_succeeds(db, tm
                 pass
 
     monkeypatch.setattr(r, "process", stubborn)
-    task = await h.new_task()
-    await r.start()
-    await h.tasks.request_execution(task.id)
-    r.notify()
-    await asyncio.wait_for(started.wait(), 10)
-    _entered, finished, _calls = track(r, "_settle_stop", monkeypatch)
-    with pytest.raises(RunnerStopIncomplete):
-        await r.stop()
     try:
+        task = await h.new_task()
+        await r.start()
+        await h.tasks.request_execution(task.id)
+        r.notify()
+        await asyncio.wait_for(started.wait(), 10)
+        _entered, finished, _calls = track(r, "_settle_stop", monkeypatch)
+        with pytest.raises(RunnerStopIncomplete):
+            await r.stop()                                            # awaited directly: its outcome is settled right here
         assert finished.is_set()                                      # the settle task itself ended ...
         assert r.lifecycle is L.STOP_INCOMPLETE and resources(r) == (False, True, 1)     # ... resources may remain
         before = await requests(h)
+        contender = make_runner(h)
+        extra.append(Entry("contender", contender))
         with pytest.raises(RunnerAlreadyActive):
-            await make_runner(h).start()                              # the advisory lock is still held
+            await contender.start()                                   # the advisory lock is still held
         with pytest.raises(RuntimeError):
             await r.start()
         for startup in (True, False):
             with pytest.raises(RuntimeError):
                 await r.recover(startup=startup)
         assert await requests(h) == before                            # claim token / status untouched
-    finally:
         release.set()
-    await asyncio.wait_for(r.stop(), 10)                              # the task ended: now it succeeds
-    assert r.lifecycle is L.STOPPED and resources(r) == (False, False, 0)
-    again = make_runner(h)
-    await again.start()                                               # the lock was returned
-    await again.stop()
+        await asyncio.wait_for(r.stop(), 10)                          # the task ended: now it succeeds
+        assert r.lifecycle is L.STOPPED and resources(r) == (False, False, 0)
+        again = make_runner(h)
+        extra.append(Entry("again", again))
+        await again.start()                                           # the lock was returned
+        await again.stop()
+    finally:
+        body_error = sys.exc_info()[1]
+        release.set()                                                 # first: the stubborn task may end
+        await cleanup_and_verify(
+            [*extra, Entry("main r", r, settle_finished=finished)],   # `r` last, whatever happened to the others
+            [("no runtime resources left", lambda: ensure(resources(r) == (False, False, 0), f"left: {resources(r)}")),
+             ("advisory lock returned", lambda: lock_returned(db))],
+            body_error)
 
 
 # --- the final transition waits for the lifecycle lock: a second cancellation arrives exactly there ------------------------------
@@ -708,19 +876,26 @@ async def test_stopping_state_refuses_start_stop_and_recover(db, tmp_path, monke
     assert r.lifecycle is L.STOPPED
 
 
-async def test_stop_waits_for_a_recovery_that_already_holds_the_lifecycle_lock(db, tmp_path, monkeypatch):
+async def test_stop_does_not_wait_for_a_recovery_that_is_inside_its_db_transaction(db, tmp_path, monkeypatch):
+    """The lifecycle lock is not held during recovery DB I/O: stop() reaches STOPPING at once, cancels the operation,
+    which rolls back and releases its connection, and the Runner ends STOPPED."""
     h = Harness(db, tmp_path)
     r = make_runner(h)
-    entered, proceed = stalled(r, "_recover_requests_locked", monkeypatch, only_periodic=True)
+    entered, proceed = stalled(r, "_recovery_body", monkeypatch, only_periodic=True)
     await r.start()                                                   # the loop's first periodic recovery stalls
     await wait(entered)
-    stopping = asyncio.create_task(r.stop())
-    for _ in range(20):
-        await asyncio.sleep(0)                                        # let stop() run as far as it can
-    assert not stopping.done() and r.lifecycle is L.RUNNING           # blocked on the lock, not yet STOPPING
-    proceed.set()
-    await asyncio.wait_for(stopping, 10)
-    assert r.lifecycle is L.STOPPED and resources(r) == (False, False, 0)
+    try:
+        assert r._recovery is not None and not r._lifecycle_lock.locked()
+        stopping = asyncio.create_task(r.stop())
+        for _ in range(200):
+            await asyncio.sleep(0)
+            if r.lifecycle is L.STOPPING:
+                break
+        assert r.lifecycle is L.STOPPING                              # stop() took the lock although recovery is live
+        await asyncio.wait_for(stopping, 10)
+    finally:
+        proceed.set()
+    assert r.lifecycle is L.STOPPED and resources(r) == (False, False, 0) and r._recovery_clean()
 
 
 # --- _prune_done only pops; the done callback owns the exception, the log and the wake-up ------------------------------------------

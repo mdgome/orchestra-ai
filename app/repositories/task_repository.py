@@ -90,6 +90,11 @@ class TaskRepository:
     async def get_step(self, step_id: uuid.UUID) -> TaskStep | None:
         return (await self.s.execute(select(TaskStep).where(TaskStep.id == step_id))).scalar_one_or_none()
 
+    async def has_steps(self, task_id: uuid.UUID, step_keys: tuple[str, ...]) -> bool:
+        """Is there any step row of these kinds? (a mutating step begin bumps the project's write epoch)"""
+        return (await self.s.execute(select(TaskStep.id).where(
+            TaskStep.task_id == task_id, TaskStep.step_key.in_(step_keys)).limit(1))).first() is not None
+
     async def steps_for_task(self, task_id: uuid.UUID) -> list[TaskStep]:
         rows = await self.s.execute(
             select(TaskStep).where(TaskStep.task_id == task_id).order_by(TaskStep.created_at, TaskStep.step_attempt))

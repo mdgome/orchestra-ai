@@ -36,7 +36,7 @@ from app.services import artifacts as A
 from app.services import context_service as C
 from app.services import prompts as PR
 from app.services.completion_checker import DoDInput, check_definition_of_done
-from app.services.fingerprints import design_review_basis
+from app.services.fingerprints import design_review_basis, profile_criteria_of, profile_part
 from app.services.hashing import stable_hash
 from app.services.human_gate_service import HumanGateService
 from app.services.lease_service import Lease, LeaseService
@@ -559,7 +559,8 @@ class WorkflowService:
     async def _do_plan(self, ctx: RunContext, task: Task) -> None:
         decisions = await self._decisions(task.id)
         feedback = await self._plan_feedback(task)
-        input_hash = stable_hash("plan", task.requirements_hash, task.decisions_hash, feedback, task.plan_revision)
+        input_hash = stable_hash("plan", task.requirements_hash, task.decisions_hash, feedback, task.plan_revision,
+                                 *profile_part(task))
         if await self._reusable(task, STEP_PLAN, input_hash):
             await self._transition(ctx, task.id, TaskState.DESIGN_REVIEWING, "plan_reused")
             return
@@ -601,7 +602,8 @@ class WorkflowService:
     # ================================================================================================
     async def _do_design_review(self, ctx: RunContext, task: Task) -> None:
         plan_step = await self._plan_step(task)
-        basis = design_review_basis(task.requirements_hash, plan_step.output_hash, task.decisions_hash)
+        basis = design_review_basis(task.requirements_hash, plan_step.output_hash, task.decisions_hash,
+                                    profile_hash=task.profile_hash)
         input_hash = stable_hash("design_review", basis["basis_hash"])
         reused = await self._reusable(task, STEP_DESIGN_REVIEW, input_hash)
         if reused is not None:
@@ -662,7 +664,8 @@ class WorkflowService:
     # ================================================================================================
     async def _do_develop(self, ctx: RunContext, task: Task) -> None:
         plan_step = await self._plan_step(task)
-        basis = design_review_basis(task.requirements_hash, plan_step.output_hash, task.decisions_hash)
+        basis = design_review_basis(task.requirements_hash, plan_step.output_hash, task.decisions_hash,
+                                    profile_hash=task.profile_hash)
         async with self.db.transaction() as s:
             review = await TaskRepository(s).latest_step(task.id, STEP_DESIGN_REVIEW, plan_revision=task.plan_revision)
         passed = (review is not None and StepState(review.status) is StepState.SUCCEEDED and review.output
@@ -675,14 +678,14 @@ class WorkflowService:
         decisions = await self._decisions(task.id)
         feedback = await self._develop_feedback(task)
         input_hash = stable_hash("develop", plan_step.output_hash, task.decisions_hash, task.workflow_iteration,
-                                 feedback)
+                                 feedback, *profile_part(task))
         if await self._reusable(task, STEP_DEVELOP, input_hash, iteration=task.workflow_iteration):
             await self._transition(ctx, task.id, TaskState.TESTING, "develop_reused")
             return
         async with self.db.transaction() as s:
             last_dev = await TaskRepository(s).latest_step(task.id, STEP_DEVELOP)
         allow_resume = bool(last_dev and last_dev.output and last_dev.output.get("plan_hash") == plan_step.output_hash)
-        prompt = PR.developer_prompt(C.developer_context(plan_step.output, decisions, feedback))
+        prompt = PR.developer_prompt(C.developer_context(plan_step.output, decisions, feedback, task.profile_snapshot))
 
         async def evaluate(handle: StepHandle, ex: StepExecution, data: dict) -> StepDecision:
             try:
@@ -852,7 +855,7 @@ class WorkflowService:
             return
         test_out = test_step.output
         input_hash = stable_hash("code_review", task.requirements_hash, current["code_fingerprint"],
-                                 stable_hash(test_out["test_result"]), task.decisions_hash)
+                                 stable_hash(test_out["test_result"]), task.decisions_hash, *profile_part(task))
         reused = await self._reusable(task, STEP_CODE_REVIEW, input_hash, iteration=task.workflow_iteration)
         if reused is not None:
             await self._apply_review(ctx, task, reused.output)
@@ -862,6 +865,8 @@ class WorkflowService:
         changed = diff_snapshots(dev.snapshot_before, current).paths() if dev and dev.snapshot_before else []
         prompt = PR.code_review_prompt(C.code_review_context(task, plan_step.output, changed, test_out["test_result"],
                                                              test_out["test_signals"]))
+
+        criteria = (task.profile_snapshot or {}).get("completion_criteria") or []
 
         async def evaluate(handle: StepHandle, ex: StepExecution, data: dict) -> StepDecision:
             try:
@@ -875,6 +880,11 @@ class WorkflowService:
                       "plan_defect": bool(review.get("plan_defect")),
                       "test_policy_concern": bool(review.get("test_policy_concern")),
                       "code_fingerprint": current["code_fingerprint"]}
+            if criteria:     # the reviewer's own evaluation, stored with the profile it was made for
+                output["profile_hash"] = task.profile_hash
+                output["profile_criteria"] = [
+                    {"id": str(c.get("id")), "met": c.get("met") is True, "evidence": str(c.get("evidence") or "")}
+                    for c in (review.get("profile_criteria") or []) if isinstance(c, dict)]
             if verdict == "NEEDS_HUMAN_REVIEW":
                 req = review["human_gate_request"]
                 return StepDecision(output=output, gate=GateSpec(
@@ -885,7 +895,8 @@ class WorkflowService:
             return StepDecision(output=output, mutate=mutate)
 
         await self._agent_step(ctx, task, step_key=STEP_CODE_REVIEW, input_hash=input_hash, prompt=prompt,
-                               schema=A.CODE_REVIEW_SCHEMA, mutating=False, allow_resume=True, evaluate=evaluate)
+                               schema=A.code_review_schema(criteria), mutating=False, allow_resume=True,
+                               evaluate=evaluate)
 
     async def _apply_review(self, ctx: RunContext, task: Task, output: dict) -> None:
         async def work(s: AsyncSession, locked: Task, proof) -> None:
@@ -915,7 +926,8 @@ class WorkflowService:
         plan = await repo.latest_step(task.id, STEP_PLAN, plan_revision=task.plan_revision)
         design = await repo.latest_step(task.id, STEP_DESIGN_REVIEW, plan_revision=task.plan_revision)
         test = await repo.latest_step(task.id, STEP_TEST, workflow_iteration=task.workflow_iteration)
-        basis = design_review_basis(task.requirements_hash, plan.output_hash if plan else "", task.decisions_hash)
+        basis = design_review_basis(task.requirements_hash, plan.output_hash if plan else "", task.decisions_hash,
+                                    profile_hash=task.profile_hash)
         design_ok = bool(design and design.output and design.output.get("verdict") == "PASS"
                          and design.output.get("basis", {}).get("basis_hash") == basis["basis_hash"])
         fingerprint = (test.output or {}).get("code_fingerprint", "") if test else ""
@@ -923,7 +935,8 @@ class WorkflowService:
         return check_definition_of_done(DoDInput(
             test_output=test.output if test else None, review=review_out, current_code_fingerprint=fingerprint,
             requirements_hash=task.requirements_hash, test_policy_hash=task.test_policy_hash,
-            design_review_passed=design_ok, pending_approvals=pending))
+            design_review_passed=design_ok, pending_approvals=pending,
+            profile_hash=task.profile_hash, profile_criteria=profile_criteria_of(task)))
 
     # ================================================================================================
     # RETRYING

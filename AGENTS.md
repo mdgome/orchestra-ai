@@ -34,7 +34,7 @@ Re-review if Plan content or its review basis (requirements, plan, approved deci
 - Keep the session-level PostgreSQL advisory lock on a dedicated connection for the Runner lifetime. On loss of ownership, stop initiating CLI work and apply recovery rules.
 - Checkpoints use input/output hashes; WorkspaceSnapshots detect changes and guard interrupted-step reruns. A snapshot hash is **not** a backup.
 - If process termination, external side effects or workspace safety is uncertain, **do not auto-rerun**: enter RECOVERY Human Gate.
-- CLI permissions are role-specific and validated by real preflight probes. Do not infer a permission request from timeouts or idle output.
+- CLI permissions are role-specific. Startup preflight checks the installed CLI flags and permission-widening settings; the write-blocking probe (`probe_write_blocked`, which runs the CLI and spends tokens) runs only in the opt-in real-CLI E2E test (`-m e2e_cli`). Do not infer a permission request from timeouts or idle output.
 - Completion requires independently executed tests; failure, zero collected tests or invalid results cannot pass.
 
 ## Delivery

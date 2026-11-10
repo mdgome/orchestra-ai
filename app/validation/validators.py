@@ -1,4 +1,5 @@
 """Feature-scoped validators. Small functions; policy values come from policies.py."""
+import math
 import os
 import re
 import uuid
@@ -15,6 +16,127 @@ def is_link_or_junction(path: Path) -> bool:
         return True
     is_junction = getattr(path, "is_junction", None)
     return bool(is_junction and is_junction())
+
+
+def validate_recovery_timeouts(statement: float, operation: float, shutdown_wait: float) -> None:
+    """The single place that checks the recovery timeouts; Settings and Runner.__init__ both call it."""
+    for name, value in (("statement", statement), ("operation", operation), ("shutdown_wait", shutdown_wait)):
+        if not math.isfinite(value) or not value > 0:         # inf would silently remove the bound, nan compares False
+            raise ValueError(f"recovery {name} timeout must be a finite number greater than 0 (got {value!r})")
+    if not statement < operation:
+        raise ValueError(f"recovery statement timeout ({statement}s) must be smaller than the operation timeout "
+                         f"({operation}s)")
+    if int(statement * 1000) < 1:
+        raise ValueError(f"recovery statement timeout {statement}s is below one millisecond")
+    if int(statement * 1000) > P.MAX_PG_TIMEOUT_MS:
+        raise ValueError(f"recovery statement timeout {statement}s exceeds PostgreSQL's millisecond range")
+
+
+def validate_response_limits() -> None:
+    """Startup check (read at call time so a test can change a limit): a bound that cannot hold even one minimal
+    answer would make an endpoint unable to return a legitimate page, so the application refuses to start instead."""
+    if P.ARTIFACT_LIST_RESPONSE_MAX_BYTES < P.RESPONSE_ENVELOPE_MAX_OVERHEAD_BYTES + P.ARTIFACT_ITEM_MAX_BYTES:
+        raise ValueError("ARTIFACT_LIST_RESPONSE_MAX_BYTES must hold the envelope plus one artifact of "
+                         "ARTIFACT_ITEM_MAX_BYTES, otherwise a page could be empty although artifacts exist")
+    if P.ARTIFACT_ITEM_MAX_BYTES < P.SANITIZED_JSON_MAX_BYTES + P.RESPONSE_ENVELOPE_MAX_OVERHEAD_BYTES:
+        raise ValueError("ARTIFACT_ITEM_MAX_BYTES must hold a full SANITIZED_JSON_MAX_BYTES field plus the item's own fields")
+    if P.CHANGES_RESPONSE_MAX_BYTES < P.CHANGES_TOTAL_DIFF_MAX_BYTES + P.RESPONSE_ENVELOPE_MAX_OVERHEAD_BYTES:
+        raise ValueError("CHANGES_RESPONSE_MAX_BYTES must hold the largest allowed set of diff bodies plus the envelope")
+    if P.REPORT_RESPONSE_MAX_BYTES < 2 * P.RESPONSE_ENVELOPE_MAX_OVERHEAD_BYTES:
+        raise ValueError("REPORT_RESPONSE_MAX_BYTES is too small for the report's core fields")
+    for name in ("SANITIZE_MAX_DEPTH", "SANITIZE_MAX_KEYS", "SANITIZE_MAX_ITEMS", "SANITIZE_MAX_STRING_CHARS",
+                 "SANITIZE_MAX_NODES", "RESPONSE_SHRINK_MAX_ROUNDS"):
+        if getattr(P, name) < 1:
+            raise ValueError(f"{name} must be at least 1")
+
+
+def validate_artifact_kind(kind: str | None, allowed: tuple[str, ...]) -> None:
+    if kind is not None and kind not in allowed:
+        raise ValidationFailed("unknown artifact kind", {"allowed": list(allowed)})
+
+
+def validate_changes_path_filter(path: str | None) -> str | None:
+    """A relative POSIX path (an exact file or a directory prefix): no absolute path, drive, `..`, empty segment or control
+    character. It only selects among paths the measurement already found; it never opens anything."""
+    if path is None or path == "":
+        return None
+    candidate = path.rstrip("/") if path != "/" else path
+    bad = (not candidate or len(candidate) > P.MANIFEST_MAX_PATH_LEN or candidate.startswith("/") or "\\" in candidate
+           or (len(candidate) > 1 and candidate[1] == ":")
+           or any(ord(c) < 32 or ord(c) == 127 for c in candidate)
+           or any(part in ("", ".", "..") for part in candidate.split("/")))
+    if bad:
+        raise ValidationFailed("path must be a relative path inside the project (no '..', absolute path or drive)",
+                               {"path": path[:200]})
+    return candidate
+
+
+def _profile_text(value, field: str, max_len: int, *, multiline: bool = False) -> str:
+    if not isinstance(value, str):
+        raise ValidationFailed(f"profile {field} must be a string")
+    text = value.strip()
+    if len(text) > max_len:
+        raise ValidationFailed(f"profile {field} is longer than {max_len} characters")
+    if any((ord(c) < 32 and not (multiline and c in "\n\t")) or ord(c) == 127 for c in text):
+        raise ValidationFailed(f"profile {field} contains control characters")
+    return text
+
+
+def _profile_list(value, field: str, max_items: int, max_len: int) -> list[str]:
+    if not isinstance(value, list):
+        raise ValidationFailed(f"profile {field} must be a list of strings")
+    if len(value) > max_items:
+        raise ValidationFailed(f"profile {field} has more than {max_items} items")
+    out = [_profile_text(item, field, max_len) for item in value]
+    if any(not item for item in out):
+        raise ValidationFailed(f"profile {field} must not contain empty items")
+    return out
+
+
+def validate_profile(raw) -> dict:
+    """The canonical content of a project profile: every key present, strings stripped, so one meaning has one hash.
+
+    Unknown keys are rejected (not ignored): a profile can never carry permissions, tools, models, paths or an
+    interpreter. `test_policy_ref` can only reference the project's own test policy."""
+    if not isinstance(raw, dict):
+        raise ValidationFailed("profile must be a JSON object")
+    extra = set(raw) - P.PROFILE_KEYS
+    if extra:
+        raise ValidationFailed("unknown profile fields: a profile cannot carry permissions, tools, models, paths or "
+                               "interpreters", {"rejected": sorted(extra), "allowed": sorted(P.PROFILE_KEYS)})
+    version = raw.get("schema_version", P.PROFILE_SCHEMA_VERSION)
+    if isinstance(version, bool) or version != P.PROFILE_SCHEMA_VERSION:
+        raise ValidationFailed("unsupported profile schema_version", {"supported": P.PROFILE_SCHEMA_VERSION})
+    if raw.get("test_policy_ref", P.PROFILE_TEST_POLICY_REF) != P.PROFILE_TEST_POLICY_REF:
+        raise ValidationFailed("profile test_policy_ref can only be 'project' (the project's own test policy)")
+    criteria_raw = raw.get("completion_criteria", [])
+    if not isinstance(criteria_raw, list) or len(criteria_raw) > P.PROFILE_CRITERIA_MAX:
+        raise ValidationFailed(f"profile completion_criteria must be a list of at most {P.PROFILE_CRITERIA_MAX} items")
+    criteria, seen = [], set()
+    for item in criteria_raw:
+        if not isinstance(item, dict) or set(item) != {"id", "text"}:
+            raise ValidationFailed("each completion criterion must be an object with exactly 'id' and 'text'")
+        cid = _profile_text(item["id"], "criterion id", 32)
+        if not re.fullmatch(P.PROFILE_CRITERION_ID_PATTERN, cid):
+            raise ValidationFailed("invalid completion criterion id", {"id": cid, "pattern": P.PROFILE_CRITERION_ID_PATTERN})
+        if cid in seen:
+            raise ValidationFailed("duplicate completion criterion id", {"id": cid})
+        seen.add(cid)
+        text = _profile_text(item["text"], "criterion text", P.PROFILE_RULE_MAX)
+        if not text:
+            raise ValidationFailed("a completion criterion needs a text", {"id": cid})
+        criteria.append({"id": cid, "text": text})
+    return {
+        "schema_version": P.PROFILE_SCHEMA_VERSION,
+        "description": _profile_text(raw.get("description", ""), "description", P.PROFILE_DESCRIPTION_MAX, multiline=True),
+        "languages": _profile_list(raw.get("languages", []), "languages", P.PROFILE_LABELS_MAX, P.PROFILE_LABEL_MAX),
+        "frameworks": _profile_list(raw.get("frameworks", []), "frameworks", P.PROFILE_LABELS_MAX, P.PROFILE_LABEL_MAX),
+        "architecture_rules": _profile_list(raw.get("architecture_rules", []), "architecture_rules",
+                                            P.PROFILE_RULES_MAX, P.PROFILE_RULE_MAX),
+        "coding_rules": _profile_list(raw.get("coding_rules", []), "coding_rules", P.PROFILE_RULES_MAX, P.PROFILE_RULE_MAX),
+        "completion_criteria": criteria,
+        "test_policy_ref": P.PROFILE_TEST_POLICY_REF,
+    }
 
 
 def validate_requirements(text: str) -> str:

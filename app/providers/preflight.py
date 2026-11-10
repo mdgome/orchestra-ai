@@ -7,8 +7,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from app.infra.command_executor import CommandExecutor, CommandSpec
+from app.infra.workspace_guard import resolve_inside_root
 from app.models.states import CliOutcome
 from app.providers.base import ProviderRequest
+from app.validation import policies as P
 from app.validation.exceptions import FailClosed
 
 CLAUDE_REQUIRED_FLAGS = ("--tools", "--allowedTools", "--disallowedTools", "--permission-mode", "--resume",
@@ -98,6 +100,33 @@ def scan_all_settings(project_dir: Path, home: Path | None = None) -> list[dict]
     out: list[dict] = []
     for p in (home / ".claude" / "settings.json", home / ".claude" / "settings.local.json",
               project_dir / ".claude" / "settings.json", project_dir / ".claude" / "settings.local.json"):
+        out += scan_claude_settings(p)
+    out += scan_codex_config(home / ".codex" / "config.toml")
+    return out
+
+
+def scan_project_settings(project_root: Path) -> list[dict]:
+    """Reads ONLY the two settings files below an already validated project root (see `resolve_project_root`).
+
+    A link or junction anywhere on those relative paths is itself a finding: the CLI would follow it outside the project.
+    Blocking filesystem I/O: call it from a worker thread."""
+    findings: list[dict] = []
+    for rel in P.PROJECT_SETTINGS_RELATIVE_PATHS:
+        try:
+            path = resolve_inside_root(project_root, rel)
+        except FailClosed:
+            findings.append({"source": rel, "severity": "high",
+                             "issue": "settings path is a link/junction or leaves the project root"})
+            continue
+        findings += scan_claude_settings(path)
+    return findings
+
+
+def scan_home_settings(home: Path | None = None) -> list[dict]:
+    """The user-level files at their fixed locations; independent of any project path validation."""
+    home = home or Path.home()
+    out: list[dict] = []
+    for p in (home / ".claude" / "settings.json", home / ".claude" / "settings.local.json"):
         out += scan_claude_settings(p)
     out += scan_codex_config(home / ".codex" / "config.toml")
     return out

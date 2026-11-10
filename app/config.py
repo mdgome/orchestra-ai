@@ -3,6 +3,9 @@ from pathlib import Path
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.validation import policies as P
+from app.validation.validators import validate_recovery_timeouts
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -25,6 +28,14 @@ class Settings(BaseSettings):
     db_pool_size: int | None = Field(None, ge=1)
     db_max_overflow: int = Field(10, ge=0)
     runner_shutdown_grace_seconds: float = 30.0
+    # Request recovery runs outside the Runner's lifecycle lock and is bounded: `recovery_statement_timeout_seconds` is
+    # the PostgreSQL statement limit (transaction-local), `runner_recovery_timeout_seconds` how long the Runner waits for
+    # the operation, `runner_recovery_shutdown_wait_seconds` how long a cancelled recovery may take to settle,
+    # `db_pool_timeout_seconds` the connection checkout wait. None of them bounds the advisory-lock connection close.
+    recovery_statement_timeout_seconds: float = P.DEFAULT_RECOVERY_STATEMENT_TIMEOUT_SECONDS
+    runner_recovery_timeout_seconds: float = P.DEFAULT_RUNNER_RECOVERY_TIMEOUT_SECONDS
+    runner_recovery_shutdown_wait_seconds: float = P.DEFAULT_RUNNER_RECOVERY_SHUTDOWN_WAIT_SECONDS
+    db_pool_timeout_seconds: float = Field(P.DEFAULT_DB_POOL_TIMEOUT_SECONDS, gt=0, allow_inf_nan=False)
     # Unique key for the single-runner advisory lock (see services/runner.py).
     runner_advisory_lock_key: int = 748_201_001
 
@@ -38,6 +49,12 @@ class Settings(BaseSettings):
         if self.effective_db_pool_size + self.db_max_overflow < 2:
             raise ValueError("DB_POOL_SIZE + DB_MAX_OVERFLOW must be at least 2: the Runner's advisory lock "
                              "permanently holds one connection")
+        return self
+
+    @model_validator(mode="after")
+    def _recovery_timeouts_are_consistent(self) -> "Settings":
+        validate_recovery_timeouts(self.recovery_statement_timeout_seconds, self.runner_recovery_timeout_seconds,
+                                   self.runner_recovery_shutdown_wait_seconds)
         return self
 
 

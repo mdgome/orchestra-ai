@@ -23,6 +23,7 @@ from app.infra.workspace_fingerprint import FingerprintError, compute_fingerprin
 from app.models.states import CliOutcome
 from app.models.tables import Project
 from app.repositories.project_repository import ProjectRepository
+from app.services import profile_service
 from app.validation import policies as P
 from app.validation import validators as V
 from app.validation.exceptions import Conflict, NotFound, ValidationFailed
@@ -52,17 +53,20 @@ class ProjectService:
 
     # --- registration --------------------------------------------------------------------------------
     async def create_project(self, *, name: str, workspace_path: str | None = None, repository_url: str | None = None,
-                             test_policy: dict | None = None) -> Project:
+                             test_policy: dict | None = None, profile: dict | None = None) -> Project:
         name = V.validate_project_name(name)
         policy = V.validate_test_policy(test_policy) if test_policy is not None else None
+        # validated BEFORE anything is cloned or inserted; omitted = the neutral profile (no architecture is imposed)
+        profile_content = V.validate_profile(profile) if profile is not None else None
         if (workspace_path is None) == (repository_url is None):
             raise ValidationFailed("exactly one of workspace_path or repository_url is required")
         if workspace_path is not None:
             resolved = V.validate_project_path(workspace_path, protected=self.protected)
-            return await self._insert(name, resolved, None, policy)
-        return await self._clone_and_register(name, V.validate_repository_url(repository_url), policy)
+            return await self._insert(name, resolved, None, policy, profile_content)
+        return await self._clone_and_register(name, V.validate_repository_url(repository_url), policy, profile_content)
 
-    async def _insert(self, name: str, resolved: Path, repository_url: str | None, policy: dict | None) -> Project:
+    async def _insert(self, name: str, resolved: Path, repository_url: str | None, policy: dict | None,
+                      profile_content: dict | None = None) -> Project:
         key = V.workspace_key(resolved)
         try:
             # the workspace as registered is the first allowed baseline (an already-dirty git tree is not an error)
@@ -73,12 +77,17 @@ class ProjectService:
             repo = ProjectRepository(s)
             await repo.lock_registration()
             V.validate_no_project_overlap(key, await repo.workspace_keys())
-            return await repo.add(Project(
+            project = await repo.add(Project(
                 id=uuid.uuid4(), name=name, workspace_path=str(resolved), workspace_key=key,
                 repository_url=repository_url, status="ACTIVE", test_policy=policy, write_epoch=0,
                 baseline_fingerprint=baseline.value, workspace_state="CLEAN", row_version=0))
+            # project row, v1 profile and the active pointer commit together or not at all
+            await profile_service.create_initial(s, project.id, profile_content)
+            await s.refresh(project)
+            return project
 
-    async def _clone_and_register(self, name: str, clean_url: str, policy: dict | None) -> Project:
+    async def _clone_and_register(self, name: str, clean_url: str, policy: dict | None,
+                                  profile_content: dict | None = None) -> Project:
         self.clone_root.mkdir(parents=True, exist_ok=True)
         slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.")[:40] or "project"
         target = self.clone_root / f"{slug}-{uuid.uuid4().hex[:8]}"
@@ -87,7 +96,7 @@ class ProjectService:
             await self._run_clone(clean_url, target)
             resolved = V.validate_project_path(
                 str(target), protected=tuple(p for p in self.protected if p != self.clone_root))
-            return await self._insert(name, resolved, clean_url, policy)
+            return await self._insert(name, resolved, clean_url, policy, profile_content)
         except CloneTerminationUnconfirmed:
             raise                            # the process may still be writing: never delete under it
         except BaseException:

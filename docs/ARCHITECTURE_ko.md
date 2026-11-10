@@ -28,6 +28,53 @@ infra/         명령 실행기, 프로세스 제어, 작업공간 보호/스냅
 * 세 카운터는 독립적으로 관리합니다. `step_attempt`는 기술적 재시도, `workflow_iteration`은 개선 루프(최대 3회),
   `plan_revision`/`replan_count`는 재계획을 나타냅니다. Human Gate 대기는 어떤 카운터도 증가시키지 않습니다.
 
+## Project Profile
+
+* `project_profiles`는 불변 버전을 보관하고(trigger가 UPDATE/DELETE를 거부), `projects.profile_version`은 활성 포인터이며 복합
+  FK이므로 같은 project의 버전만 가리킬 수 있습니다. Task는 버전, hash, 내용을 복사합니다(`tasks.profile_*`: 모두 NULL이거나,
+  project와 64자 hash가 있는 상태로 모두 존재해야 함. CHECK로 강제).
+* Profile은 프롬프트를 조정하는 데이터입니다. 오케스트레이터 메커닉(`prompts.MECHANICS`)은 결코 포함되지 않으며, 오케스트레이터
+  자체의 개발 규칙은 AGENTS.md / CLAUDE.md에 남습니다. 권한은 role과 test preset만의 함수이고(`providers/permissions.py`),
+  `validate_profile`은 schema 밖의 모든 key를 거부합니다.
+* Profile이 없는 Task는 내장 `RULES`와 원래 hash를 바이트 단위로 유지합니다(hash가 NULL이면 `profile_part` /
+  `profile_criteria_of`는 아무것도 더하지 않음). `legacy` v1은 `RULES`와 똑같이 렌더되고 `neutral` v1은 아키텍처를 강제하지
+  않습니다.
+* `completion_criteria`: 리뷰어가 저장한 평가는 `completion_checker.profile_criteria_problems`가 추가 조건으로 결정적으로
+  검사합니다. criterion 충족 여부 자체는 리뷰어의 판단으로 남습니다.
+
+## 산출물과 보고서 조회
+
+* 새 테이블은 없습니다. 산출물은 `task_steps` 행(`artifact_id` = step id)이며, 보고서는 `ArtifactRepository`를 통해 step,
+  execution, approval, transition을 읽습니다(manifest는 defer되어 로드하지 않음). `ReportService`가 payload를 만들고
+  `schemas/reports.py`가 검증하며 크기 계약을 적용합니다. LLM 호출도, 쓰기도 없습니다.
+* `completion_checker.evaluate_definition_of_done`은 모든 조건을 각자의 판정과 함께 반환하며 `check_definition_of_done`의
+  유일한 근거입니다(동작 불변). 보고서의 `current_re_evaluation`은 아무것도 결정하지 않고 이를 재사용합니다. 저장된 COMPLETED
+  전이는 `historical_completion`(상세 UNKNOWN)으로 따로 보고합니다.
+* 마스킹 primitive(`session_fingerprint`, 알려진 id 치환)는 `infra/redaction.py`에 있으며 provider와 응답 sanitizer가 함께
+  씁니다(`infra`는 `providers`를 import하지 않고, `providers.base.redact`는 얇은 wrapper).
+* 응답마다의 순서: 올바른 타입의 정화된 값으로 payload 구성 -> strict 검증 -> 크기 -> schema가 예약한 필드(`sanitization`,
+  `omitted_items`, `omitted_sections`, `size_limited`, `SanitizedJson.reasons`)로만 재절단 -> 다시 strict 검증 -> 크기
+  (최대 `RESPONSE_SHRINK_MAX_ROUNDS`회) -> 제한된 fallback -> 명시적 오류. `validate_response_limits()`는 답 하나도 담지 못하는
+  한도로는 시작하지 않게 합니다.
+
+## 런타임 상태와 진단
+
+* `runtime_status.runtime_snapshot(lifecycle, startup_outcome, recovery_unsettled)`가 `/health`의 유일한 판정입니다.
+  `runner_active`와 `ready`는 `Runner.lifecycle`에서 계산합니다. Runner가 시작되지 않은 이유(preflight 차단, advisory lock
+  점유, `start()` 실패)는 lifecycle에 보이지 않으므로 lifespan이 `StartupOutcome`을 기록합니다. `START_FAILED`는 예약
+  상태입니다. `Runner.start`의 일반 예외는 지금도 lifespan을 중단시킵니다(결정 D6-a).
+* `diagnostics_service`는 읽기 전용입니다(도구 버전 확인과 파일 읽기만; 에이전트, 인증 프로브, 설치 프로그램, 프로젝트
+  테스트는 실행하지 않음). cache key마다 공유 `asyncio.Task` 하나를 짧은 `asyncio.Lock` 아래에서 만들며, 이 lock은 진단이
+  실행되는 동안 잡지 않습니다. 결과는 task가 끝나기 전에 캐시되고 done callback은 자기 task만 제거합니다. waiter는
+  shield되어 취소된 waiter가 진단을 취소하지 않습니다.
+* subprocess는 executor의 timeout으로 제한되고 종료됩니다. 파일 점검은 worker thread를 쓰며 timeout은 **cooperative/
+  best-effort**입니다. thread는 강제 종료할 수 없으므로 Project당 점검 1개와 전역 상한이 worker 수를 제한하고, 슬롯은
+  thread가 실제로 끝날 때만 반납됩니다.
+* 등록된 Project는 자신의 root부터 검증합니다(`resolve_project_root` 후 `resolve_inside_root`). `WORKSPACE_ROOT` 기준의
+  `WorkspaceGuard`는 사용하지 않습니다. 끼워 넣은 링크/junction, 바뀐 canonical path, 사라지거나 접근 불가한 root는
+  탐지하지만, 같은 canonical path의 실제 디렉터리가 다른 디렉터리로 교체된 경우는 탐지하지 않습니다(저장된 filesystem
+  identity가 필요함).
+
 ## Lease 및 인계(`lease_service`)
 
 Task마다 하나의 RUNNING `task_runs` 행만 허용하며 부분 Unique Index로 보장합니다. 만료된 Lease의 인계는 세 단계로
@@ -88,6 +135,21 @@ CLI가 세션이 존재하지 않는다고 명시적으로 보고한 경우에�
 * Test Policy preset(pytest/Maven/Gradle)은 Task 생성 시 하나의 명령으로 해석되어 Task에 복사됩니다. 결과 파일은 삭제하지
   않고 이번 실행에서 새로 생기거나 바뀐 파일만 사용하며, 테스트 프로세스에는 CLI 인증 변수가 전달되지 않습니다.
 * 상세한 흐름·Mermaid·불변 조건은 `docs/workflow/`(특히 03, 07, 08, 09, 10, 11)에 있습니다.
+
+## Task baseline과 변경 내역
+
+* `task_baselines`(migration 0004): Task당 한 행이며 `ProjectLockService`가 `set_owner`와 **같은 트랜잭션**에서 기록합니다
+  (`ON CONFLICT (task_id) DO NOTHING` 후 실제 행을 identity로 비교: 같은 acquisition이면 idempotent, 다르면 fail closed하고 owner도
+  rollback). AVAILABLE 행은 gzip manifest와 HEAD를, UNAVAILABLE 행은 이유만 담고 payload는 없습니다. CHECK는 NULL-safe
+  (`... IS TRUE`)합니다. CHECK는 NULL이면 통과하므로 NULL 항이 섞인 단순 conjunction은 잘못된 행을 허용했을 것입니다.
+* 두 결과를 분리합니다(`LockMeasurement`): fingerprint proof(fail closed, 변경 없음)와 보조 manifest(실패 = UNAVAILABLE 행, Task는
+  계속). `WORKSPACE_FINGERPRINT_V1`과 `STEP_SNAPSHOT_V1`은 건드리지 않으며, manifest는 자체 walk, 한도(비압축 바이트, 파일 수,
+  경로·target 길이), bounded 압축 해제를 가진 별도의 `CHANGES_MANIFEST_V1` schema입니다.
+* `ChangeService`는 읽기 전용입니다(git: `rev-parse`, `ls-files`, `status`, `cat-file`). `Deadline` 하나를 측정 코드에 전달합니다
+  (git은 `min(기본, 남은 시간)`, walk/hash는 entry·chunk 사이 확인). filesystem에서는 cooperative이며 OS 호출이 멈추는 경우를
+  막아 주지 않습니다. `MeasurementGate`가 Project당·전체 worker 수를 제한하고 worker가 끝날 때 슬롯을 반납하며, timeout은
+  `verify_workspace`의 cooldown을 엽니다.
+* `lock_consistency`(DB, 전후 비교)와 `workspace_consistency`(파일, 측정 두 번)는 별개 필드입니다.
 
 ## 의사결정 기록
 

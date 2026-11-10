@@ -7,9 +7,11 @@ from fastapi import FastAPI
 from app.config import Settings, get_settings
 from app.container import Container, build_container
 from app.providers.preflight import check_installed_cli, scan_all_settings
-from app.routers import approvals, conversations, events, projects, tasks
+from app.routers import approvals, conversations, events, projects, reports, tasks
 from app.services.runner import RunnerAlreadyActive
+from app.services.runtime_status import StartupOutcome
 from app.validation.error_handlers import register_error_handlers
+from app.validation.validators import validate_response_limits
 
 log = logging.getLogger("orchestrator")
 
@@ -62,6 +64,7 @@ async def shutdown_runtime(c: Container, owns_db: bool, body_error: BaseExceptio
 
 def create_app(settings: Settings | None = None, container: Container | None = None,
                run_preflight: bool = True) -> FastAPI:
+    validate_response_limits()      # a limit that cannot hold one answer stops the application from starting
     settings = settings or get_settings()
 
     @asynccontextmanager
@@ -72,11 +75,14 @@ def create_app(settings: Settings | None = None, container: Container | None = N
             await _preflight(c)
             if c.preflight and c.preflight.blocking:
                 log.error("preflight failed, the Runner will not execute tasks: %s", c.preflight.blocking)
-        if not (c.preflight and c.preflight.blocking):
+        if c.preflight and c.preflight.blocking:
+            c.startup_outcome = StartupOutcome.PREFLIGHT_BLOCKED
+        else:
             try:
                 await c.runner.start()
-                c.runner_active = True
+                c.startup_outcome = StartupOutcome.STARTED
             except RunnerAlreadyActive:
+                c.startup_outcome = StartupOutcome.ALREADY_ACTIVE
                 log.error("another Runner process is active: this API instance only stores requests")
         body_error: BaseException | None = None
         try:
@@ -90,13 +96,15 @@ def create_app(settings: Settings | None = None, container: Container | None = N
     app.include_router(conversations.router)
     app.include_router(projects.router)
     app.include_router(tasks.router)
+    app.include_router(reports.router)
     app.include_router(approvals.router)
     app.include_router(events.router)
 
     @app.get("/health", tags=["health"])
     async def health():
-        c = app.state.container
-        return {"status": "ok", "runner_active": c.runner_active}
+        """`status` is API liveness (always "ok" while this answers); `ready` is whether a new execution request would
+        be picked up. Both `runner_active` and `ready` come from `Runner.lifecycle`, see app/services/runtime_status."""
+        return app.state.container.runtime().as_dict()
 
     return app
 

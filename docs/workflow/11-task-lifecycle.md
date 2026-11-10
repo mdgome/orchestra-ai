@@ -183,6 +183,35 @@ The check conditions are the items actually verified by `check_definition_of_don
 If anything is unmet, the Review outcome is changed to `FAIL`, moving to an improvement iteration (`RETRYING`); if it is a `plan_defect`, it moves to replanning. The only cases where this check results in FAILED are exceeding the iteration limit (`max_workflow_iterations`) or the replan limit (`max_replans`) ([05](05-development-testing.md)). (A project Task can also become FAILED for other reasons such as `PROJECT_WORKSPACE_UNSTABLE`, `PROJECT_DIRTY_ABORTED`/`PROJECT_DIRTY_REJECTED`, which are unrelated to the Completion check.)
 - Project cleanup at the moment of becoming COMPLETED (accepting the final fingerprint as the baseline) follows the "Terminal Transitions and Project Write Lock Cleanup" section above.
 
+## Reading the Result: Artifacts and Report
+
+`GET /tasks/{id}/artifacts`, `GET /tasks/{id}/artifacts/{artifact_id}` and `GET /tasks/{id}/report` read what is already stored; they run no agent, command or LLM and write nothing. `COMPLETED` means the orchestrator's completion conditions were met, not that the result was accepted, merged or deployed. The stored COMPLETED transition is shown as `historical_completion` (its Definition-of-Done detail was never stored: `UNKNOWN`); `current_re_evaluation` evaluates the same conditions now (`evaluate_definition_of_done`, the function behind `check_definition_of_done`) and neither confirms nor cancels it. The three counters stay separate in every artifact: `plan_revision`, `workflow_iteration`, `step_attempt`.
+
+```mermaid
+flowchart TD
+    A["task_steps / executions / approvals / state_transitions"] --> B["ArtifactRepository (manifests deferred)"]
+    B --> C["ReportService: validity, latest, iterations, gates, re-evaluation"]
+    C --> D["Sanitizer: known session ids, credentials, denied keys, bounds"]
+    D --> E["Strict validation, size check, reserved-field cuts, bounded fallback"]
+    E --> F["JSON response with sanitization info"]
+```
+
+Besides the artifacts, `GET /tasks/{id}/changes` shows what the task changed in the workspace since it took the write lock: the live workspace compared with the stored baseline (paths and hashes, bodies only where git can supply the old content). It is a live comparison, not a snapshot: `lock_consistency` (DB) and `workspace_consistency` (files, two measurements, `verify_workspace=true`) are reported separately, and a task that no longer owns the project does not get a settled diff. A task with no baseline (`NO_BASELINE`), no project (`NO_PROJECT`) or an `UNAVAILABLE` baseline says so with the reason.
+
+## Runner Readiness and Diagnostics
+
+`POST /tasks/{id}/execution-requests` only stores a `PENDING` request; it answers 202 whether or not a Runner will pick it up. Whether one will is answered by `GET /health` (`ready`, `runner.blockers`) and `GET /projects/{id}/diagnostics` (`RUNNER_STATE`), both read-only. `runner_active` and `ready` are derived from `Runner.lifecycle`; the reasons a Runner never started (`PREFLIGHT_FAILED`, `ADVISORY_LOCK_HELD`) come from the `StartupOutcome` the lifespan records. A pending request is not lost: the next Runner that starts picks it up. `START_FAILED` is reserved until a general `Runner.start` failure stops aborting the API lifespan.
+
+```mermaid
+flowchart TD
+    A["POST /tasks/{id}/execution-requests"] --> B["ExecutionRequest PENDING (202)"]
+    B --> C{"Runner.lifecycle == RUNNING and no blocker?"}
+    C -- yes --> D["Runner claims and executes it"]
+    C -- no --> E["Request waits PENDING; /health runner.blockers explains why"]
+    E --> F["A Runner becomes ready: it claims the request"]
+    F --> D
+```
+
 ## Current Implementation Limitations
 
 - The Completion Checker does not check for unterminated Executions via a separate query. The three groups of checks above are all there is.

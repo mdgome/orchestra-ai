@@ -83,6 +83,60 @@ async def statuses(h: Harness, *task_ids) -> list[str]:
     return [(await h.task(t)).status for t in task_ids]
 
 
+def observe_done_callbacks(runner: Runner, monkeypatch) -> tuple[asyncio.Event, asyncio.Event]:
+    """Observes the production done-callback and changes nothing. Install it BEFORE `runner.start()` (before any request
+    is launched; the done-callback looks `self._on_done` up when it runs, so the instance wrapper is the one called).
+    A plain `def` like the callback it wraps: `original` (the production bound method, saved before the wrapper exists)
+    is called exactly once, its return value is returned, an exception is re-raised unchanged, `_inflight` and the task
+    are not touched, and nothing is awaited or scheduled.
+      callback_ran    set once per call, whether `original` returned or raised
+      registry_empty  set only when `original` returned normally AND the registry is empty afterwards (diagnostics only)"""
+    callback_ran, registry_empty = asyncio.Event(), asyncio.Event()
+    original = runner._on_done
+
+    def observed(request_id, task):
+        try:
+            result = original(request_id, task)
+        except BaseException:
+            raise
+        else:
+            if runner.in_flight == 0:
+                registry_empty.set()
+            return result
+        finally:
+            callback_ran.set()
+
+    monkeypatch.setattr(runner, "_on_done", observed)
+    return callback_ran, registry_empty
+
+
+async def wait_registry_empty(runner: Runner, callback_ran: asyncio.Event, registry_empty: asyncio.Event,
+                              timeout: float = 30.0) -> None:
+    """Waits (one absolute deadline, no sleeping, no polling) until the Runner's in-flight registry is empty. Whether it
+    is empty is always decided by `runner.in_flight` itself, never by an Event: `registry_empty` can have been set
+    earlier by a momentary zero (e.g. before the third request was launched) and says nothing about now."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+
+    def message() -> str:
+        return (f"timed out waiting for the Runner in-flight registry to become empty (in_flight={runner.in_flight}, "
+                f"callback_ran={callback_ran.is_set()}, registry_empty={registry_empty.is_set()})")
+
+    while True:
+        if runner.in_flight == 0:
+            return
+        # No `await` between the check above and this clear(), and the event loop is single-threaded, so no callback can
+        # run in between: every done-callback after this point sets the Event, none is missed.
+        callback_ran.clear()
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise AssertionError(message())
+        try:
+            await asyncio.wait_for(callback_ran.wait(), remaining)
+        except TimeoutError as exc:
+            raise AssertionError(message()) from exc
+
+
 # --- backoff -----------------------------------------------------------------------------------------------------------
 def test_backoff_delays_are_5_10_20_then_capped():
     assert [defer_delay(n, jitter=1.0) for n in range(3)] == [5.0, 10.0, 20.0]
@@ -251,12 +305,13 @@ async def test_claim_with_empty_and_default_busy_list(db, tmp_path):
 
 
 # --- bounded dispatch -----------------------------------------------------------------------------------------------
-async def test_different_projects_run_in_parallel_up_to_the_task_limit(db, tmp_path):
+async def test_different_projects_run_in_parallel_up_to_the_task_limit(db, tmp_path, monkeypatch):
     gate = Gate()
     h = Harness(db, tmp_path / "ws", claude_handlers={"PLANNER": gate.planner})
     projects = [await make_project(h, tmp_path, n) for n in ("a", "b", "c")]
     tasks = [await project_task(h, p) for p in projects]
     runner = make_runner(h, tasks=2, per_project=1)
+    callback_ran, registry_empty = observe_done_callbacks(runner, monkeypatch)       # before any request is launched
     await runner.start()
     try:
         for t in tasks:
@@ -268,6 +323,12 @@ async def test_different_projects_run_in_parallel_up_to_the_task_limit(db, tmp_p
         assert [s for s in await statuses(h, *[t.id for t in tasks])].count("PENDING") == 1
         gate.release.set()
         assert await wait_for(lambda: _all_completed(h, tasks), timeout=60)
+        # A Task is COMPLETED when the review step COMMITS it (`finalize_task_with_proof`). The request coroutine is not
+        # finished by then: Runner.process still stops the heartbeat, marks the ExecutionRequest DONE, returns to
+        # `_run_request`, and only the task's done-callback `_on_done` removes it from the registry. Task COMPLETED and
+        # that removal are NOT atomic (and nothing promises they are), so `in_flight == 0` cannot be asserted the moment
+        # the polling sees COMPLETED. It is awaited here, in the normal flow and before stop(), instead:
+        await wait_registry_empty(runner, callback_ran, registry_empty)
         assert runner.in_flight == 0
     finally:
         await runner.stop()

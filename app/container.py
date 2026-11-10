@@ -10,13 +10,18 @@ from app.infra.workspace_guard import WorkspaceGuard
 from app.providers.claude_cli import ClaudeCliProvider
 from app.providers.codex_cli import CodexCliProvider
 from app.providers.preflight import PreflightReport
+from app.services.change_service import ChangeService
+from app.services.diagnostics_service import DiagnosticsService
 from app.services.human_gate_service import HumanGateService
 from app.services.lease_service import LeaseService
 from app.services.project_lock_service import ProjectLockService
 from app.services.project_recovery_effect import ProjectDirtyRecoveryEffect
+from app.services.profile_service import ProfileService
 from app.services.project_service import ProjectService
+from app.services.report_service import ReportService
 from app.services.recovery_effects import RecoveryEffects
 from app.services.runner import Runner, new_runner_id
+from app.services.runtime_status import RuntimeSnapshot, StartupOutcome, snapshot_of
 from app.services.session_service import SessionService
 from app.services.step_runner import StepRunner
 from app.services.task_finalizer import TaskFinalizer
@@ -24,6 +29,7 @@ from app.services.task_service import TaskService
 from app.services.test_policy_service import TestPolicyService
 from app.services.workflow_service import WorkflowService
 from app.validation import policies as P
+from app.validation.exceptions import ServiceNotConfigured
 
 
 @dataclass
@@ -38,15 +44,47 @@ class Container:
     runner: Runner
     providers: dict
     preflight: PreflightReport | None = field(default=None)
-    runner_active: bool = False
+    startup_outcome: StartupOutcome = StartupOutcome.NOT_ATTEMPTED    # recorded by the API lifespan
     projects: ProjectService | None = None
+    diagnostics: DiagnosticsService | None = None
+    reports: ReportService | None = None
+    profiles: ProfileService | None = None
+    changes: ChangeService | None = None
+
+    def runtime(self) -> RuntimeSnapshot:
+        """The single judgement of what the Runner can do right now (derived from `Runner.lifecycle`)."""
+        return snapshot_of(self.runner, self.startup_outcome)
+
+    @property
+    def runner_active(self) -> bool:
+        return self.runtime().runner_active
+
+    def diagnostics_service(self) -> DiagnosticsService:
+        if self.diagnostics is None:
+            raise ServiceNotConfigured("project diagnostics are not configured in this container")
+        return self.diagnostics
+
+    def profile_service(self) -> ProfileService:
+        if self.profiles is None:
+            raise ServiceNotConfigured("project profiles are not configured in this container")
+        return self.profiles
+
+    def change_service(self) -> ChangeService:
+        if self.changes is None:
+            raise ServiceNotConfigured("task changes are not configured in this container")
+        return self.changes
+
+    def report_service(self) -> ReportService:
+        if self.reports is None:
+            raise ServiceNotConfigured("artifact and report views are not configured in this container")
+        return self.reports
 
 
 def build_container(settings: Settings, providers: dict | None = None, db: Database | None = None) -> Container:
     root = Path(settings.workspace_root)
     root.mkdir(parents=True, exist_ok=True)
     database = db or Database(create_engine(settings.database_url, settings.effective_db_pool_size,
-                                          settings.db_max_overflow))
+                                          settings.db_max_overflow, settings.db_pool_timeout_seconds))
     guard = WorkspaceGuard(root)
     executor = CommandExecutor(guard, max_concurrent=settings.max_concurrent_cli_processes)
     events = EventBus()
@@ -66,8 +104,17 @@ def build_container(settings: Settings, providers: dict | None = None, db: Datab
                     advisory_key=settings.runner_advisory_lock_key, claim_timeout_seconds=settings.claim_timeout_seconds,
                     max_concurrent_tasks=settings.max_concurrent_tasks,
                     max_tasks_per_project=settings.max_tasks_per_project,
-                    shutdown_grace_seconds=settings.runner_shutdown_grace_seconds)
+                    shutdown_grace_seconds=settings.runner_shutdown_grace_seconds,
+                    recovery_statement_timeout_seconds=settings.recovery_statement_timeout_seconds,
+                    recovery_timeout_seconds=settings.runner_recovery_timeout_seconds,
+                    recovery_shutdown_wait_seconds=settings.runner_recovery_shutdown_wait_seconds)
     projects = ProjectService(database, executor, clone_root=Path(settings.project_clone_root),
                               protected=(root, Path(__file__).resolve().parents[1]))
-    return Container(settings, database, guard, executor, events, TaskService(database, guard), gates, runner, providers,
-                     projects=projects)
+    container = Container(settings, database, guard, executor, events, TaskService(database, guard), gates, runner,
+                          providers, projects=projects)
+    container.diagnostics = DiagnosticsService(projects, executor, protected=projects.protected,
+                                               get_runtime=container.runtime, get_preflight=lambda: container.preflight)
+    container.reports = ReportService(database, get_runtime=container.runtime)
+    container.profiles = ProfileService(database)
+    container.changes = ChangeService(database)
+    return container

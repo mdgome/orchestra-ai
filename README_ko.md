@@ -54,7 +54,8 @@ cp .env.example .env
 
 `codex`와 `claude`가 설치되어 있고 로그인된 상태여야 합니다. 시작 시 사전 점검을 통해 설치된 버전이 사용하는 모든
 플래그를 지원하는지 확인합니다. 또한 `~/.claude/settings*.json`, 프로젝트의 `.claude/`, `~/.codex/config.toml`에서
-권한을 확대하는 설정(예: `bypassPermissions`)을 검사하며, 차단 대상이 발견되면 Runner를 중지합니다.
+권한을 확대하는 설정(예: `bypassPermissions`)을 검사하며, 차단 대상이 발견되면 Runner를 중지합니다. 로그인 상태 자체는 검증하지 **않으며**(프로브는 CLI를 실행해 토큰을 사용함),
+아래 진단에서 `UNKNOWN`으로 보고합니다.
 
 ## API
 
@@ -69,17 +70,151 @@ URI에는 명사를 사용하고 동작은 HTTP 메서드로 표현합니다. �
 | GET | `/projects` · `/projects/{id}` | |
 | PATCH | `/projects/{id}` | `name`, `status`(`ARCHIVED`는 미종료 Task가 있으면 409), `test_policy`(생략=유지, 객체=검증 후 교체, `null`=제거, `name`/`status`의 `null`은 422. 이미 만든 Task의 정책 복사본은 바뀌지 않음) |
 | GET/POST | `/projects/{id}/tasks` | Project Workspace를 공유하는 Task 목록/생성(201, 실행은 하지 않음) |
+| GET | `/projects/{id}/profile` | 활성 Project Profile 버전(*Project Profile* 참고) |
+| GET/POST | `/projects/{id}/profile-versions` | 버전 목록(최신순, 페이지네이션) / 새 버전 생성 **및 활성화**: 201, 활성 버전과 같으면 200 `created: false` |
+| GET | `/projects/{id}/diagnostics` | 읽기 전용 실행 준비 점검(*Health와 진단* 참고). `?refresh=true`는 30초 캐시를 우회 |
+| GET | `/health` | API 생존 여부와 Runner 준비 상태(*Health와 진단* 참고) |
 | GET/POST | `/tasks` | POST는 PENDING 작업을 **생성만** 하며(201), 아무 작업도 실행하지 않음 |
 | GET/PATCH | `/tasks/{id}` | GET 응답에 현재 lease, 최신 checkpoint 및 미결 승인 포함 |
 | POST | `/tasks/{id}/execution-requests` | 202. 요청을 저장하고 Runner가 실행함. 미결 요청이 있는 동안 멱등성 보장 |
 | POST | `/tasks/{id}/cancellation-requests` | 202. 요청을 기록하며 CLI 프로세스 종료가 확인된 후에만 CANCELLED 처리 |
 | GET | `/tasks/{id}/executions` · `/state-transitions` · `/approvals` | 이력 |
+| GET | `/tasks/{id}/artifacts` · `/tasks/{id}/artifacts/{artifact_id}` | 저장된 단계 결과(페이지네이션: `kind`, `limit` ≤ 100, `offset`). *산출물과 완료 보고서* 참고 |
+| GET | `/tasks/{id}/report` | 저장된 사실로 구성하는 결정적 완료 보고서(LLM 호출 없음) |
+| GET | `/tasks/{id}/changes` | Task가 Project write lock을 잡은 시점부터의 누적 변경(`limit` ≤ 100, `offset`, `path`, `verify_workspace`). *Task 변경 내역* 참고 |
 | GET | `/approvals/{id}` | |
 | POST | `/approvals/{id}/decisions` | `Idempotency-Key` 헤더 필수. 신규 201, 동일 요청 재실행 200, 충돌/만료 데이터 409, 기한 만료 410 |
 | WS | `/tasks/{id}/event-stream` | 실시간 이벤트 |
 
 결정을 승인하면 결정 내용과 `RESUME` 실행 요청을 하나의 트랜잭션에 저장합니다. 따라서 승인 직후 장애가 발생해도 다음
 Runner 시작 시 작업이 재개됩니다.
+
+## 산출물과 완료 보고서
+
+여기의 모든 내용은 이미 저장된 데이터(task step, execution, approval, state transition)에서 계산합니다. 만들기 위해
+에이전트, 명령, LLM을 호출하지 않으며, 에이전트가 만들지 않은 것을 지어내지 않습니다.
+
+* `GET /tasks/{id}/artifacts?kind=&limit=&offset=`은 저장된 단계 결과(`PLAN`, `DESIGN_REVIEW`, `DEVELOP`, `TEST`,
+  `CODE_REVIEW`)를 오래된 순(`created_at`, 다음 `id`)으로 나열합니다. 각 항목은 `plan_revision`, `workflow_iteration`,
+  `step_attempt`를 따로 가지며(재계획, 개선 회차, 기술적 재시도는 서로 다른 것), `is_latest_succeeded`(해당 종류에서
+  가장 최근에 만들어진 SUCCEEDED 산출물이며 "현재 유효"를 뜻하지 **않음**)와 `validity`를 포함합니다.
+* `validity.state`: `CURRENT`(저장된 기준이 아직 일치하는 계획/설계 검토), `STALE`(저장된 기준이 더 이상 일치하지 않거나
+  이후 revision/회차/시도가 대체함. `reasons`가 이유를 설명), `UNVERIFIED`(workspace 내용을 설명하는 산출물: 저장된 기준은
+  모두 일치하지만 live workspace와 비교하지 않았으므로 CURRENT라고 부르지 않음), `NOT_APPLICABLE`(단계가 성공하지 않음).
+* `GET /tasks/{id}/artifacts/{artifact_id}`는 정화된 저장 출력과 함께 산출물 하나를 반환합니다. 다른 Task의 id는 `404`입니다.
+* `GET /tasks/{id}/report`는 결과와 `outcome_note`, 계획, 설계 검토, 구현, 테스트(오케스트레이터가 실행한 명령과 결과,
+  `run_by: ORCHESTRATOR`), 코드 검토, 회차별 지적 사항, Human Gate 이력, 마지막 전이, `next_actions`를 반환합니다.
+* `COMPLETED`는 오케스트레이터의 완료 조건을 충족했다는 뜻입니다. 사용자가 결과를 인수하거나 merge·배포했다는 뜻이
+  **아닙니다**.
+* `historical_completion`은 저장된 COMPLETED 전이만 보여 줍니다. 그 시점의 Definition-of-Done 상세는 저장된 적이 없으므로
+  `conditions`는 `UNKNOWN`이며 재구성하지 않습니다. `current_re_evaluation`은 같은 조건을 지금 저장된 산출물에 대해
+  평가하며(`evaluated_at`, `evaluation_basis`), 과거 완료를 확인하거나 취소하지 않고 live workspace와도 비교하지 않습니다.
+* 응답에는 native session id, 자격 증명, step manifest가 포함되지 않습니다. 하나의 재귀 sanitizer가 해당 Task의 알려진
+  session id(일반 UUID는 유지), URL 자격 증명과 토큰을 마스킹하고, 금지된 key를 제거하며, 깊이·key 수·배열 항목·문자열
+  길이·크기를 제한합니다. 잘린 내용은 데이터 안이 아니라 `sanitization` / `SanitizedJson.reasons`에 명시됩니다. 크기 제한을
+  넘는 페이지는 뒤쪽 항목을 생략하며 `total`은 DB 건수 그대로이고 `returned`, `omitted_items`, `size_limited`, `has_more`,
+  `next_offset`이 상황을 알려 줍니다. 생략된 항목은 `next_offset`부터 다시 조회할 수 있습니다. 한도가 답 하나도 담지 못하면
+  애플리케이션이 시작되지 않습니다.
+
+## Task 변경 내역
+
+Task가 Project write lock을 잡을 때 오케스트레이터는 같은 트랜잭션에서 workspace의 **baseline**을 기록합니다. Changes
+manifest(`CHANGES_MANIFEST_V1`: 경로마다 `FILE` {sha256, executable}, `SYMLINK` {target}, `GITLINK` {oid}), HEAD(`COMMIT` 또는
+`UNBORN`), 그리고 이미 dirty였던 경로입니다. **hash만 저장하고 파일 내용은 저장하지 않습니다.** `GET /tasks/{id}/changes`는
+live workspace를 이 baseline과 비교합니다.
+
+* **측정 둘, 실패 정책 둘.** Project fingerprint(`WORKSPACE_FINGERPRINT_V1`, 변경 없음)는 Task가 Project를 소유해도 되는지를
+  결정합니다. 측정할 수 없으면 기존 fail-closed 경로(owner 없음, baseline 없음, `DIRTY_UNRESOLVED`, `PROJECT_DIRTY` gate)를
+  따릅니다. manifest, HEAD, dirty 경로는 보조 자료이며, 이것만 실패하면 Task는 **계속 실행**되고 이유 코드(`TOO_MANY_FILES`,
+  `DIRTY_PATHS_LIMIT`, `DEADLINE`, `GIT_ENUMERATION_FAILED` 등)가 있는 `UNAVAILABLE` baseline 행이 owner 설정과 같은
+  트랜잭션에 기록됩니다. 순서는 fingerprint, manifest, fingerprint 재측정이며 두 fingerprint가 다르면 측정이 stale이므로 기존
+  bounded retry 안에서 다시 측정합니다.
+* **Epoch.** `proof_epoch` = fingerprint를 측정한 시점(acquisition 전)의 project epoch, `acquired_epoch` = acquisition이 만든
+  epoch(`proof_epoch + 1`), `recorded_epoch` = 행을 기록한 시점의 epoch입니다. `set_owner`가 자신이 만든 epoch를 명시하며 +1을
+  추측하지 않습니다. baseline 행 없이 이미 lock을 소유한 Task(crash gap, 또는 이 기능 이전의 owner)는 행 없이 READY가 되지
+  않습니다. 아무것도 바꾸지 않았고 fingerprint가 write baseline과 같으면 manifest를 복구하고, 아니면 proof/acquired epoch가
+  **null**인 명시적 `UNAVAILABLE` 행(`BASELINE_MISSING_AT_REENTRY`)을 기록합니다. 원래 epoch를 지어내지 않습니다.
+* **범위.** GIT mode는 tracked 파일과 untracked non-ignored 파일을 다루고(ignored build output 제외), CONTENT mode(사용 가능한
+  git 없음)는 workspace policy walk를 다룹니다. `executable`은 working-tree의 mode bit이며 Windows에서는 항상 false입니다. 다루지
+  않는 것: ignored 파일, submodule 내부(commit id만), staged만 된 mode 변경. 응답에 `limitations`가 나열됩니다.
+* **본문.** 텍스트 diff는 GIT mode에서 head가 `COMMIT`이고 시작 시 clean이었던 파일에만 있습니다(옛 내용은 `git cat-file`에서 옴).
+  그 외에는 `diff_status`가 이유와 함께 `UNAVAILABLE`(`BASELINE_CONTENT_NOT_STORED`, `UNBORN_HEAD`,
+  `NO_BASELINE_CONTENT_WITHOUT_GIT`, `BINARY`, `LFS_POINTER`, `SYMLINK_TARGET_ONLY`, `SUBMODULE_CONTENT_NOT_STORED`), `WITHHELD`
+  (`SENSITIVE_PATH`: `.env*`, 키, 인증서, credentials 등은 경로만 나열하고 내용은 절대 반환하지 않음,
+  `PROJECT_OWNED_BY_OTHER_TASK`), `TRUNCATED`(`FILE_TOO_LARGE`, `BODY_BUDGET`, `DEADLINE`, `SIZE_LIMIT`)입니다. 이미 dirty였던
+  파일은 `pre_existing_dirty`로 표시하며 Task의 변경으로 단정하지 않습니다. 본문은 credential이 마스킹됩니다. `rev-parse`,
+  `ls-files`, `status`, `cat-file`만 실행하며 reset, clean, checkout, commit, push는 하지 않습니다.
+* **snapshot이 아니라 live 비교.** `lock_consistency`(조회 전후 owner·write epoch·workspace state 비교, 변하면 1회 재시도)와
+  `workspace_consistency`는 별개입니다. 외부 프로세스는 DB를 건드리지 않고 파일을 바꿀 수 있기 때문입니다.
+  `workspace_consistency`는 `verify_workspace=true`에서 실제 측정 두 번이 일치할 때만 `STABLE`이고, 그 외에는 이유와 함께
+  `UNVERIFIED`입니다. 종료된 Task의 답도 다른 Task가 workspace를 바꾼 뒤에는 확정된 것이 아닙니다(`workspace_relation`).
+* **제한.** deadline 하나가 측정 코드 자체까지 전달됩니다. git은 `min(자체 timeout, 남은 시간)`으로 종료되고 walk와 hashing은
+  entry·chunk 사이에서 확인합니다. 이 filesystem deadline은 **cooperative**입니다. OS 안에서 멈춘 read는 중단할 수 없어 worker가
+  deadline 뒤에도 남을 수 있습니다. Project당 측정 1개, 전체 `CHANGES_MAX_CONCURRENT_GLOBAL`개까지만 실행하고, 슬롯은 요청이
+  포기한 시점이 아니라 worker thread가 실제로 끝났을 때 반납합니다. busy 응답은 `503 CHANGES_MEASUREMENT_BUSY`이며 timeout 뒤에는
+  cooldown 동안 `verify_workspace`를 거부합니다(`UNVERIFIED`, 이유 `COOLDOWN`). Project가 없는 Task는 `UNAVAILABLE`(`NO_PROJECT`),
+  lock을 잡은 적 없는 Task는 `NO_BASELINE`입니다.
+
+## Health와 진단
+
+`GET /health`는 API 프로세스가 살아 있으면 200으로 응답합니다. 기존 키의 의미는 그대로이고 `ready`와 `runner`가 추가되었습니다.
+
+```json
+{"status": "ok", "runner_active": false, "ready": false,
+ "runner": {"lifecycle": "STOPPED", "startup_outcome": "PREFLIGHT_BLOCKED", "blockers": ["PREFLIGHT_FAILED"]}}
+```
+
+* `status`는 API 생존 여부만 뜻합니다. `runner_active`와 `ready`는 **`Runner.lifecycle`에서 계산**하며(직접 대입하지 않음),
+  `runner_active`는 Runner 루프가 도는 동안만 true이고 `ready`는 추가로 막는 요인이 없어야 합니다(예: 미확정 복구).
+* Runner가 준비되지 않았어도 `POST /tasks/{id}/execution-requests`는 202로 응답하고, 요청은 Runner가 준비될 때까지
+  `PENDING`으로 남습니다. `runner.blockers`가 이유를 설명합니다: `PREFLIGHT_FAILED`, `ADVISORY_LOCK_HELD`, `STOPPED`,
+  `STARTING`, `SHUTTING_DOWN`, `STOP_INCOMPLETE`, `RECOVERY_UNSETTLED`. `START_FAILED`는 **예약 상태**입니다. `Runner.start`의
+  일반 예외는 지금도 API 기동을 중단시키므로(결정 D6), 실행 중인 API가 이를 보고하는 일은 없습니다.
+
+`GET /projects/{id}/diagnostics`는 **읽기 전용 빠른 점검**입니다. 에이전트, 로그인 프로브, 설치 프로그램, 프로젝트 테스트를
+실행하지 않으며, 도구 버전 확인(`git --version`, `java -version`)과 파일 읽기만 수행합니다. 각 항목은 `code`,
+`status`(`PASS`/`WARN`/`FAIL`/`UNKNOWN`), `checked_at`, `cause`, `recommendation`, `blocks_execution`을 가지며,
+`can_start`는 실행을 막는 항목이 FAIL일 때만 false입니다. Task 실행 가능이나 성공을 **보장하지 않습니다**. 참고:
+
+* `CLI_AUTH`는 항상 `UNKNOWN`입니다. `PYTHON_INTERPRETER`는 발견된 프로젝트 `.venv`를 보고하지만 테스트는 오케스트레이터
+  자신의 인터프리터로 실행됩니다. `JUNIT_COLLECTION`은 Gradle이 UP-TO-DATE 테스트 태스크를 건너뛸 수 있음을 경고합니다.
+* Project 경로는 등록된 root부터 다시 검증하며, 그 안의 `.claude/settings.json`과 `.claude/settings.local.json`만 읽습니다.
+  거기에 링크나 junction이 있으면 차단 대상 발견입니다. 같은 canonical path의 실제 디렉터리가 다른 디렉터리로 교체된
+  경우는 탐지하지 **않습니다**.
+* Project당 진단은 한 번에 하나만 실행되고 동시 요청은 그 결과를 공유합니다. 파일 점검은 worker thread에서 best-effort
+  timeout으로 실행되며, 멈춘 파일시스템은 중단시킬 수 없으므로 전체 deadline은 hard deadline이 **아닙니다**. 그런
+  worker는 실제로 끝날 때까지 슬롯을 유지하고, 살아 있는 동안 파일 기반 항목은 `UNKNOWN`입니다.
+
+## Project Profile
+
+예전에는 내장 개발 규칙이 모든 프로젝트의 모든 프롬프트에 주입되었습니다. Project Profile은 프로젝트별로 이를 조정합니다.
+Profile은 **데이터**이며 버전마다 불변입니다.
+
+```json
+{"description": "Billing service", "languages": ["Java"], "frameworks": ["Spring"],
+ "architecture_rules": ["Hexagonal modules"], "coding_rules": ["No static state"],
+ "completion_criteria": [{"id": "DOC", "text": "the public API is documented"}], "test_policy_ref": "project"}
+```
+
+* `profile` 없이 만든 **새** Project는 **neutral** v1(아키텍처를 강제하지 않음)을 받습니다. Profile 도입 **이전에 있던**
+  Project는 `legacy` v1(migration `0003`)을 받으며 그 규칙은 기존 내장 문구와 똑같이 렌더됩니다. Project가 없거나 Profile
+  도입 이전에 만든 Task는 내장 규칙을 그대로 유지합니다(`profile_*` 필드가 null).
+* Project 행, v1, 활성 포인터는 한 트랜잭션에서 만들어집니다. `POST /projects/{id}/profile-versions`는 project 행 lock 아래에서
+  버전을 **만들고 활성화**하며, 활성 버전과 내용이 같으면 아무것도 쓰지 않습니다(200, `created: false`). ARCHIVED Project는
+  새 버전을 받지 않지만 조회는 가능하고, profile 행은 삭제되지 않습니다.
+* Task는 생성 시 같은 lock 아래에서 활성 버전(번호, hash, 내용)을 **복사**합니다. 이후 변경은 이미 있는 Task를 바꾸지
+  않습니다(Task에 `profile_version`, `profile_hash`가 있음).
+* Profile hash는 **Profile이 있는 Task에 한해** design-review basis와 PLAN·DEVELOP·CODE_REVIEW input hash에 포함됩니다.
+  따라서 한 Profile에서 만든 결과는 다른 Profile에서 재사용되지 않고, Profile이 없는 Task의 hash는 이전과 완전히 같습니다.
+* 오케스트레이터 자체의 메커닉(Human Gate 규칙, "받은 것보다 많은 도구를 쓰지 않는다")은 Profile의 일부가 아니며 Profile로
+  제거할 수 없습니다. 알 수 없는 key는 **거부**됩니다. Profile은 권한, 도구, 모델, 경로, interpreter를 담을 수 없고(신뢰된
+  정책인 `providers/permissions.py`에 남음), `test_policy_ref`는 `"project"`만 가능합니다. 프로젝트의 `test_policy`를
+  참조할 뿐 재정의하지 않습니다.
+* `completion_criteria`는 Definition-of-Done의 **추가** 조건입니다. 코드 리뷰어는 criterion마다 정확히 하나의
+  `{id, met, evidence}`를 담은 `profile_criteria`를 반환해야 하며 결과는 Profile hash와 함께 저장됩니다. 오케스트레이터는
+  저장된 평가가 현재 Profile의 것이고 정확히 그 id들만 담았으며(누락·중복·알 수 없는 id 없음) 각각 `met`이고 `evidence`가
+  비어 있지 않은지를 **결정적으로** 검사합니다. criterion이 실제로 충족되었는지는 **리뷰어의 판단**이며 오케스트레이터가
+  독립적으로 검증하지 않습니다. 다른 모든 조건(테스트, 리뷰 verdict, fingerprint, 설계 검토, Human Gate)은 그대로 적용됩니다.
 
 ## Project 사용
 

@@ -5,7 +5,8 @@ import pytest
 
 from app.config import Settings
 from app.main import create_app, raise_combined, shutdown_runtime
-from app.services.runner import RunnerStopIncomplete
+from app.services.runner import RunnerLifecycle, RunnerStopIncomplete
+from app.services.runtime_status import StartupOutcome, snapshot_of
 
 
 class FakeRunner:
@@ -91,13 +92,16 @@ def test_non_exception_base_errors_use_a_base_exception_group():
 
 # --- the real lifespan wiring (create_app) -------------------------------------------------------------------------------------
 class StartableRunner(FakeRunner):
+    lifecycle = RunnerLifecycle.STOPPED
+
     async def start(self):
-        return None
+        self.lifecycle = RunnerLifecycle.RUNNING
 
 
 def injected_container(runner_error=None):
     """The minimum the lifespan touches when a container is injected and run_preflight=False."""
-    return SimpleNamespace(preflight=None, runner_active=False, runner=StartableRunner(runner_error), db=FakeDb(),
+    return SimpleNamespace(preflight=None, startup_outcome=StartupOutcome.NOT_ATTEMPTED,
+                           runner=StartableRunner(runner_error), db=FakeDb(),
                            settings=Settings(_env_file=None))
 
 
@@ -109,7 +113,8 @@ def lifespan_of(c):
 async def test_the_lifespan_starts_and_stops_the_runner_and_never_disposes_an_injected_db():
     c = injected_container()
     async with lifespan_of(c):
-        assert c.runner_active is True
+        assert c.startup_outcome is StartupOutcome.STARTED
+        assert snapshot_of(c.runner, c.startup_outcome).runner_active is True
     assert c.runner.stops == 1 and c.db.disposed == 0
 
 

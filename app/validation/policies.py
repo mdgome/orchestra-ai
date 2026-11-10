@@ -80,6 +80,13 @@ DEFER_JITTER = (0.8, 1.2)
 DEFAULT_MAX_CONCURRENT_TASKS = 1
 DEFAULT_MAX_TASKS_PER_PROJECT = 1
 DEFAULT_RUNNER_SHUTDOWN_GRACE_SECONDS = 30.0
+# Request recovery. statement < operation: the server-side limit fires before the Runner gives up waiting. The shutdown
+# wait is how long a cancelled recovery may take to roll back / release its connection before it counts as PENDING.
+DEFAULT_RECOVERY_STATEMENT_TIMEOUT_SECONDS = 15.0
+DEFAULT_RUNNER_RECOVERY_TIMEOUT_SECONDS = 20.0
+DEFAULT_RUNNER_RECOVERY_SHUTDOWN_WAIT_SECONDS = 5.0
+DEFAULT_DB_POOL_TIMEOUT_SECONDS = 30.0             # SQLAlchemy's own default, stated explicitly
+MAX_PG_TIMEOUT_MS = 2_147_483_647                  # statement_timeout is a 32-bit integer of milliseconds
 
 # --- Lease -----------------------------------------------------------------------
 LEASE_TTL_SECONDS = 60
@@ -157,3 +164,82 @@ ROLE_PROVIDER = {
     "TESTER": "CLAUDE",
     "CODE_REVIEWER": "CODEX",
 }
+
+# --- Project diagnostics (read-only) -----------------------------------------------
+DIAGNOSTICS_POLICY_VERSION = 1             # part of the cache key: bump it when the set of checks changes
+DIAGNOSTICS_ITEM_TIMEOUT_SECONDS = 5.0     # one check: a subprocess, or one filesystem inspection
+DIAGNOSTICS_DEADLINE_SECONDS = 15.0        # the whole run; a check still pending is reported UNKNOWN
+DIAGNOSTICS_CACHE_TTL_SECONDS = 30.0
+# Global cap of filesystem-inspection worker threads, abandoned ones (a waiter timed out) included: a thread cannot be
+# killed, so a stalled filesystem may keep a worker alive. The cap is what stops such workers from piling up.
+DIAGNOSTICS_MAX_FS_WORKERS = 4
+PROJECT_SETTINGS_RELATIVE_PATHS = (".claude/settings.json", ".claude/settings.local.json")
+
+# --- Response sanitising and size limits (artifacts / report) ------------------------
+SANITIZE_MAX_DEPTH = 8
+SANITIZE_MAX_KEYS = 100                 # per object
+SANITIZE_MAX_ITEMS = 200                # per array
+SANITIZE_MAX_STRING_CHARS = 4000
+SANITIZE_MAX_NODES = 5000               # whole value
+SANITIZE_MAX_OMITTED_PATHS = 50         # how many omissions are named in `omitted_paths`
+SANITIZE_SHRINK_MAX_ROUNDS = 256        # byte-budget shrinking of one value
+SANITIZE_MIN_SHRINK_STRING = 256        # a string is never cut below this by the byte-budget shrinker
+# Exact key names that are removed from any returned JSON, plus a reviewed suffix rule. `session_fingerprint` and
+# `token_count` are normal fields: they are allow-listed, never removed by substring matching.
+SANITIZE_DENY_KEYS = frozenset({
+    "native_session_id", "session_id", "snapshot_before", "snapshot_after", "idempotency_key", "password", "passwd",
+    "secret", "api_key", "apikey", "authorization", "cookie", "token", "access_token", "refresh_token"})
+SANITIZE_DENY_KEY_SUFFIXES = ("_token", "_secret", "_password", "_api_key", "_apikey")
+SANITIZE_ALLOW_KEYS = frozenset({"session_fingerprint", "token_count", "tokens", "max_tokens", "total_tokens"})
+SANITIZED_JSON_MAX_BYTES = 64 * 1024            # one free-form JSON field
+ARTIFACT_ITEM_MAX_BYTES = 128 * 1024            # one artifact (summary + content + error)
+ARTIFACT_LIST_RESPONSE_MAX_BYTES = 512 * 1024   # a whole page of artifacts
+REPORT_RESPONSE_MAX_BYTES = 512 * 1024
+RESPONSE_ENVELOPE_MAX_OVERHEAD_BYTES = 8 * 1024  # everything in a list response except its items
+RESPONSE_SHRINK_MAX_ROUNDS = 8                  # re-truncation rounds of one response before the bounded fallback
+ARTIFACT_LIST_MAX_LIMIT = 100
+REPORT_ITERATIONS_MAX = 50
+REPORT_GATES_MAX = 50
+REPORT_ISSUES_MAX = 50                          # per list of review issues in the report
+
+# --- Project profile -------------------------------------------------------------------
+# A profile is DATA that tunes the prompts of one project. It can carry no permission, tool, model, path or interpreter:
+# those keys are not accepted at all (they belong to the trusted policy, see providers/permissions.py).
+PROFILE_SCHEMA_VERSION = 1
+PROFILE_KEYS = frozenset({"schema_version", "description", "languages", "frameworks", "architecture_rules",
+                          "coding_rules", "completion_criteria", "test_policy_ref"})
+PROFILE_DESCRIPTION_MAX = 2000
+PROFILE_LABEL_MAX = 64                  # one language / framework name
+PROFILE_LABELS_MAX = 20
+PROFILE_RULE_MAX = 500                  # one architecture / coding rule, one criterion text
+PROFILE_RULES_MAX = 30
+PROFILE_CRITERIA_MAX = 20
+PROFILE_CRITERION_ID_PATTERN = r"^[A-Za-z][A-Za-z0-9_-]{0,31}$"
+PROFILE_TEST_POLICY_REF = "project"     # the only accepted value: the project's own test_policy is referenced, not copied
+PROFILE_VERSIONS_MAX_LIMIT = 200
+
+# --- Task baseline and cumulative changes ------------------------------------------------
+# Changes manifest: path -> tagged entry, gzip-compressed in the database. Every bound is checked on write AND on read.
+MANIFEST_MAX_UNCOMPRESSED_BYTES = 32 * 1024 * 1024
+MANIFEST_MAX_COMPRESSED_BYTES = 8 * 1024 * 1024
+MANIFEST_MAX_FILES = 100_000
+MANIFEST_MAX_PATH_LEN = 1024
+MANIFEST_MAX_SYMLINK_TARGET_LEN = 1024
+# Paths that were already dirty when the task took the write lock (so their content is not the task's own start state).
+DIRTY_PATHS_MAX_ITEMS = 20_000
+DIRTY_PATHS_MAX_PATH_LEN = 1024
+DIRTY_PATHS_MAX_SERIALIZED_BYTES = 2 * 1024 * 1024
+CHANGES_BASELINE_DEADLINE_SECONDS = 120.0   # collecting the supplemental baseline at lock acquisition (cooperative)
+CHANGES_DEADLINE_SECONDS = 10.0             # one GET /tasks/{id}/changes, including a verification re-measure
+CHANGES_DEADLINE_GRACE_SECONDS = 2.0        # how long the waiter lets a cooperative worker notice an expired deadline
+CHANGES_MAX_CONCURRENT_PER_PROJECT = 1      # a slot is released when the worker REALLY ends, not when the waiter gives up
+CHANGES_MAX_CONCURRENT_GLOBAL = 2
+CHANGES_VERIFY_COOLDOWN_SECONDS = 60.0      # after a deadline, verify_workspace requests of that project are refused
+CHANGES_FILE_DIFF_MAX_BYTES = 256 * 1024
+CHANGES_TOTAL_DIFF_MAX_BYTES = 1024 * 1024
+CHANGES_MAX_DIFF_FILES = 200
+CHANGES_PAGE_MAX_LIMIT = 100
+# Paths whose content is never returned in a diff body (the path itself is still listed).
+SENSITIVE_PATH_PATTERNS = (".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*", "id_ed25519*", "id_ecdsa*",
+                           "credentials*", "*.keystore", "*.jks", "secrets.*", ".netrc", ".npmrc", ".pypirc")
+CHANGES_RESPONSE_MAX_BYTES = 2 * 1024 * 1024    # a whole /changes answer: the diff bodies (<= CHANGES_TOTAL_DIFF_MAX_BYTES) plus a page

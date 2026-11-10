@@ -47,3 +47,21 @@ class FailClosed(AppError):
     """A safety precondition (DB, lease, gate, session) failed; CLI must not run."""
     status_code = 409
     code = "FAIL_CLOSED"
+
+
+class ResponseSizeUnsatisfiable(AppError):
+    """Even the bounded fallback response exceeds its size limit: refuse to send a response that breaks the contract."""
+    status_code = 500
+    code = "RESPONSE_SIZE_UNSATISFIABLE"
+
+
+class ServiceNotConfigured(AppError):
+    """The container was built without an optional service this endpoint needs."""
+    status_code = 503
+    code = "SERVICE_NOT_CONFIGURED"
+
+
+class MeasurementBusy(AppError):
+    """Another workspace measurement of this project (or too many overall) is still running: nothing new is started."""
+    status_code = 503
+    code = "CHANGES_MEASUREMENT_BUSY"

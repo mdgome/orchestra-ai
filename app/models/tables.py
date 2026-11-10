@@ -3,8 +3,8 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
-    BigInteger, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, String, Text,
-    UniqueConstraint, func, text,
+    BigInteger, CheckConstraint, DateTime, Float, ForeignKey, ForeignKeyConstraint, Index, Integer, LargeBinary, String,
+    Text, UniqueConstraint, func, text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -63,10 +63,15 @@ class Project(Base):
     baseline_fingerprint: Mapped[str | None] = mapped_column(Text)
     write_baseline_fingerprint: Mapped[str | None] = mapped_column(Text)
     workspace_state: Mapped[str] = mapped_column(String(24), default="CLEAN", server_default="CLEAN", nullable=False)
+    profile_version: Mapped[int | None] = mapped_column(Integer)         # the ACTIVE profile version (see project_profiles)
     row_version: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0", nullable=False)
     created_at: Mapped[datetime] = _now()
     updated_at: Mapped[datetime] = _now()
     __table_args__ = (
+        CheckConstraint("profile_version IS NULL OR profile_version > 0", name="ck_projects_profile_version"),
+        # the active pointer can only name a version of THIS project (MATCH SIMPLE: NULL = no profile yet)
+        ForeignKeyConstraint(["id", "profile_version"], ["project_profiles.project_id", "project_profiles.version"],
+                             name="fk_projects_active_profile", use_alter=True),
         CheckConstraint("status IN ('ACTIVE','ARCHIVED')", name="ck_projects_status"),
         CheckConstraint("workspace_state IN ('CLEAN','DIRTY_UNRESOLVED')", name="ck_projects_workspace_state"),
         CheckConstraint("(write_owner_task_id IS NULL) = (write_baseline_fingerprint IS NULL)",
@@ -97,9 +102,103 @@ class Task(Base):
     resume_step_key: Mapped[str | None] = mapped_column(String(32))
     cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     failure_reason: Mapped[str | None] = mapped_column(String(64))
+    # The project profile as it was when the task was created: NULL (all three) = a task without a project (or one that
+    # predates profiles), which keeps the original built-in rules.
+    profile_version: Mapped[int | None] = mapped_column(Integer)
+    profile_hash: Mapped[str | None] = mapped_column(String(64))
+    # none_as_null: Python None must be SQL NULL (not the JSON value null), or the all-or-none CHECK would reject it
+    profile_snapshot: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True))
     row_version: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     created_at: Mapped[datetime] = _now()
     updated_at: Mapped[datetime] = _now()
+    __table_args__ = (
+        CheckConstraint(
+            "(profile_version IS NULL AND profile_hash IS NULL AND profile_snapshot IS NULL) OR "
+            "(project_id IS NOT NULL AND profile_version IS NOT NULL AND profile_hash IS NOT NULL "
+            "AND profile_snapshot IS NOT NULL AND length(profile_hash) = 64)", name="ck_tasks_profile_all_or_none"),
+        ForeignKeyConstraint(["project_id", "profile_version"], ["project_profiles.project_id", "project_profiles.version"],
+                             name="fk_tasks_profile"),
+    )
+
+
+class ProjectProfile(Base):
+    """One immutable version of a project's profile (a trigger rejects UPDATE/DELETE). A change is always a new row."""
+    __tablename__ = "project_profiles"
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", name="fk_project_profiles_project_id"), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = _now()
+    __table_args__ = (
+        UniqueConstraint("project_id", "version", name="uq_project_profiles_project_version"),
+        CheckConstraint("version > 0", name="ck_project_profiles_version"),
+        CheckConstraint("length(content_hash) = 64", name="ck_project_profiles_hash"),
+    )
+
+
+class TaskBaseline(Base):
+    """What the workspace looked like when a task took the project write lock (one row per task, never overwritten).
+
+    Only the manifest and bookkeeping are stored, never file content. A row is AVAILABLE (a usable manifest) or UNAVAILABLE
+    (the reason code is stored and every payload column is NULL: partial data is never an authoritative baseline).
+    `proof_epoch` is the project epoch when the fingerprint was measured (before acquisition), `acquired_epoch` the epoch the
+    actual lock acquisition produced (proof_epoch + 1 for origin ACQUISITION), `recorded_epoch` the epoch when this row was
+    written. A recovered row can have acquired_epoch NULL: the original acquisition epoch is then unknown and is not invented."""
+    __tablename__ = "task_baselines"
+    task_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("tasks.id", name="fk_task_baselines_task_id"),
+                                               primary_key=True)
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", name="fk_task_baselines_project_id"), nullable=False)
+    origin: Mapped[str] = mapped_column(String(24), nullable=False)
+    proof_epoch: Mapped[int | None] = mapped_column(BigInteger)
+    acquired_epoch: Mapped[int | None] = mapped_column(BigInteger)
+    recorded_epoch: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    proof_fingerprint: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    mode: Mapped[str | None] = mapped_column(String(8))
+    head_kind: Mapped[str | None] = mapped_column(String(8))
+    head_sha: Mapped[str | None] = mapped_column(String(64))
+    manifest: Mapped[bytes | None] = mapped_column(LargeBinary)
+    manifest_version: Mapped[str | None] = mapped_column(String(32))
+    uncompressed_bytes: Mapped[int | None] = mapped_column(Integer)
+    manifest_sha256: Mapped[str | None] = mapped_column(String(64))
+    file_count: Mapped[int | None] = mapped_column(Integer)
+    dirty_paths: Mapped[list | None] = mapped_column(JSONB(none_as_null=True))
+    unavailable_reason: Mapped[str | None] = mapped_column(String(48))
+    created_at: Mapped[datetime] = _now()
+    __table_args__ = (
+        CheckConstraint("status IN ('AVAILABLE','UNAVAILABLE')", name="ck_task_baselines_status"),
+        CheckConstraint("origin IN ('ACQUISITION','REENTRY_RECOVERY')", name="ck_task_baselines_origin"),
+        CheckConstraint("head_kind IS NULL OR head_kind IN ('COMMIT','UNBORN')", name="ck_task_baselines_head_kind"),
+        CheckConstraint("(proof_epoch IS NULL OR proof_epoch >= 0) AND (acquired_epoch IS NULL OR acquired_epoch >= 1) "
+                        "AND recorded_epoch >= 1", name="ck_task_baselines_epochs"),
+        CheckConstraint("proof_fingerprint ~ '^WORKSPACE_FINGERPRINT_V[0-9]+:[0-9a-f]{64}$'",
+                        name="ck_task_baselines_proof_fp"),
+        CheckConstraint(
+            "status <> 'AVAILABLE' OR ((mode IN ('GIT','CONTENT') AND manifest IS NOT NULL AND manifest_version IS NOT NULL "
+            "AND manifest_sha256 IS NOT NULL AND length(manifest_sha256) = 64 AND uncompressed_bytes IS NOT NULL "
+            "AND uncompressed_bytes >= 0 AND file_count IS NOT NULL AND file_count >= 0 AND dirty_paths IS NOT NULL "
+            "AND jsonb_typeof(dirty_paths) = 'array' "
+            "AND ((mode = 'GIT' AND head_kind = 'COMMIT' AND head_sha ~ '^([0-9a-f]{40}|[0-9a-f]{64})$') "
+            "OR (mode = 'GIT' AND head_kind = 'UNBORN' AND head_sha IS NULL) "
+            "OR (mode = 'CONTENT' AND head_kind IS NULL AND head_sha IS NULL)) "
+            "AND proof_epoch IS NOT NULL AND acquired_epoch IS NOT NULL AND acquired_epoch >= proof_epoch "
+            "AND recorded_epoch >= acquired_epoch) IS TRUE)", name="ck_task_baselines_available"),
+        CheckConstraint(
+            "origin <> 'ACQUISITION' OR ((proof_epoch IS NOT NULL AND acquired_epoch = proof_epoch + 1 "
+            "AND recorded_epoch = acquired_epoch) IS TRUE)", name="ck_task_baselines_acquisition"),
+        CheckConstraint(
+            "status <> 'UNAVAILABLE' OR (unavailable_reason IS NOT NULL AND manifest IS NULL AND manifest_version IS NULL "
+            "AND manifest_sha256 IS NULL AND uncompressed_bytes IS NULL AND file_count IS NULL AND mode IS NULL "
+            "AND head_kind IS NULL AND head_sha IS NULL AND dirty_paths IS NULL)", name="ck_task_baselines_unavailable"),
+        CheckConstraint("status = 'UNAVAILABLE' OR unavailable_reason IS NULL", name="ck_task_baselines_reason_only_unavailable"),
+        CheckConstraint(
+            "unavailable_reason IS DISTINCT FROM 'BASELINE_MISSING_AT_REENTRY' OR (origin = 'REENTRY_RECOVERY' "
+            "AND status = 'UNAVAILABLE' AND acquired_epoch IS NULL AND proof_epoch IS NULL)",
+            name="ck_task_baselines_reentry_missing"),
+    )
 
 
 class TaskRun(Base):

@@ -56,7 +56,8 @@ cp .env.example .env
 `codex` and `claude` must be installed and logged in. A preflight check at startup verifies that the installed
 versions support every flag used. It also inspects `~/.claude/settings*.json`, the project's `.claude/`, and
 `~/.codex/config.toml` for settings that escalate permissions (e.g. `bypassPermissions`), and stops the Runner if
-anything blocking is found.
+anything blocking is found. The login state itself is **not** verified (a probe would run the CLI and spend tokens): the
+diagnostics below report it as `UNKNOWN`.
 
 ## API
 
@@ -72,17 +73,163 @@ Use nouns in the URI and express actions through the HTTP method. Errors always 
 | GET | `/projects` · `/projects/{id}` | |
 | PATCH | `/projects/{id}` | `name`, `status` (`ARCHIVED` returns 409 if there are unfinished Tasks), `test_policy` (omitted = unchanged, object = validated then replaced, `null` = removed; `null` for `name`/`status` is 422. Policy copies already made for existing Tasks are unaffected) |
 | GET/POST | `/projects/{id}/tasks` | List/create Tasks that share the Project Workspace (201, does not execute) |
+| GET | `/projects/{id}/profile` | The active Project Profile version (see *Project Profiles*) |
+| GET/POST | `/projects/{id}/profile-versions` | List versions (newest first, paginated) / create **and activate** a new version: 201, or 200 `created: false` when identical to the active one |
+| GET | `/projects/{id}/diagnostics` | Read-only readiness check (see *Health and Diagnostics*); `?refresh=true` bypasses the 30 s cache |
+| GET | `/health` | API liveness plus Runner readiness (see *Health and Diagnostics*) |
 | GET/POST | `/tasks` | POST only **creates** a PENDING task (201); it does not execute anything |
 | GET/PATCH | `/tasks/{id}` | The GET response includes the current lease, latest checkpoint, and any pending approvals |
 | POST | `/tasks/{id}/execution-requests` | 202. Stores the request; the Runner executes it. Idempotent while a request is pending |
 | POST | `/tasks/{id}/cancellation-requests` | 202. Records the request; marked CANCELLED only after CLI process termination is confirmed |
 | GET | `/tasks/{id}/executions` · `/state-transitions` · `/approvals` | History |
+| GET | `/tasks/{id}/artifacts` · `/tasks/{id}/artifacts/{artifact_id}` | Stored step results, paginated (`kind`, `limit` ≤ 100, `offset`); see *Artifacts and the Completion Report* |
+| GET | `/tasks/{id}/report` | Deterministic completion report built from stored facts (no LLM call) |
+| GET | `/tasks/{id}/changes` | Cumulative changes since the task took the project write lock (`limit` ≤ 100, `offset`, `path`, `verify_workspace`); see *Task Changes* |
 | GET | `/approvals/{id}` | |
 | POST | `/approvals/{id}/decisions` | `Idempotency-Key` header required. New = 201, same request replayed = 200, conflict/expired data = 409, deadline expired = 410 |
 | WS | `/tasks/{id}/event-stream` | Real-time events |
 
 Approving a decision stores the decision content and the `RESUME` execution request in a single transaction. So even
 if a failure occurs right after approval, the work resumes the next time the Runner starts.
+
+## Artifacts and the Completion Report
+
+Everything here is derived from what is already stored (task steps, executions, approvals, state transitions). No agent,
+command or LLM is called to produce it, and nothing the agents never produced is invented.
+
+* `GET /tasks/{id}/artifacts?kind=&limit=&offset=` lists the stored step results (`PLAN`, `DESIGN_REVIEW`, `DEVELOP`,
+  `TEST`, `CODE_REVIEW`), oldest first (`created_at`, then `id`). Each item carries `plan_revision`,
+  `workflow_iteration` and `step_attempt` separately (a replan, an improvement iteration and a technical retry are
+  different things), `is_latest_succeeded` (the most recently produced SUCCEEDED artifact of its kind, **not** "currently
+  valid") and `validity`.
+* `validity.state`: `CURRENT` (a plan / design review whose stored basis still matches), `STALE` (a stored basis no
+  longer matches, or a later revision / iteration / attempt superseded it; `reasons` say which), `UNVERIFIED` (artifacts
+  that describe workspace content: every stored basis matches, but the live workspace is not compared, so they are never
+  called CURRENT), `NOT_APPLICABLE` (the step did not succeed).
+* `GET /tasks/{id}/artifacts/{artifact_id}` returns one artifact with its sanitised stored output. An id that belongs to
+  another task is `404`.
+* `GET /tasks/{id}/report` returns the outcome and `outcome_note`, plan, design review, implementation, tests (the
+  command the Orchestrator ran and its result, `run_by: ORCHESTRATOR`), code review, issues per round, Human Gate
+  history, the last transition, and `next_actions`.
+* `COMPLETED` means the orchestrator's completion conditions were met. It does **not** mean you accepted, merged or
+  deployed the result.
+* `historical_completion` shows only the stored COMPLETED transition. The Definition-of-Done detail of that moment was
+  never stored, so its `conditions` are `UNKNOWN` and are not reconstructed. `current_re_evaluation` evaluates the same
+  conditions now against the stored artifacts (`evaluated_at`, `evaluation_basis`); it neither confirms nor cancels a
+  past completion and does not compare the live workspace.
+* Responses never contain native session ids, credentials or the step manifests. One recursive sanitiser masks the
+  task's known session ids (ordinary UUIDs stay), URL credentials and tokens, removes denied keys, and bounds depth, keys,
+  array items, string length and size. What was cut is named in `sanitization` / `SanitizedJson.reasons`, never inside
+  the data. A page over its size limit drops trailing items: `total` stays the database count, while `returned`,
+  `omitted_items`, `size_limited`, `has_more` and `next_offset` say what happened; the omitted items are re-fetchable from
+  `next_offset`. The application refuses to start if a limit cannot hold even one answer.
+
+## Task Changes
+
+When a task takes the project write lock, the orchestrator records a **baseline** of the workspace in the same transaction:
+the Changes manifest (`CHANGES_MANIFEST_V1`: per path a `FILE` {sha256, executable}, `SYMLINK` {target} or `GITLINK` {oid}),
+HEAD (`COMMIT` or `UNBORN`) and the paths that were already dirty. **Only hashes are stored, never file content.**
+`GET /tasks/{id}/changes` compares the live workspace with it.
+
+* **Two measurements, two failure policies.** The Project fingerprint (`WORKSPACE_FINGERPRINT_V1`, unchanged) decides whether
+  the task may own the project: if it cannot be measured the existing fail-closed path applies (no owner, no baseline,
+  `DIRTY_UNRESOLVED`, the `PROJECT_DIRTY` gate). The manifest, HEAD and dirty paths are supplementary: if only they fail, the
+  task **continues** and an `UNAVAILABLE` baseline row with a reason code (`TOO_MANY_FILES`, `DIRTY_PATHS_LIMIT`, `DEADLINE`,
+  `GIT_ENUMERATION_FAILED`, ...) is written in the same transaction as the owner. Order: fingerprint, manifest, fingerprint
+  again; if the two fingerprints differ the measurement is stale and is retried within the existing bounded retry.
+* **Epochs.** `proof_epoch` = project epoch when the fingerprint was measured (before acquisition), `acquired_epoch` = the
+  epoch the acquisition produced (`proof_epoch + 1`), `recorded_epoch` = epoch when the row was written. `set_owner` states the
+  epoch it produced; nothing guesses the `+1`. A task that already owned the lock without a baseline row (a crash gap, or an
+  owner from before this feature) never gets READY without one: if it changed nothing and the fingerprint still equals its
+  write baseline the manifest is recovered, otherwise an explicit `UNAVAILABLE` row (`BASELINE_MISSING_AT_REENTRY`) with
+  **null** proof/acquired epochs is written: the original epoch is not invented.
+* **Scope.** GIT mode covers tracked files and untracked non-ignored files (ignored build output is excluded); CONTENT mode
+  (no usable git) covers the workspace-policy walk. `executable` is the working-tree mode bit (never on Windows). Not covered:
+  ignored files, the inside of a submodule (only its commit id), and a mode change that is only staged. The response lists
+  `limitations`.
+* **Bodies.** A text diff exists only in GIT mode with a `COMMIT` head, for a file that was clean at the start (the old content
+  comes from `git cat-file`). Otherwise `diff_status` is `UNAVAILABLE` with a reason (`BASELINE_CONTENT_NOT_STORED`,
+  `UNBORN_HEAD`, `NO_BASELINE_CONTENT_WITHOUT_GIT`, `BINARY`, `LFS_POINTER`, `SYMLINK_TARGET_ONLY`,
+  `SUBMODULE_CONTENT_NOT_STORED`), `WITHHELD` (`SENSITIVE_PATH`: `.env*`, keys, certificates, credentials; the path is listed, the
+  content never; `PROJECT_OWNED_BY_OTHER_TASK`) or `TRUNCATED` (`FILE_TOO_LARGE`, `BODY_BUDGET`, `DEADLINE`, `SIZE_LIMIT`). A file
+  that was already dirty is flagged `pre_existing_dirty` and is not claimed as the task's own. Bodies are credential-masked.
+  Only `rev-parse`, `ls-files`, `status` and `cat-file` are run: no reset, clean, checkout, commit or push.
+* **A live comparison, not a snapshot.** `lock_consistency` (owner, write epoch and workspace state compared before and after;
+  one retry when they moved) and `workspace_consistency` are separate: an outside process can change files without touching the
+  database. `workspace_consistency` is `STABLE` only with `verify_workspace=true` when two real measurements agree, and
+  `UNVERIFIED` (with a reason) otherwise. A finished task's answer is not settled once another task changed the workspace
+  (`workspace_relation`).
+* **Bounded.** One deadline reaches the measuring code itself: git is killed by `min(its timeout, remaining)`; the walk and
+  hashing check it between entries and chunks. That filesystem deadline is **cooperative**: a read that stalls inside the OS
+  cannot be interrupted, so the worker may outlive it. At most one measurement per project and `CHANGES_MAX_CONCURRENT_GLOBAL`
+  overall run; a slot is returned when the worker thread really ends (not when the request gives up), a busy answer is
+  `503 CHANGES_MEASUREMENT_BUSY`, and after a timeout `verify_workspace` is refused for a cooldown (`UNVERIFIED`, reason
+  `COOLDOWN`). A task without a project is `UNAVAILABLE` (`NO_PROJECT`), a task that never took the lock `NO_BASELINE`.
+
+## Health and Diagnostics
+
+`GET /health` answers 200 while the API process is alive. The original keys keep their meaning; `ready` and `runner` are new:
+
+```json
+{"status": "ok", "runner_active": false, "ready": false,
+ "runner": {"lifecycle": "STOPPED", "startup_outcome": "PREFLIGHT_BLOCKED", "blockers": ["PREFLIGHT_FAILED"]}}
+```
+
+* `status` is API liveness only. `runner_active` and `ready` are **derived from `Runner.lifecycle`** (nothing sets them by
+  hand): `runner_active` is true only while the Runner loop runs, `ready` additionally requires that nothing blocks it
+  (for example an unsettled recovery).
+* While the Runner is not ready, `POST /tasks/{id}/execution-requests` still answers 202 and the request stays `PENDING`
+  until a Runner is ready. `runner.blockers` explains why: `PREFLIGHT_FAILED`, `ADVISORY_LOCK_HELD`, `STOPPED`,
+  `STARTING`, `SHUTTING_DOWN`, `STOP_INCOMPLETE`, `RECOVERY_UNSETTLED`. `START_FAILED` is **reserved**: a general
+  exception from `Runner.start` still aborts API startup (decision D6), so a running API never reports it.
+
+`GET /projects/{id}/diagnostics` is a **read-only quick check**. It never runs an agent, the login probe, an installer or
+the project's tests; it only runs tool version probes (`git --version`, `java -version`) and reads files. Every item has
+`code`, `status` (`PASS`/`WARN`/`FAIL`/`UNKNOWN`), `checked_at`, `cause`, `recommendation` and `blocks_execution`;
+`can_start` is false only when an item that blocks execution FAILED. It is **not** a guarantee that a task can run or
+will succeed. Notes:
+
+* `CLI_AUTH` is always `UNKNOWN`. `PYTHON_INTERPRETER` reports a discovered project `.venv`, but the orchestrator's own
+  interpreter is what runs the tests. `JUNIT_COLLECTION` warns that Gradle may skip an UP-TO-DATE test task.
+* Project paths are re-validated from the registered root; only `.claude/settings.json` and `.claude/settings.local.json`
+  inside it are read, and a link or junction there is a blocking finding. Replacing the real directory at the same
+  canonical path with another one is **not** detected.
+* One diagnosis per project runs at a time and concurrent requests share it. File inspection runs in a worker thread
+  with a best-effort timeout: a stalled filesystem cannot be interrupted, so the overall deadline is **not** a hard
+  deadline. Such a worker keeps its slot until it really ends, and while it lives the file-derived items are `UNKNOWN`.
+
+## Project Profiles
+
+The built-in engineering rules used to be injected into every prompt of every project. A Project Profile lets one project
+tune them. It is **data**, versioned and immutable per version:
+
+```json
+{"description": "Billing service", "languages": ["Java"], "frameworks": ["Spring"],
+ "architecture_rules": ["Hexagonal modules"], "coding_rules": ["No static state"],
+ "completion_criteria": [{"id": "DOC", "text": "the public API is documented"}], "test_policy_ref": "project"}
+```
+
+* A **new** Project without `profile` gets the **neutral** v1 (no architecture imposed). Projects that **existed before**
+  profiles got `legacy` v1 (migration `0003`), whose rules render exactly like the old built-in text. A Task without a
+  Project, or created before profiles, keeps the built-in rules unchanged (its `profile_*` fields are null).
+* Project row, v1 and the active pointer are created in one transaction. `POST /projects/{id}/profile-versions` creates
+  **and activates** a version under the project row lock; content identical to the active version writes nothing (200,
+  `created: false`). An ARCHIVED Project takes no new version but stays readable; no profile row is ever deleted.
+* A Task **copies** the active version (number, hash, content) when it is created, under the same lock. A later change
+  never alters a task that already exists (`profile_version`, `profile_hash` are on the Task).
+* The profile hash is part of the design-review basis and of the PLAN, DEVELOP and CODE_REVIEW input hashes **only for
+  tasks that have a profile**, so a result produced under one profile is never reused under another, and tasks without a
+  profile keep their hashes exactly as before.
+* The orchestrator's own mechanics (Human Gate rule, "never use more tools than you were given") are not part of the
+  profile and cannot be removed by it. Unknown keys are **rejected**: a profile cannot carry permissions, tools, models,
+  paths or interpreters (those stay in the trusted policy, `providers/permissions.py`), and `test_policy_ref` can only be
+  `"project"`: the project's own `test_policy` is referenced, never redefined.
+* `completion_criteria` are an **additional** Definition-of-Done condition. The code reviewer must return `profile_criteria`
+  with exactly one `{id, met, evidence}` per criterion; the result is stored with the profile hash. The orchestrator
+  checks **deterministically** that the stored evaluation is for the current profile, covers exactly those ids (no missing,
+  duplicate or unknown id), and that each is `met` with non-empty `evidence`. Whether a criterion is really satisfied is
+  the **reviewer's judgement**; the orchestrator does not verify it independently. Every other condition (tests, review
+  verdict, fingerprints, design review, Human Gate) still applies unchanged.
 
 ## Using Projects
 

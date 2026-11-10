@@ -28,6 +28,53 @@ Abstractions exist only where a second implementation is real: `CliProvider` (Co
 * Three independent counters: `step_attempt` (technical retry), `workflow_iteration` (improvement loop, max 3),
   `plan_revision`/`replan_count` (replans). A Human Gate wait increments none of them.
 
+## Project profiles
+
+* `project_profiles` holds immutable versions (a trigger rejects UPDATE/DELETE); `projects.profile_version` is the active
+  pointer, a composite FK so it can only name a version of the same project. A task copies version, hash and content
+  (`tasks.profile_*`: all NULL, or all present with a project and a 64-character hash, enforced by a CHECK).
+* The profile is DATA that tunes prompts. Orchestrator mechanics (`prompts.MECHANICS`) are never part of it; the
+  orchestrator's own development rules stay in AGENTS.md / CLAUDE.md. Permissions are a function of role and test preset
+  only (`providers/permissions.py`), and `validate_profile` rejects every key outside its schema.
+* Tasks without a profile keep the built-in `RULES` and original hashes byte for byte (`profile_part` / `profile_criteria_of`
+  add nothing when the hash is NULL). `legacy` v1 renders exactly like `RULES`; `neutral` v1 imposes no architecture.
+* `completion_criteria`: the reviewer's stored evaluation is checked deterministically by
+  `completion_checker.profile_criteria_problems` as an additional condition; whether a criterion is satisfied stays the
+  reviewer's judgement.
+
+## Artifact and report views
+
+* No new table: an artifact is a `task_steps` row (`artifact_id` = step id), the report reads steps, executions,
+  approvals and transitions through `ArtifactRepository` (manifests deferred, never loaded). `ReportService` builds a
+  payload; `schemas/reports.py` validates it and enforces the size contract. No LLM call, no write.
+* `completion_checker.evaluate_definition_of_done` returns every condition with its own verdict and is the single source
+  of `check_definition_of_done` (unchanged behaviour); the report's `current_re_evaluation` reuses it without deciding
+  anything. The stored COMPLETED transition is reported separately as `historical_completion` (detail UNKNOWN).
+* Redaction primitives (`session_fingerprint`, known-id replacement) live in `infra/redaction.py`; providers and the
+  response sanitiser both use them (`infra` never imports `providers`; `providers.base.redact` is a thin wrapper).
+* Order for each response: payload of correctly typed, sanitised values -> strict validation -> size -> cut only through
+  the fields the schema reserves (`sanitization`, `omitted_items`, `omitted_sections`, `size_limited`,
+  `SanitizedJson.reasons`) -> strict validation again -> size, at most `RESPONSE_SHRINK_MAX_ROUNDS` times -> bounded
+  fallback -> explicit error. `validate_response_limits()` refuses to start with a limit that cannot hold one answer.
+
+## Runtime status and diagnostics
+
+* `runtime_status.runtime_snapshot(lifecycle, startup_outcome, recovery_unsettled)` is the ONE judgement behind `/health`.
+  `runner_active` and `ready` come from `Runner.lifecycle`. Why a Runner never started (preflight blocked, advisory lock
+  held, `start()` failed) is invisible in the lifecycle, so the lifespan records a `StartupOutcome`. `START_FAILED` is
+  reserved: a general `Runner.start` exception still aborts the lifespan (decision D6-a).
+* `diagnostics_service` is read-only (version probes of tools and file reads; never an agent, the auth probe, an
+  installer or a project test). One shared `asyncio.Task` per cache key, created under a short `asyncio.Lock` that is
+  never held while the diagnosis runs; the result is cached before the task ends and the done callback removes only its
+  own task. Waiters are shielded: a cancelled waiter does not cancel the diagnosis.
+* A subprocess is bounded by the executor's timeout and terminated. File inspection uses a worker thread and its
+  timeout is **cooperative/best-effort**: a thread cannot be killed, so one inspection per project and a global cap
+  bound the number of workers, and a slot is released only when the thread really ends.
+* Registered projects are validated from their own root (`resolve_project_root`, then `resolve_inside_root`); the
+  `WORKSPACE_ROOT`-anchored `WorkspaceGuard` is never used for them. A swapped-in link/junction, a changed canonical
+  path, a vanished or inaccessible root are detected; the real directory at the same canonical path being replaced by
+  another is not (that would need a stored filesystem identity).
+
 ## Lease and takeover (`lease_service`)
 
 One RUNNING `task_runs` row per task (partial unique index). Takeover of an expired lease is three steps:
@@ -88,6 +135,23 @@ only when the CLI explicitly reports it does not exist; timeouts and transient e
   task. Result files are never deleted; only files created or changed by the current run count. Test processes never
   receive the CLI authentication variables.
 * Details, diagrams and invariants: `docs/workflow/` (03, 07, 08, 09, 10, 11).
+
+## Task baseline and changes
+
+* `task_baselines` (migration 0004): one row per task, written by `ProjectLockService` in the SAME transaction as `set_owner`
+  (`ON CONFLICT (task_id) DO NOTHING`, then the real row is compared by identity: same acquisition = idempotent, different
+  = fail closed and the owner rolls back). AVAILABLE rows carry the gzip manifest and HEAD; UNAVAILABLE rows carry a reason and
+  NO payload. The CHECKs are NULL-safe (`... IS TRUE`): a CHECK passes on NULL, so a bare conjunction with a NULL term would
+  have admitted malformed rows.
+* Two results, kept apart (`LockMeasurement`): the fingerprint proof (fail closed, unchanged) and the supplemental manifest
+  (failure = UNAVAILABLE row, the task continues). `WORKSPACE_FINGERPRINT_V1` and `STEP_SNAPSHOT_V1` are untouched;
+  the manifest is its own `CHANGES_MANIFEST_V1` schema with its own walk, bounds (uncompressed bytes, files, path, target
+  length) and bounded decompression.
+* `ChangeService` is read-only (git: `rev-parse`, `ls-files`, `status`, `cat-file`). One `Deadline` is passed into the
+  measuring code (git gets `min(default, remaining)`, the walk/hash check between entries and chunks): cooperative for the
+  filesystem, not a guarantee against a stalled OS call. `MeasurementGate` bounds workers per project and overall and returns
+  a slot when the worker ends; a timeout opens a cooldown for `verify_workspace`.
+* `lock_consistency` (DB, before/after) and `workspace_consistency` (files, two measurements) are separate fields.
 
 ## Decision log
 

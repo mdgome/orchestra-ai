@@ -71,6 +71,8 @@ flowchart TD
 - If the stored PASS's `basis_hash` differs from the current basis, `WorkflowService._do_develop` does not start Development and reverts DEVELOPING → DESIGN_REVIEWING (`design_review_basis_changed`).
 - The `approvals.basis` (`current_basis`) that the Human Gate stores at request time consists of the three values `requirements_hash`, `plan_hash`, and `decisions_hash`, and does not include `review_policy_hash`. This value is used only to determine whether a decision is stale.
 
+For a task that has a Project Profile snapshot, `profile_hash` is one more part of the basis (and of `current_basis`); for a task without one the basis is unchanged, byte for byte. The profile also selects the rules text and the design-review checklist in the prompts (`legacy` renders like the built-in rules, `neutral` imposes no architecture); a profile cannot carry permissions or tools.
+
 ## How to read this
 
 - The Planner uses only Plan Mode and read-only tools. The Plan Artifact is not written to a file by the Planner — the Orchestrator validates and stores it from the CLI output. If a change is detected when comparing Snapshots before and after execution, the Step cannot succeed.

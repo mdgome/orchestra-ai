@@ -46,11 +46,18 @@ class ProjectRepository:
             Task.project_id == project_id, Task.status.notin_(terminal)))).scalar_one()
 
     # --- write lock / baselines (callers hold the project row lock) -----------------------------------------
-    async def set_owner(self, project_id: uuid.UUID, task_id: uuid.UUID, fingerprint: str) -> None:
-        """First acquisition: owner, write baseline AND the accepted baseline are the measured state (CLEAN)."""
-        await self.s.execute(update(Project).where(Project.id == project_id).values(
-            write_owner_task_id=task_id, write_baseline_fingerprint=fingerprint, baseline_fingerprint=fingerprint,
-            workspace_state="CLEAN", write_epoch=Project.write_epoch + 1, updated_at=func.now()))
+    async def set_owner(self, project_id: uuid.UUID, task_id: uuid.UUID, fingerprint: str, *,
+                        expected_epoch: int) -> int | None:
+        """First acquisition: owner, write baseline AND the accepted baseline are the measured state (CLEAN).
+
+        Returns the epoch this acquisition PRODUCED (`acquired_epoch`, expected_epoch + 1), or None when the project's
+        epoch is no longer `expected_epoch` (nothing was changed). The caller never has to guess what the +1 resulted in."""
+        row = (await self.s.execute(update(Project).where(
+            Project.id == project_id, Project.write_epoch == expected_epoch, Project.write_owner_task_id.is_(None)
+        ).values(write_owner_task_id=task_id, write_baseline_fingerprint=fingerprint, baseline_fingerprint=fingerprint,
+                 workspace_state="CLEAN", write_epoch=Project.write_epoch + 1, updated_at=func.now())
+            .returning(Project.write_epoch))).first()
+        return row[0] if row else None
 
     async def release(self, project_id: uuid.UUID, *, state: str, baseline: str | None) -> None:
         """Owner and write baseline are always cleared together (ck_projects_write_owner_baseline)."""

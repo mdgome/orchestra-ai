@@ -1,6 +1,6 @@
 # Lease 및 Runner Ownership
 
-> English: [07-lease.md](07-lease_ko.md)
+> English: [07-lease.md](07-lease.md)
 
 > 현재 구현 코드를 기준으로 정리한 흐름입니다. 코드로 확인되지 않았거나 검증되지 않은 동작은 현재 구현 제한으로 구분합니다.
 
@@ -118,6 +118,29 @@ sequenceDiagram
 - 해제 순서는 반대입니다. Project lock은 Task의 **terminal 전이와 같은 트랜잭션**에서 해제되고(`project_terminal.release_on_terminal`), Lease는 기존 경로가 반환합니다. Lease 로직 자체는 바뀌지 않았습니다.
 - `WAITING_APPROVAL`에 들어가면 CLI와 Task Lease는 반환하지만 Project write lock은 유지합니다. 아직 정리되지 않은 Workspace 변경이 있을 수 있기 때문입니다 ([08](08-human-gate_ko.md), [11](11-task-lifecycle_ko.md)).
 - 소유자 Task의 Lease가 만료되어도 Project lock을 자동으로 풀지 않습니다. 불확실한 실행은 기존 `UNCERTAIN` → RECOVERY 경로가 판단합니다.
+
+## Lock과 함께 기록하는 Task baseline
+
+`ProjectLockService._acquire_once`는 project 행 lock을 잡고 proof의 `project_id`, owner, `write_epoch`를 다시 검증한 뒤
+`set_owner(..., expected_epoch=proof.write_epoch)`를 호출하고(자신이 만든 epoch인 `acquired_epoch = proof_epoch + 1`을 반환) `task_baselines`
+행을 **같은 트랜잭션**에서 INSERT합니다. 그 앞의 측정은 fingerprint, Changes manifest(HEAD, dirty 경로), fingerprint 재측정이며 두
+fingerprint가 다르면 stale 측정입니다(`FingerprintProofStale`, 기존 bounded retry). fingerprint를 측정할 수 없으면 fail-closed 경로를
+유지하고, manifest 실패는 행을 이유와 함께 `UNAVAILABLE`로 만들 뿐입니다. 같은 owner의 재진입에서는 baseline 행 없이 READY가
+되지 않습니다(09-recovery 참고).
+
+```mermaid
+flowchart TD
+    A["ensure_for_step: owner 없음, workspace CLEAN"] --> B["fingerprint (before)"]
+    B -->|"측정 불가"| X["DIRTY_UNRESOLVED 표시, PROJECT_DIRTY gate (변경 없음)"]
+    B --> C["Changes manifest + HEAD + dirty 경로 (자체 walk, cooperative deadline)"]
+    C -->|"실패"| D["supplemental = UNAVAILABLE(reason)"]
+    C --> E["fingerprint (after)"]
+    D --> E
+    E -->|"before와 다름"| R["stale: bounded retry"]
+    E --> F["한 트랜잭션: project+task 행 lock, owner/epoch 재확인, set_owner, task_baselines INSERT"]
+    F -->|"다른 identity의 기존 행"| G["fail closed, owner rollback"]
+    F --> H["READY"]
+```
 
 ## 현재 구현 제한
 

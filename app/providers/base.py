@@ -1,31 +1,20 @@
 """Provider interface shared by the Codex / Claude adapters and the mock."""
 import hashlib
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
 from app.infra.command_executor import CommandResult, OnStarted
 from app.infra.process_control import ProcessIdentity
+from app.infra.redaction import redact_session_ids, session_fingerprint  # noqa: F401 - session_fingerprint is re-exported
 from app.models.states import CliOutcome
 from app.validation import policies as P
 
-_UUIDISH = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
-
-
-def session_fingerprint(native_id: str) -> str:
-    """Irreversible short tag, safe for audit logs. Cannot be used to resume a session."""
-    return "sess:" + hashlib.sha256(native_id.encode()).hexdigest()[:8]
-
 
 def redact(text: str | None, known_ids: tuple[str, ...] = ()) -> str:
-    """Mask native session ids (known ones, and anything UUID-shaped) before text is stored or returned."""
-    if not text:
-        return ""
-    for known in known_ids:
-        if known:
-            text = text.replace(known, session_fingerprint(known))
-    return _UUIDISH.sub(lambda m: session_fingerprint(m.group(0)), text)[-P.LOG_TAIL_CHARS:]
+    """Mask native session ids (known ones, and anything UUID-shaped) before text is stored or returned.
+    Compatibility wrapper: the implementation lives in app.infra.redaction."""
+    return redact_session_ids(text, known_ids, all_uuids=True, tail=P.LOG_TAIL_CHARS)
 
 
 def command_fingerprint(argv: list[str], extra: str = "") -> str:

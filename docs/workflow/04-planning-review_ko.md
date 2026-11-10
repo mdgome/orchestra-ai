@@ -1,6 +1,6 @@
 # Planning 및 Design Review
 
-> English: [04-planning-review.md](04-planning-review_ko.md)
+> English: [04-planning-review.md](04-planning-review.md)
 
 > 현재 구현 코드를 기준으로 정리한 흐름입니다. 코드로 확인되지 않았거나 검증되지 않은 동작은 현재 구현 제한으로 구분합니다.
 
@@ -70,6 +70,8 @@ flowchart TD
 - Design Review 결과(`task_steps.output`)에 검토 시점의 basis가 저장됩니다.
 - `WorkflowService._do_develop`는 저장된 PASS의 `basis_hash`가 현재 basis와 다르면 Development를 시작하지 않고 DEVELOPING → DESIGN_REVIEWING으로 되돌립니다 (`design_review_basis_changed`).
 - Human Gate가 요청 시점에 저장하는 `approvals.basis`(`current_basis`)는 `requirements_hash`, `plan_hash`, `decisions_hash` 3개로 구성되며 `review_policy_hash`를 포함하지 않습니다. 이 값은 결정이 stale한지 판단하는 데만 사용됩니다.
+
+Project Profile snapshot이 있는 Task에서는 `profile_hash`가 basis(와 `current_basis`)의 한 부분이 되고, 없는 Task의 basis는 바이트 단위로 그대로입니다. Profile은 프롬프트의 규칙 문구와 설계 검토 체크리스트도 선택합니다(`legacy`는 내장 규칙과 똑같이, `neutral`은 아키텍처를 강제하지 않고 렌더). Profile은 권한이나 도구를 담을 수 없습니다.
 
 ## 읽는 방법
 

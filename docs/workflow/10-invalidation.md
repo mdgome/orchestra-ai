@@ -102,6 +102,8 @@ flowchart TD
 - Requirement edits (`PATCH /tasks/{id}`) are possible only for a PENDING Task (`TaskService.update_task`). Once execution has started, requirements cannot change.
 - A Human Gate decision changes `decisions_hash`, so the Steps that use it as input (PLAN, DESIGN_REVIEW, DEVELOP, CODE_REVIEW) become subject to re-execution.
 
+**Project Profile.** For a task that has a profile snapshot, `profile_hash` is appended to the PLAN, DEVELOP and CODE_REVIEW `input_hash` and to `design_review_basis` (and `current_basis`); TEST does not use it (its command comes from `test_policy_hash`). For a task without a profile nothing is appended, so its hashes and the reuse of its stored steps are exactly what they were before profiles. The snapshot is copied once at task creation, so a change to the project profile cannot alter a task that already exists; it only gives later tasks different hashes.
+
 ## 3. Project Workspace fingerprint (`WORKSPACE_FINGERPRINT_V1`)
 
 Separately from the `code_fingerprint` above (`STEP_SNAPSHOT_V1`, used for Step reuse decisions) — the two modules do not import each other and share only the common `workspace_policy`/`workspace_digest` modules, with prefixes not cross-permitted — the project-level baseline and proof use `compute_fingerprint` from `app/infra/workspace_fingerprint.py`. The two values are never compared against each other, and boundaries that require accuracy (DIRTY determination, write baseline comparison) use only this fingerprint.

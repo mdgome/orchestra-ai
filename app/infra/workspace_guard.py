@@ -35,6 +35,27 @@ def resolve_project_root(path: str | os.PathLike) -> Path:
     return resolved
 
 
+def resolve_inside_root(root: Path, rel: str | os.PathLike) -> Path:
+    """Resolves `rel` strictly below an ALREADY validated `root` (the result of `resolve_project_root`).
+
+    `WorkspaceGuard` is anchored at WORKSPACE_ROOT and must not be used for a registered project, which lives elsewhere.
+    Rejected: an empty or absolute path, a drive, `..`, and any component (even a missing one) that is a symlink or
+    junction. The root itself is not re-validated here."""
+    candidate = Path(rel)
+    if not candidate.parts or candidate.is_absolute() or candidate.drive or ".." in candidate.parts:
+        raise FailClosed("path must be a relative path inside the project root", {"path": str(rel)})
+    probe = Path(root)
+    for part in candidate.parts:
+        probe = probe / part
+        if os.path.lexists(probe) and _is_link_or_junction(probe):
+            raise FailClosed("path traverses a symlink or junction", {"path": str(rel)})
+    resolved = probe.resolve()
+    real_root = Path(root).resolve()
+    if real_root not in resolved.parents:
+        raise FailClosed("path escapes the project root", {"path": str(rel)})
+    return resolved
+
+
 class WorkspaceGuard:
     def __init__(self, root: Path):
         self.root = Path(root).resolve()

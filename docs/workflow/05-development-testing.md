@@ -129,6 +129,10 @@ flowchart TD
 - Only test results produced with the current code (`code_fingerprint`) are passed to the Reviewer. On a mismatch, execution resumes from TESTING.
 - The `RETRYING`/`REVIEWING` nodes in diagram 1 are the entry points into this diagram.
 
+## Profile Completion Criteria
+
+When the task's profile snapshot defines `completion_criteria`, the code review schema gains a required `profile_criteria` (`{id, met, evidence}` per criterion) and the stored review carries `profile_hash`. `check_definition_of_done` then adds **one more condition** (`profile_criteria_met`), evaluated deterministically on that stored evaluation: it must be for the current profile, cover exactly the current ids once each, and every entry must be `met` with non-empty `evidence`; otherwise the review is treated as `FAIL` (`Definition of Done: ...`) and the usual improvement loop applies. Whether a criterion is really satisfied is the reviewer's judgement; the orchestrator does not verify it. No other condition is weakened.
+
 ## Current Implementation Limitations
 
 - The Maven/Gradle presets' JUnit parsing, wrapper resolution (including Windows `mvnw.cmd`), and permission/environment rules have been verified only by unit tests. This environment has no JDK/Maven/Gradle, so **actual Maven/Gradle builds could not be run.**

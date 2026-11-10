@@ -119,6 +119,24 @@ A Task belonging to a project additionally carries a Project write lock (`projec
 - Upon entering `WAITING_APPROVAL`, the CLI and Task Lease are returned, but the Project write lock is retained, because there may be Workspace changes that have not yet been cleaned up ([08](08-human-gate.md), [11](11-task-lifecycle.md)).
 - Even if the owning Task's Lease expires, the Project lock is not automatically released. Uncertain executions are judged through the existing `UNCERTAIN` → RECOVERY path.
 
+## Task Baseline Written with the Lock
+
+`ProjectLockService._acquire_once` takes the project row lock, re-validates the proof's `project_id`, owner and `write_epoch`, then calls `set_owner(..., expected_epoch=proof.write_epoch)` (it returns the epoch it produced, `acquired_epoch = proof_epoch + 1`) and inserts the `task_baselines` row **in the same transaction**. The measurement before it is: fingerprint, Changes manifest (HEAD, dirty paths), fingerprint again; two different fingerprints are a stale measurement (`FingerprintProofStale`, existing bounded retry). A fingerprint that cannot be measured keeps the fail-closed path; a manifest failure only makes the row `UNAVAILABLE` with a reason. On re-entry by the same owner the lock is never READY without a baseline row (see 09-recovery).
+
+```mermaid
+flowchart TD
+    A["ensure_for_step: owner is None and workspace CLEAN"] --> B["fingerprint (before)"]
+    B -->|"cannot be measured"| X["mark DIRTY_UNRESOLVED, PROJECT_DIRTY gate (unchanged)"]
+    B --> C["Changes manifest + HEAD + dirty paths (own walk, cooperative deadline)"]
+    C -->|"fails"| D["supplemental = UNAVAILABLE(reason)"]
+    C --> E["fingerprint (after)"]
+    D --> E
+    E -->|"differs from before"| R["stale: bounded retry"]
+    E --> F["one transaction: lock project+task rows, re-check owner/epoch, set_owner, INSERT task_baselines"]
+    F -->|"existing row of another identity"| G["fail closed, owner rolls back"]
+    F --> H["READY"]
+```
+
 ## Current implementation limitations
 
 - The Advisory Lock is acquired once in `Runner.start` and released in `Runner.stop`, but there is no code that continuously monitors whether the connection has dropped. Logic to block new CLI execution upon connection loss is not implemented. (Task-level duplicate execution continues to be blocked by the Lease and the partial unique index.)

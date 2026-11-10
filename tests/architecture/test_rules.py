@@ -109,7 +109,7 @@ def test_routers_only_call_services_through_the_container():
 # ---- layering -------------------------------------------------------------------------------------------------------
 LAYER_RULES = {
     "repositories": ("app.routers", "app.services", "app.providers", "app.schemas", "app.container"),
-    "infra": ("app.routers", "app.services", "app.repositories", "app.schemas", "app.container"),
+    "infra": ("app.routers", "app.services", "app.repositories", "app.providers", "app.schemas", "app.container"),
     "providers": ("app.routers", "app.services", "app.repositories", "app.schemas", "app.container"),
     "services": ("app.routers", "app.schemas", "app.container"),
     "validation": ("app.routers", "app.services", "app.repositories", "app.providers", "app.container"),

@@ -131,6 +131,13 @@ Since Project Tasks share a Workspace, Project state is added to the safety dete
 
 The basis for the table above and the meaning of `write_epoch` are in [10](10-invalidation.md). Operating rule (threat model): **external modification while an active Project Task exists is not supported.** If detected, the read phase retries by epoch, and the write phase is subject to Recovery. User modifications between Tasks (while the Project is idle) are permitted and are accepted as the baseline the next time a Task first acquires the write lock. Since the filesystem and the DB cannot be made into a single atomic transaction, external changes between measurement and commit may not be fully detected.
 
+## 4. Owner without a baseline row (crash gap, or an owner from before the feature)
+
+`_ensure_baseline` runs when the task that already owns the project re-enters the gate: with a row it only checks the epoch (before any mutating step exactly `acquired_epoch`; afterwards at least `acquired_epoch`, because every mutating step begin bumps the epoch; a recovery row without an acquisition epoch is only bounded from below by `recorded_epoch`). Without a row it never returns READY:
+- **a mutating step already ran** (DEVELOP/TEST row exists): an explicit `UNAVAILABLE(BASELINE_MISSING_AT_REENTRY)` row with `proof_epoch = acquired_epoch = NULL` and `recorded_epoch` = the current epoch. The first acquisition epoch cannot be proven, so it is not invented from the current one;
+- **nothing was changed yet**: the fingerprint and manifest are measured outside any transaction, then in one transaction (task and project rows locked, owner and epoch re-checked) the fresh fingerprint is compared with `write_baseline_fingerprint`. Equal = the workspace is provably unchanged since the acquisition: an AVAILABLE `REENTRY_RECOVERY` row with `proof_epoch = acquired_epoch = recorded_epoch` = the current owner epoch. Different (or unmeasurable) = `UNAVAILABLE(BASELINE_MISSING_AT_REENTRY)`.
+A row of a different identity (project, proof epochs, fingerprint) is a conflict: fail closed, nothing is overwritten; the same identity with a different status keeps the existing row (an AVAILABLE row is never replaced, an UNAVAILABLE one never promoted).
+
 ## Current implementation limitations
 
 - Modification by an external process during an active Project Task is not supported, and fingerprint comparison does not guarantee complete detection (changes may occur between measurement and commit). `write_epoch` is a generation number for the lock and change Step controlled by the Orchestrator, and it does not detect external changes.

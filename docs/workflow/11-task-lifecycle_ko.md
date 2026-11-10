@@ -1,6 +1,6 @@
 # Cancellation, Streaming 및 Completion
 
-> English: [11-task-lifecycle.md](11-task-lifecycle_ko.md)
+> English: [11-task-lifecycle.md](11-task-lifecycle.md)
 
 > 현재 구현 코드를 기준으로 정리한 흐름입니다. 코드로 확인되지 않았거나 검증되지 않은 동작은 현재 구현 제한으로 구분합니다.
 
@@ -182,6 +182,35 @@ flowchart TD
 
 미충족이 있으면 Review 결과가 `FAIL`로 바뀌어 개선 반복(`RETRYING`)으로 이동하고, `plan_defect`면 재계획으로 이동합니다. 이 검사에서 FAILED가 되는 경우는 반복 한도(`max_workflow_iterations`) 또는 재계획 한도(`max_replans`) 초과뿐입니다 ([05](05-development-testing_ko.md)). (프로젝트 Task는 이 밖에 `PROJECT_WORKSPACE_UNSTABLE`, `PROJECT_DIRTY_ABORTED`/`PROJECT_DIRTY_REJECTED` 등으로도 FAILED가 될 수 있으며 Completion 검사와는 무관합니다.)
 - COMPLETED가 되는 순간의 Project 정리(최종 fingerprint를 baseline으로 수용)는 위 「Terminal 전이와 Project write lock 정리」를 따릅니다.
+
+## 결과 읽기: 산출물과 보고서
+
+`GET /tasks/{id}/artifacts`, `GET /tasks/{id}/artifacts/{artifact_id}`, `GET /tasks/{id}/report`는 이미 저장된 데이터를 읽을 뿐이며 에이전트, 명령, LLM을 실행하지 않고 아무것도 쓰지 않습니다. `COMPLETED`는 오케스트레이터의 완료 조건을 충족했다는 뜻이지 결과가 인수·merge·배포되었다는 뜻이 아닙니다. 저장된 COMPLETED 전이는 `historical_completion`으로 보이며(그 시점의 Definition-of-Done 상세는 저장된 적이 없어 `UNKNOWN`), `current_re_evaluation`은 같은 조건을 지금 평가하고(`check_definition_of_done`의 근거 함수인 `evaluate_definition_of_done`) 과거 완료를 확인하거나 취소하지 않습니다. 모든 산출물에서 세 카운터(`plan_revision`, `workflow_iteration`, `step_attempt`)는 분리되어 있습니다.
+
+```mermaid
+flowchart TD
+    A["task_steps / executions / approvals / state_transitions"] --> B["ArtifactRepository (manifest는 defer)"]
+    B --> C["ReportService: validity, latest, 회차, gate, 재평가"]
+    C --> D["Sanitizer: 알려진 session id, 자격 증명, 금지 key, 제한"]
+    D --> E["strict 검증, 크기 확인, 예약 필드 재절단, 제한된 fallback"]
+    E --> F["sanitization 정보를 포함한 JSON 응답"]
+```
+
+산출물과 별개로 `GET /tasks/{id}/changes`는 Task가 write lock을 잡은 이후 workspace에서 무엇을 바꾸었는지 보여 줍니다. live workspace를 저장된 baseline과 비교하며(경로와 hash, 본문은 git이 옛 내용을 줄 수 있는 경우만), snapshot이 아니라 live 비교입니다. `lock_consistency`(DB)와 `workspace_consistency`(파일, 측정 두 번, `verify_workspace=true`)는 따로 보고하고, 더 이상 Project를 소유하지 않는 Task는 확정된 diff를 받지 못합니다. baseline이 없는 Task(`NO_BASELINE`), Project가 없는 Task(`NO_PROJECT`), baseline이 `UNAVAILABLE`인 Task는 이유와 함께 그렇게 알려 줍니다.
+
+## Runner 준비 상태와 진단
+
+`POST /tasks/{id}/execution-requests`는 `PENDING` 요청을 저장할 뿐이며, Runner가 가져가는지와 무관하게 202로 응답합니다. 가져갈 수 있는지는 읽기 전용인 `GET /health`(`ready`, `runner.blockers`)와 `GET /projects/{id}/diagnostics`(`RUNNER_STATE`)가 알려 줍니다. `runner_active`와 `ready`는 `Runner.lifecycle`에서 계산하고, Runner가 시작되지 않은 이유(`PREFLIGHT_FAILED`, `ADVISORY_LOCK_HELD`)는 lifespan이 기록한 `StartupOutcome`에서 옵니다. 대기 중인 요청은 사라지지 않으며 다음에 시작하는 Runner가 가져갑니다. `START_FAILED`는 `Runner.start`의 일반 실패가 API lifespan을 중단시키지 않게 될 때까지 예약 상태입니다.
+
+```mermaid
+flowchart TD
+    A["POST /tasks/{id}/execution-requests"] --> B["ExecutionRequest PENDING (202)"]
+    B --> C{"Runner.lifecycle == RUNNING 이고 blocker 없음?"}
+    C -- 예 --> D["Runner가 요청을 claim하고 실행"]
+    C -- 아니오 --> E["요청은 PENDING으로 대기, /health runner.blockers가 이유를 설명"]
+    E --> F["Runner가 준비됨: 요청을 claim"]
+    F --> D
+```
 
 ## 현재 구현 제한
 

@@ -159,9 +159,11 @@ def _git_version() -> tuple[int, ...] | None:
     return (int(match.group(1)), int(match.group(2))) if match else None
 
 
-def _git(root: Path, subcommand: list[str], *, ok_codes=(0,)) -> bytes:
+def _git(root: Path, subcommand: list[str], *, ok_codes=(0,), timeout: float | None = None) -> bytes:
+    """`timeout` is only ever given by a bounded caller (a Changes query); the default is the original behaviour."""
     try:
-        proc = subprocess.run([*git_global_args(root), *subcommand], capture_output=True, timeout=GIT_TIMEOUT_SECONDS,
+        proc = subprocess.run([*git_global_args(root), *subcommand], capture_output=True,
+                              timeout=GIT_TIMEOUT_SECONDS if timeout is None else timeout,
                               env=git_env(), cwd=root, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
         raise _GitUnusable(f"git {subcommand[0]} failed to run: {exc}") from exc
@@ -245,3 +247,96 @@ def compute_fingerprint(root: Path) -> Fingerprint:
         raise
     except OSError as exc:
         raise FingerprintError(describe_os_error("read", root, exc)) from exc
+
+
+
+# --- read-only git inventory for the Changes manifest -----------------------------------------------------------------------
+# These helpers only ENUMERATE (HEAD, index entries, untracked files, dirty paths) with the same hardened git invocation the
+# fingerprint uses. They do not touch the fingerprint algorithm, its entries or its digest.
+class GitInventoryError(Exception):
+    """git is usable but one of its read-only commands failed or timed out (not the same as 'not a git workspace')."""
+
+
+@dataclass(frozen=True)
+class GitInventory:
+    head_kind: str                                  # "COMMIT" | "UNBORN"
+    head_sha: str | None
+    tracked: tuple[tuple[str, str, str], ...]       # (rel, mode, oid) from the index, first stage per path
+    untracked: tuple[str, ...]                      # non-ignored untracked files
+    dirty: tuple[str, ...]                          # paths that differ from HEAD or are untracked, when enumerated
+
+
+def _bounded_git(root: Path, subcommand: list[str], deadline, *, ok_codes=(0,)) -> bytes:
+    timeout = None
+    if deadline is not None:
+        if deadline.expired():
+            from app.infra.deadline import DeadlineExceeded
+            raise DeadlineExceeded("the measurement deadline passed")
+        timeout = min(GIT_TIMEOUT_SECONDS, deadline.remaining())
+    try:
+        return _git(root, subcommand, ok_codes=ok_codes, timeout=timeout)      # subprocess.run kills the child on timeout
+    except _GitUnusable as exc:
+        if deadline is not None and deadline.expired():
+            from app.infra.deadline import DeadlineExceeded
+            raise DeadlineExceeded("the measurement deadline passed") from exc
+        raise GitInventoryError(str(exc)) from exc
+
+
+def git_workspace_usable(root: Path) -> bool:
+    """True when the GIT mode applies to this workspace (the same eligibility test the fingerprint uses)."""
+    try:
+        _git_usable(Path(root))
+    except _GitUnusable:
+        return False
+    return True
+
+
+def _parse_status(raw: bytes) -> list[str]:
+    """`git status --porcelain=v1 -z`: 'XY path' records; a rename/copy is followed by its original path as one more record."""
+    paths: list[str] = []
+    records = raw.split(b"\0")
+    i = 0
+    while i < len(records):
+        rec = records[i]
+        i += 1
+        if len(rec) < 4:
+            continue
+        status, path = rec[:2].decode("ascii", "replace"), rec[3:].decode("utf-8", "surrogateescape")
+        paths.append(path)
+        if "R" in status or "C" in status:
+            if i < len(records) and records[i]:
+                paths.append(records[i].decode("utf-8", "surrogateescape"))
+            i += 1
+    return paths
+
+
+def git_inventory(root: Path, *, deadline=None) -> GitInventory | None:
+    """None when this is not a GIT-mode workspace (callers use the content walk). Raises GitInventoryError for a failing
+    command and DeadlineExceeded when `deadline` passes (git is then killed)."""
+    root = Path(root)
+    if not git_workspace_usable(root):
+        return None
+    head = _bounded_git(root, ["rev-parse", "--verify", "-q", "HEAD"], deadline, ok_codes=(0, 1)).strip().decode("ascii", "replace")
+    if head and not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
+        raise GitInventoryError("HEAD is not a commit id")
+    tracked: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for raw in _bounded_git(root, ["ls-files", "--stage", "-z"], deadline).split(b"\0"):
+        if not raw:
+            continue
+        meta, _, path_b = raw.partition(b"\t")
+        mode, oid, _stage = meta.decode("ascii").split(" ")
+        rel = path_b.decode("utf-8", "surrogateescape")
+        if rel not in seen and not is_volatile(rel):
+            seen.add(rel)
+            tracked.append((rel, mode, oid))
+    untracked = tuple(r for r in (raw.decode("utf-8", "surrogateescape") for raw in _bounded_git(
+        root, ["ls-files", "--others", "--exclude-standard", "-z"], deadline).split(b"\0") if raw) if not is_volatile(r))
+    status = _bounded_git(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"], deadline)
+    dirty = tuple(dict.fromkeys(p for p in _parse_status(status) if not is_volatile(p)))
+    return GitInventory("COMMIT" if head else "UNBORN", head or None, tuple(tracked), untracked, dirty)
+
+
+def git_read_only(root: Path, subcommand: list[str], *, deadline=None, ok_codes=(0,)) -> bytes:
+    """One READ-ONLY git command (the caller restricts the sub-command), with the hardened environment and deadline."""
+    return _bounded_git(Path(root), subcommand, deadline, ok_codes=ok_codes)

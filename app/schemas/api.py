@@ -43,6 +43,7 @@ class ProjectCreate(BaseModel):
     workspace_path: str | None = None       # connect an existing local workspace ...
     repository_url: str | None = None       # ... or clone a git repository into the managed clone root
     test_policy: dict | None = None
+    profile: dict | None = None             # omitted: the neutral profile (v1); validated, unknown keys are rejected
 
 
 class ProjectPatch(BaseModel):
@@ -59,8 +60,47 @@ class ProjectOut(_Out):
     status: str
     test_policy: dict | None = None
     workspace_state: str
+    profile_version: int | None = None      # the ACTIVE profile version
     created_at: datetime
     updated_at: datetime
+
+
+class ProfileVersionOut(_Out):
+    version: int
+    content: dict
+    content_hash: str
+    created_at: datetime
+    active: bool
+
+
+class ProfileVersionResult(ProfileVersionOut):
+    created: bool                           # false: identical to the active version, nothing was written
+
+
+class ProfileVersionList(_Out):
+    items: list[ProfileVersionOut]
+    total: int
+    limit: int
+    offset: int
+
+
+class DiagnosticItemOut(_Out):
+    code: str
+    status: str                       # PASS | WARN | FAIL | UNKNOWN
+    checked_at: datetime
+    cause: str
+    recommendation: str
+    blocks_execution: bool
+
+
+class DiagnosticsOut(_Out):
+    project_id: uuid.UUID
+    generated_at: datetime
+    can_start: bool                   # false when a check that blocks execution FAILED; never a guarantee of success
+    blockers: list[str]
+    items: list[DiagnosticItemOut]
+    disclaimer: str
+    cached: bool
 
 
 # --- tasks -------------------------------------------------------------------------------------------------
@@ -105,6 +145,8 @@ class TaskOut(_Out):
     run_seconds: float
     failure_reason: str | None = None
     cancel_requested_at: datetime | None = None
+    profile_version: int | None = None      # the profile version this task copied; null = the built-in rules
+    profile_hash: str | None = None
     created_at: datetime
     updated_at: datetime
 
