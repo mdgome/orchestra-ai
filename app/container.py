@@ -36,7 +36,7 @@ from app.services.test_policy_service import TestPolicyService
 from app.services.tracked_diagnostics import TrackedDiagnosticsReader
 from app.services.workflow_service import WorkflowService
 from app.validation import policies as P
-from app.validation.exceptions import ServiceNotConfigured
+from app.validation.exceptions import ReportsNotConfigured, ServiceNotConfigured
 
 
 @dataclass
@@ -83,7 +83,8 @@ class Container:
 
     def report_service(self) -> ReportService:
         if self.reports is None:
-            raise ServiceNotConfigured("artifact and report views are not configured in this container")
+            raise ReportsNotConfigured("artifact and report views are not configured in this container "
+                                       "(Container.reports is not set)")
         return self.reports
 
 

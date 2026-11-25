@@ -8,7 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import defer
 
-from app.models.tables import AgentSession, Approval, ApprovalDecision, StateTransition, TaskStep
+from app.models.tables import AgentSession, Approval, ApprovalDecision, Execution, StateTransition, TaskStep
 
 _NO_SNAPSHOTS = (defer(TaskStep.snapshot_before), defer(TaskStep.snapshot_after))
 
@@ -37,6 +37,15 @@ class ArtifactRepository:
         """The step only if it belongs to this task: another task's artifact id is simply 'not found'."""
         return (await self.s.execute(select(TaskStep).where(TaskStep.id == step_id, TaskStep.task_id == task_id)
                                      .options(*_NO_SNAPSHOTS))).scalar_one_or_none()
+
+    async def orchestrator_test_run(self, step_id: uuid.UUID) -> Execution | None:
+        """The LOCAL `Execution` row the orchestrator wrote for its own test run of this Tester step
+        (`detail.orchestrator_test_run`), or None when none was recorded. Tracked command rows share the step id and
+        are skipped."""
+        rows = await self.s.execute(select(Execution).where(
+            Execution.step_id == step_id, Execution.provider == "LOCAL", Execution.role == "TESTER")
+            .order_by(Execution.started_at.desc(), Execution.id.desc()))
+        return next((r for r in rows.scalars() if (r.detail or {}).get("orchestrator_test_run") is True), None)
 
     async def known_session_ids(self, task_id: uuid.UUID) -> tuple[str, ...]:
         """The task's native session ids, used ONLY to mask them in returned text. Never returned."""

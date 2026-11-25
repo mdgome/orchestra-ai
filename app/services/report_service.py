@@ -11,10 +11,10 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 
 from app.db import Database
-from app.infra.response_sanitizer import Sanitizer
+from app.infra.response_sanitizer import LOSSY, TRUNCATION_MARK, Sanitizer, SanitizeReason
 from app.models.states import (STEP_CODE_REVIEW, STEP_DESIGN_REVIEW, STEP_DEVELOP, STEP_PLAN, STEP_TEST, StepState,
                                TaskState)
-from app.models.tables import Task, TaskStep
+from app.models.tables import Execution, Task, TaskStep
 from app.repositories.approval_repository import ExecutionRequestRepository
 from app.repositories.artifact_repository import ArtifactRepository
 from app.repositories.task_repository import TaskRepository
@@ -40,17 +40,55 @@ IN_PROGRESS = (TaskState.PLANNING, TaskState.DESIGN_REVIEWING, TaskState.DEVELOP
                TaskState.REVIEWING, TaskState.RETRYING)
 
 
-def _s(sanitizer: Sanitizer, text: str | None, max_chars: int = 500) -> str:
+class _Clean:
+    """The Sanitizer of ONE response plus the record of every reason it raised while that response was built. The
+    response's top-level `sanitization` is made from this record, so a truncated or redacted structured string and a
+    SanitizedJson field are both reported there (plan B-2). Nothing here is shared between responses."""
+
+    def __init__(self, sanitizer: Sanitizer):
+        self._sanitizer = sanitizer
+        self._reasons: dict[str, None] = {}                    # an ordered set: first-seen order, no duplicates
+
+    def add(self, reasons) -> None:
+        for reason in reasons:
+            self._reasons[str(reason)] = None
+
+    def text(self, value: str | None, *, max_chars: int | None = None) -> tuple[str, tuple[str, ...]]:
+        out, reasons = self._sanitizer.text(value, max_chars=max_chars)
+        self.add(reasons)
+        return out, reasons
+
+    def tail(self, value: str | None, max_chars: int) -> str:
+        """A text whose END matters (a command's output): keeps the last `max_chars` characters, marks the cut."""
+        value = value or ""
+        if len(value) > max_chars:
+            self.add((SanitizeReason.STRING_TRUNCATED.value,))
+            value = TRUNCATION_MARK + value[-max_chars:]
+        return self.text(value, max_chars=max_chars + len(TRUNCATION_MARK))[0]
+
+    def json(self, value, *, max_bytes: int | None = None):
+        cut = self._sanitizer.json(value, max_bytes=max_bytes)
+        self.add(cut.reasons)
+        return cut
+
+    def sanitization(self) -> dict:
+        """The response-level `sanitization` (the size-limit fields stay for `finalize` to merge into)."""
+        reasons = list(self._reasons)
+        return {"truncated": any(SanitizeReason(r) in LOSSY for r in reasons), "reasons": reasons,
+                "omitted_items": 0, "omitted_sections": []}
+
+
+def _s(sanitizer: _Clean, text: str | None, max_chars: int = 500) -> str:
     return sanitizer.text(text or "", max_chars=max_chars)[0]
 
 
-def _issues(sanitizer: Sanitizer, output: dict | None) -> list[dict]:
+def _issues(sanitizer: _Clean, output: dict | None) -> list[dict]:
     raw = (output or {}).get("issues") or []
     return [{"severity": str(i.get("severity", ""))[:16], "description": _s(sanitizer, i.get("description"))}
             for i in raw[:P.REPORT_ISSUES_MAX] if isinstance(i, dict)]
 
 
-def _sj(sanitizer: Sanitizer, value, max_bytes: int | None = None) -> dict:
+def _sj(sanitizer: _Clean, value, max_bytes: int | None = None) -> dict:
     cut = sanitizer.json(value, max_bytes=max_bytes)
     return {"value": cut.value, "truncated": cut.truncated, "reasons": list(cut.reasons),
             "omitted_paths": list(cut.omitted_paths)}
@@ -138,7 +176,7 @@ class ReportService:
             raise NotFound("task not found")
         return task
 
-    def _summary(self, step: TaskStep, validity: _Validity, sanitizer: Sanitizer) -> dict:
+    def _summary(self, step: TaskStep, validity: _Validity, sanitizer: _Clean) -> dict:
         latest = validity.latest.get(step.step_key)
         return {"id": step.id, "kind": step.step_key, "plan_revision": step.plan_revision,
                 "workflow_iteration": step.workflow_iteration, "step_attempt": step.step_attempt,
@@ -154,13 +192,13 @@ class ReportService:
             repo = ArtifactRepository(s)
             page, total = await repo.steps_page(task_id, (kind,) if kind else KINDS, limit, offset)
             every = await repo.all_steps(task_id)
-            sanitizer = Sanitizer(await repo.known_session_ids(task_id))
+            sanitizer = _Clean(Sanitizer(await repo.known_session_ids(task_id)))
         validity = _Validity(task, every)
         items = [self._summary(step, validity, sanitizer) for step in page]
         end = offset + len(items)
         return {"items": items, "total": total, "returned": len(items), "omitted_items": 0, "has_more": end < total,
                 "size_limited": False, "next_offset": end if end < total else None, "limit": limit, "offset": offset,
-                "sanitization": {"truncated": False, "reasons": [], "omitted_items": 0, "omitted_sections": []}}
+                "sanitization": sanitizer.sanitization()}
 
     async def artifact_detail(self, task_id: uuid.UUID, artifact_id: uuid.UUID) -> dict:
         async with self.db.transaction() as s:
@@ -170,13 +208,11 @@ class ReportService:
             if step is None:
                 raise NotFound("artifact not found")
             every = await repo.all_steps(task_id)
-            sanitizer = Sanitizer(await repo.known_session_ids(task_id))
+            sanitizer = _Clean(Sanitizer(await repo.known_session_ids(task_id)))
         content = _sj(sanitizer, step.output) if step.output is not None else None
-        error, reasons = sanitizer.text(step.error, max_chars=2000)
+        error, _ = sanitizer.text(step.error, max_chars=2000)
         return {**self._summary(step, _Validity(task, every), sanitizer), "content": content,
-                "error": error if step.error else None,
-                "sanitization": {"truncated": bool(content and content["truncated"]), "reasons": list(reasons),
-                                 "omitted_items": 0, "omitted_sections": []}}
+                "error": error if step.error else None, "sanitization": sanitizer.sanitization()}
 
     # --- report -----------------------------------------------------------------------------------------------
     async def report(self, task_id: uuid.UUID) -> dict:
@@ -184,7 +220,9 @@ class ReportService:
             task = await self._task(s, task_id)
             repo = ArtifactRepository(s)
             steps = await repo.all_steps(task_id)
-            sanitizer = Sanitizer(await repo.known_session_ids(task_id))
+            sanitizer = _Clean(Sanitizer(await repo.known_session_ids(task_id)))
+            test_step = _latest_succeeded(steps).get(STEP_TEST)
+            test_run = await repo.orchestrator_test_run(test_step.id) if test_step else None
             gates = await repo.gates(task_id)
             completed = await repo.last_transition_to(task_id, str(TaskState.COMPLETED))
             last = await repo.last_task_transition(task_id)
@@ -203,7 +241,7 @@ class ReportService:
             "plan": self._plan(latest.get(STEP_PLAN), validity, sanitizer),
             "design_review": self._review(latest.get(STEP_DESIGN_REVIEW), validity, sanitizer),
             "implementation": self._implementation(latest.get(STEP_DEVELOP), validity, sanitizer),
-            "tests": self._tests(task, latest.get(STEP_TEST), validity, sanitizer),
+            "tests": self._tests(task, latest.get(STEP_TEST), test_run, validity, sanitizer),
             "code_review": self._review(latest.get(STEP_CODE_REVIEW), validity, sanitizer),
             "iterations": self._iterations(steps, sanitizer),
             "human_gates": [self._gate(g, d, sanitizer) for g, d in gates[-P.REPORT_GATES_MAX:]],
@@ -212,9 +250,9 @@ class ReportService:
             "last_transition": self._transition(last, sanitizer),
             "next_actions": self._next_actions(task, pending, open_request is not None),
             "runtime": self._runtime(),
-            "sanitization": {"truncated": False, "reasons": [], "omitted_items": 0, "omitted_sections": []},
         }
         payload["task"]["failure_reason"] = _s(sanitizer, task.failure_reason, 64) if task.failure_reason else None
+        payload["sanitization"] = sanitizer.sanitization()          # last: every section above has been built
         return payload
 
     def _plan(self, step, validity, sanitizer):
@@ -241,20 +279,42 @@ class ReportService:
                 "summary": _s(sanitizer, out.get("summary")),
                 "files_changed": [_s(sanitizer, f, 300) for f in (out.get("files_changed") or [])[:P.SANITIZE_MAX_ITEMS]]}
 
-    def _tests(self, task: Task, step, validity, sanitizer):
+    def _tests(self, task: Task, step, run: Execution | None, validity, sanitizer):
+        """The Tester step's stored output and the orchestrator's own run, each only as far as it was RECORDED.
+
+        The pass/fail aggregate is the orchestrator's authoritative result stored in the step output (`test_result`). The
+        run itself is the LOCAL `Execution` row written with that step (`detail.orchestrator_test_run`); without it
+        `orchestrator_run.recorded` is false and `run_by` is UNKNOWN. The command is not stored on either record: the
+        task's test policy is shown as `policy_command` and becomes `command` only when the step recorded the hash of
+        that very policy."""
         if step is None:
             return None
         out = step.output or {}
         result = out.get("test_result") or {}
         commands = (task.test_policy or {}).get("commands") or []
-        command = [_s(sanitizer, a, 300) for a in commands[0]] if commands else None
+        policy_command = [_s(sanitizer, a, 300) for a in commands[0]] if commands else None
+        bound = run is not None and bool(task.test_policy_hash) and out.get("test_policy_hash") == task.test_policy_hash
+        detail = (run.detail if run is not None else None) or {}
+        codes = result.get("exit_codes")
+        recorded_run = {
+            "recorded": run is not None, "run_by": "ORCHESTRATOR" if run is not None else "UNKNOWN",
+            "outcome": run.outcome if run is not None else None, "exit_code": run.exit_code if run is not None else None,
+            "exit_codes": ([c for c in codes if c is None or isinstance(c, int)]
+                           if run is not None and isinstance(codes, list) else []),
+            "finished_at": run.finished_at if run is not None else None,
+            "reason": (_s(sanitizer, detail.get("reason")) or None) if run is not None else None,
+            "tracking": str(detail["tracking"])[:64] if detail.get("tracking") else None,
+            "output_tail": sanitizer.tail(run.stdout_tail, 2000) if run is not None and run.stdout_tail else None}
         return {"artifact_id": step.id, "plan_revision": step.plan_revision,
-                "workflow_iteration": step.workflow_iteration, "validity": validity.of(step), "command": command,
-                "run_by": "ORCHESTRATOR", "passed": result.get("passed"), "executed": result.get("executed"),
+                "workflow_iteration": step.workflow_iteration, "validity": validity.of(step),
+                "command": policy_command if bound else None, "policy_command": policy_command,
+                "run_by": recorded_run["run_by"], "orchestrator_run": recorded_run,
+                "agent_summary": _s(sanitizer, out.get("agent_summary")),
+                "passed": result.get("passed"), "executed": result.get("executed"),
                 "skipped": result.get("skipped"), "reason": _s(sanitizer, result.get("reason")) or None,
                 "failures": [_s(sanitizer, f, 300) for f in (result.get("failures") or [])[:P.REPORT_ISSUES_MAX]]}
 
-    def _iterations(self, steps: list[TaskStep], sanitizer: Sanitizer) -> list[dict]:
+    def _iterations(self, steps: list[TaskStep], sanitizer: _Clean) -> list[dict]:
         rounds: dict[tuple[int, int], list[TaskStep]] = {}
         for step in steps:
             rounds.setdefault((step.plan_revision, step.workflow_iteration), []).append(step)

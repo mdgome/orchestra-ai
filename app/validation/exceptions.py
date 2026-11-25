@@ -61,6 +61,11 @@ class ServiceNotConfigured(AppError):
     code = "SERVICE_NOT_CONFIGURED"
 
 
+class ReportsNotConfigured(ServiceNotConfigured):
+    """The container was built without the artifact / report views (`Container.reports` is None)."""
+    code = "REPORTS_NOT_CONFIGURED"
+
+
 class MeasurementBusy(AppError):
     """Another workspace measurement of this project (or too many overall) is still running: nothing new is started."""
     status_code = 503

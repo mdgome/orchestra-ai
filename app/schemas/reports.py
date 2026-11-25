@@ -112,13 +112,30 @@ class ImplementationOut(_Out):
     files_changed: list[str]
 
 
+class OrchestratorRunOut(_Out):
+    """The orchestrator's own test run as RECORDED (the LOCAL execution row with `detail.orchestrator_test_run`).
+    `recorded` false: no such record exists; `run_by` is then UNKNOWN and no outcome is shown, nothing is inferred."""
+    recorded: bool
+    run_by: str                              # ORCHESTRATOR (a recorded orchestrator run) | UNKNOWN
+    outcome: str | None = None
+    exit_code: int | None = None
+    exit_codes: list[int | None] = []
+    finished_at: datetime | None = None      # when the record was written, right after the run (the start is not recorded)
+    reason: str | None = None
+    tracking: str | None = None              # e.g. UNTRACKED_PLATFORM: the run was not process-tracked
+    output_tail: str | None = None           # the end of the command output, sanitised
+
+
 class TestRunOut(_Out):
     artifact_id: uuid.UUID
     plan_revision: int
     workflow_iteration: int
     validity: ValidityOut
-    command: list[str] | None = None        # what the Orchestrator ran (from the task's stored test policy)
-    run_by: str                              # ORCHESTRATOR: the Orchestrator ran it itself; the agent's text proves nothing
+    command: list[str] | None = None        # the policy command, only when the step recorded the hash of this very policy
+    policy_command: list[str] | None = None  # the task's test policy command: NOT evidence that anything ran
+    run_by: str                              # from the record: ORCHESTRATOR when its run is recorded, else UNKNOWN
+    orchestrator_run: OrchestratorRunOut | None = None
+    agent_summary: str = ""                  # the Tester agent's own text (it proves nothing about the result)
     passed: bool | None = None
     executed: int | None = None
     skipped: int | None = None

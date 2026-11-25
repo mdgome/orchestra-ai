@@ -109,7 +109,9 @@ command or LLM is called to produce it, and nothing the agents never produced is
 * `GET /tasks/{id}/artifacts/{artifact_id}` returns one artifact with its sanitised stored output. An id that belongs to
   another task is `404`.
 * `GET /tasks/{id}/report` returns the outcome and `outcome_note`, plan, design review, implementation, tests (the
-  command the Orchestrator ran and its result, `run_by: ORCHESTRATOR`), code review, issues per round, Human Gate
+  stored test result and the Orchestrator's own run only as recorded: `orchestrator_run.recorded`, `run_by` is
+  `ORCHESTRATOR` for a recorded run and `UNKNOWN` otherwise; the policy command is `policy_command`, never proof that it
+  ran), code review, issues per round, Human Gate
   history, the last transition, and `next_actions`.
 * `COMPLETED` means the orchestrator's completion conditions were met. It does **not** mean you accepted, merged or
   deployed the result.

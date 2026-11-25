@@ -266,7 +266,9 @@ async def test_a_container_without_the_report_service_answers_with_the_error_env
     app = create_app(container=container, run_preflight=False)
     app.state.container = container
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-        assert_envelope(await client.get(f"/tasks/{UNKNOWN}/report"), 503, "SERVICE_NOT_CONFIGURED")
+        for url in (f"/tasks/{UNKNOWN}/report", f"/tasks/{UNKNOWN}/artifacts", f"/tasks/{UNKNOWN}/artifacts/{UNKNOWN}"):
+            error = assert_envelope(await client.get(url), 503, "REPORTS_NOT_CONFIGURED")
+            assert "not configured" in error["message"] and error["details"] == {}
 
 
 # --- pagination ------------------------------------------------------------------------------------------------------------
