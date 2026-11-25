@@ -68,11 +68,13 @@ infra/         명령 실행기, 프로세스 제어, 작업공간 보호/스냅
   상태입니다. `Runner.start`의 일반 예외는 지금도 lifespan을 중단시킵니다(결정 D6-a).
 * `diagnostics_service`는 읽기 전용입니다(도구 버전 확인과 파일 읽기만; 에이전트, 인증 프로브, 설치 프로그램, 프로젝트
   테스트는 실행하지 않음). cache key마다 공유 `asyncio.Task` 하나를 짧은 `asyncio.Lock` 아래에서 만들며, 이 lock은 진단이
-  실행되는 동안 잡지 않습니다. 결과는 task가 끝나기 전에 캐시되고 done callback은 자기 task만 제거합니다. waiter는
+  실행되는 동안 잡지 않습니다. 완전한 결과는 task가 끝나기 전에 캐시되고(부분 결과, 즉 UNKNOWN 항목은 반환하되 캐시하지 않음) done callback은 자기 task만
+  제거합니다. waiter는
   shield되어 취소된 waiter가 진단을 취소하지 않습니다.
 * subprocess는 executor의 timeout으로 제한되고 종료됩니다. 파일 점검은 worker thread를 쓰며 timeout은 **cooperative/
   best-effort**입니다. thread는 강제 종료할 수 없으므로 Project당 점검 1개와 전역 상한이 worker 수를 제한하고, 슬롯은
-  thread가 실제로 끝날 때만 반납됩니다.
+  thread가 실제로 끝날 때만 반납됩니다. 전체 실행은 `DIAGNOSTICS_DEADLINE_SECONDS`로 cooperative하게 제한되므로(각 단계는
+  자신의 timeout과 남은 시간 중 작은 값을 받음) blocking 파일시스템 thread가 남을 수 있습니다.
 * 등록된 Project는 자신의 root부터 검증합니다(`resolve_project_root` 후 `resolve_inside_root`). `WORKSPACE_ROOT` 기준의
   `WorkspaceGuard`는 사용하지 않습니다. 끼워 넣은 링크/junction, 바뀐 canonical path, 사라지거나 접근 불가한 root는
   탐지하지만, 같은 canonical path의 실제 디렉터리가 다른 디렉터리로 교체된 경우는 탐지하지 않습니다(저장된 filesystem

@@ -75,7 +75,7 @@ Use nouns in the URI and express actions through the HTTP method. Errors always 
 | GET/POST | `/projects/{id}/tasks` | List/create Tasks that share the Project Workspace (201, does not execute) |
 | GET | `/projects/{id}/profile` | The active Project Profile version (see *Project Profiles*) |
 | GET/POST | `/projects/{id}/profile-versions` | List versions (newest first, paginated) / create **and activate** a new version: 201, or 200 `created: false` when identical to the active one |
-| GET | `/projects/{id}/diagnostics` | Read-only readiness check (see *Health and Diagnostics*); `?refresh=true` bypasses the 30 s cache |
+| GET | `/projects/{id}/diagnostics` | Read-only readiness check (see *Health and Diagnostics*); `?refresh=true` bypasses the 30 s cache (only complete results are cached) |
 | GET | `/health` | API liveness plus Runner readiness (see *Health and Diagnostics*) |
 | GET/POST | `/tasks` | POST only **creates** a PENDING task (201); it does not execute anything |
 | GET/PATCH | `/tasks/{id}` | The GET response includes the current lease, latest checkpoint, and any pending approvals |

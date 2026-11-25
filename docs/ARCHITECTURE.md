@@ -68,11 +68,13 @@ Abstractions exist only where a second implementation is real: `CliProvider` (Co
   reserved: a general `Runner.start` exception still aborts the lifespan (decision D6-a).
 * `diagnostics_service` is read-only (version probes of tools and file reads; never an agent, the auth probe, an
   installer or a project test). One shared `asyncio.Task` per cache key, created under a short `asyncio.Lock` that is
-  never held while the diagnosis runs; the result is cached before the task ends and the done callback removes only its
-  own task. Waiters are shielded: a cancelled waiter does not cancel the diagnosis.
+  never held while the diagnosis runs; a complete result is cached before the task ends (a partial one, UNKNOWN items, is returned but never cached) and
+  the done callback removes only its own task. Waiters are shielded: a cancelled waiter does not cancel the diagnosis.
 * A subprocess is bounded by the executor's timeout and terminated. File inspection uses a worker thread and its
   timeout is **cooperative/best-effort**: a thread cannot be killed, so one inspection per project and a global cap
-  bound the number of workers, and a slot is released only when the thread really ends.
+  bound the number of workers, and a slot is released only when the thread really ends. The whole run is bounded by
+  `DIAGNOSTICS_DEADLINE_SECONDS` cooperatively (every stage gets the smaller of its timeout and the time left), so a
+  blocking filesystem thread may linger.
 * Registered projects are validated from their own root (`resolve_project_root`, then `resolve_inside_root`); the
   `WORKSPACE_ROOT`-anchored `WorkspaceGuard` is never used for them. A swapped-in link/junction, a changed canonical
   path, a vanished or inaccessible root are detected; the real directory at the same canonical path being replaced by

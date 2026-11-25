@@ -3,6 +3,7 @@ import asyncio
 import os
 import subprocess
 import threading
+import time
 import uuid
 from types import SimpleNamespace
 
@@ -12,7 +13,7 @@ from app.infra.command_executor import CommandResult
 from app.models.states import CliOutcome
 from app.providers import preflight as preflight_module
 from app.providers.preflight import PreflightReport
-from app.services.diagnostics_service import DiagnosticsService, Status
+from app.services.diagnostics_service import DiagnosticsService, Status, TrackedVerdict
 from app.services.runner import RunnerLifecycle as L
 from app.services.runtime_status import StartupOutcome as S
 from app.services.runtime_status import runtime_snapshot
@@ -33,10 +34,11 @@ class FakeProjects:
         self.rows[row.id] = row
         return row
 
-    async def get_project(self, project_id):
+    async def get_project_and_profile_hash(self, project_id):
         if project_id not in self.rows:
             raise NotFound("project not found")
-        return self.rows[project_id]
+        row = self.rows[project_id]
+        return row, getattr(row, "profile_hash", None)
 
 
 class FakeExecutor:
@@ -371,6 +373,27 @@ async def test_a_changed_workspace_or_policy_makes_the_old_entry_unreachable_and
     assert not (await svc.diagnose(row.id)).cached and len(svc._cache) == 1
 
 
+async def test_a_changed_active_profile_makes_the_old_entry_unreachable_and_evicts_it(tmp_path):
+    svc, projects, ex, _ = make(tmp_path)
+    row = projects.add(workspace(tmp_path))                     # no active profile: profile_hash is None
+    await svc.diagnose(row.id)
+    assert (await svc.diagnose(row.id)).cached and len(ex.calls) == 1   # one run so far
+    old_key = next(iter(svc._cache))
+    row.profile_hash = "a" * 64                                 # a new profile version became active
+    assert not (await svc.diagnose(row.id)).cached and len(ex.calls) == 2    # a new run
+    assert len(svc._cache) == 1 and old_key not in svc._cache   # same project, different key: the old entry is evicted
+    assert (await svc.diagnose(row.id)).cached                  # unchanged profile: a hit again
+    row.profile_hash = None                                     # back to "no profile" is a different key as well
+    assert not (await svc.diagnose(row.id)).cached and len(svc._cache) == 1
+
+
+async def test_the_profile_hash_is_part_of_the_cache_key(tmp_path):
+    svc, projects, _, _ = make(tmp_path)
+    row = projects.add(workspace(tmp_path), profile_hash="b" * 64)
+    await svc.diagnose(row.id)
+    assert "b" * 64 in next(iter(svc._cache))
+
+
 # --- bounded file inspection --------------------------------------------------------------------------------------------
 def stall_fs(svc, release: threading.Event, started: list):
     original = svc._inspect_fs
@@ -424,3 +447,241 @@ async def test_the_global_cap_stops_inspections_of_other_projects_from_piling_up
     finally:
         release.set()
     await wait_until(lambda: svc._fs_total == 0)
+
+
+# --- partial results are never cached; the overall deadline bounds the whole run ---------------------------------------------
+class ProbeEndsExecutor(FakeExecutor):
+    """`git --version` ends with the given outcome/exit code; every other command behaves as in FakeExecutor."""
+
+    def __init__(self, outcome, exit_code):
+        super().__init__()
+        self.outcome, self.exit_code = outcome, exit_code
+
+    async def run(self, spec, **kw):
+        if spec.argv[0] != "git":
+            return await super().run(spec, **kw)
+        self.calls.append(list(spec.argv))
+        return CommandResult(spec.argv, self.outcome, self.exit_code, "", "boom\n", 0.0)
+
+
+def counted(svc):
+    """Counts the real diagnosis runs (a cache hit starts none)."""
+    runs, original = [], svc._run
+
+    def run(*args, **kw):
+        runs.append(1)
+        return original(*args, **kw)
+
+    svc._run = run
+    return runs
+
+
+def with_readers(svc, *, capability=None, tracked=None):
+    svc._read_capability, svc._read_tracked = capability, tracked
+
+
+async def _ok_capability():
+    return SimpleNamespace(state="SUPPORTED", reason_code=None)
+
+
+async def _ok_tracked(_pid):
+    return TrackedVerdict()
+
+
+async def _failing_tracked(_pid):
+    raise RuntimeError("db down")
+
+
+async def _hanging(*_args):
+    await asyncio.Event().wait()
+
+
+async def test_a_file_inspection_error_is_partial_and_not_cached(tmp_path):
+    svc, projects, *_ = make(tmp_path)
+    row = projects.add(workspace(tmp_path))
+    runs = counted(svc)
+
+    def boom(view):
+        raise OSError("disk")
+
+    svc._inspect_fs = boom
+    first = by_code(await svc.diagnose(row.id))
+    assert first["WORKSPACE_ACCESS"].status is Status.UNKNOWN and "failed unexpectedly" in first["WORKSPACE_ACCESS"].cause
+    assert svc._cache == {} and runs == [1]
+    assert not (await svc.diagnose(row.id)).cached and runs == [1, 1] and svc._cache == {}   # a fresh run, no cache hit
+    await asyncio.sleep(0)
+    assert svc._inflight == {}
+
+
+async def test_a_file_inspection_timeout_is_partial_and_not_cached(tmp_path, monkeypatch):
+    monkeypatch.setattr(P, "DIAGNOSTICS_ITEM_TIMEOUT_SECONDS", 0.05)
+    svc, projects, *_ = make(tmp_path)
+    row, release = projects.add(workspace(tmp_path)), threading.Event()
+    runs = counted(svc)
+    stall_fs(svc, release, [])
+    try:
+        first = await svc.diagnose(row.id)
+        assert "did not finish" in by_code(first)["WORKSPACE_ACCESS"].cause and svc._cache == {} and runs == [1]
+    finally:
+        release.set()
+    await wait_until(lambda: svc._fs_total == 0)
+
+
+async def test_a_busy_inspection_is_uncached_starts_no_second_worker_and_a_complete_run_follows_once_it_ended(tmp_path, monkeypatch):
+    monkeypatch.setattr(P, "DIAGNOSTICS_ITEM_TIMEOUT_SECONDS", 0.05)
+    svc, projects, ex, _ = make(tmp_path)
+    row, release, started = projects.add(workspace(tmp_path)), threading.Event(), []
+    runs = counted(svc)
+    stall_fs(svc, release, started)
+    try:
+        await svc.diagnose(row.id)                           # times out; the thread is still alive
+        busy = await svc.diagnose(row.id)                    # plain GET: a new run, which is busy, not a cache hit
+        assert not busy.cached and "still running" in by_code(busy)["WORKSPACE_ACCESS"].cause
+        assert runs == [1, 1] and started == [row.id] and svc._cache == {}      # no second worker, nothing cached
+    finally:
+        release.set()
+    await wait_until(lambda: svc._fs_total == 0)
+    monkeypatch.setattr(P, "DIAGNOSTICS_ITEM_TIMEOUT_SECONDS", 5.0)
+    complete = await svc.diagnose(row.id)                    # the thread ended: a complete run ...
+    assert not complete.cached and by_code(complete)["WORKSPACE_ACCESS"].status is Status.PASS and runs == [1, 1, 1]
+    assert (await svc.diagnose(row.id)).cached and runs == [1, 1, 1]            # ... which IS cached
+
+
+@pytest.mark.parametrize("outcome,exit_code", [(CliOutcome.TIMEOUT, -1), (CliOutcome.ERROR, 1)])
+async def test_a_version_probe_timeout_or_error_is_partial_and_not_cached(tmp_path, outcome, exit_code):
+    svc, projects, ex, _ = make(tmp_path, executor=ProbeEndsExecutor(outcome, exit_code))
+    runs = counted(svc)
+    row = projects.add(workspace(tmp_path))
+    assert not (await svc.diagnose(row.id)).cached and svc._cache == {}
+    assert not (await svc.diagnose(row.id)).cached and runs == [1, 1] and len(ex.calls) == 2
+
+
+async def test_a_failed_state_read_is_partial_and_not_cached(tmp_path):
+    svc, projects, *_ = make(tmp_path)
+    with_readers(svc, capability=_ok_capability, tracked=_failing_tracked)
+    runs = counted(svc)
+    row = projects.add(workspace(tmp_path))
+    first = by_code(await svc.diagnose(row.id))
+    assert first["TRACKED_EXECUTIONS"].status is Status.UNKNOWN and svc._cache == {}
+    assert not (await svc.diagnose(row.id)).cached and runs == [1, 1]
+
+
+async def test_a_state_read_timeout_is_partial_and_not_cached(tmp_path, monkeypatch):
+    monkeypatch.setattr(P, "DIAGNOSTICS_ITEM_TIMEOUT_SECONDS", 0.05)
+    svc, projects, *_ = make(tmp_path)
+    with_readers(svc, capability=_hanging, tracked=_ok_tracked)
+    runs = counted(svc)
+    row = projects.add(workspace(tmp_path))
+    first = by_code(await svc.diagnose(row.id))
+    assert first["PROCESS_TRACKING"].status is Status.UNKNOWN and svc._cache == {}
+    assert not (await svc.diagnose(row.id)).cached and runs == [1, 1]
+
+
+async def test_a_complete_result_is_cached_with_readers_configured(tmp_path):
+    svc, projects, *_ = make(tmp_path)
+    with_readers(svc, capability=_ok_capability, tracked=_ok_tracked)
+    runs = counted(svc)
+    pid = projects.add(workspace(tmp_path)).id
+    assert not (await svc.diagnose(pid)).cached
+    assert (await svc.diagnose(pid)).cached and runs == [1]
+
+
+async def test_a_genuinely_missing_tool_is_a_complete_answer_and_is_cached(tmp_path):
+    svc, projects, ex, _ = make(tmp_path, executor=FakeExecutor(missing=("git",)))
+    runs = counted(svc)
+    pid = projects.add(workspace(tmp_path)).id
+    assert by_code(await svc.diagnose(pid))["GIT_AVAILABLE"].status is Status.WARN
+    assert (await svc.diagnose(pid)).cached and runs == [1] and len(ex.calls) == 1
+
+
+class StageStubs:
+    """Cooperative stages on a fake clock: each takes `duration` of clock time but never longer than the timeout it got."""
+
+    def __init__(self, svc, clock, fs=4.0, probe=6.0):
+        self.clock, self.fs_d, self.probe_d = clock, fs, probe
+        self.fs_timeouts: list[float] = []
+        self.probe_timeouts: list[float] = []
+        original_fs = svc._fs
+
+        async def fs(project_id, fn, timeout):
+            self.fs_timeouts.append(timeout)
+            result = await original_fs(project_id, fn, timeout)
+            self.clock.now += min(self.fs_d, timeout)
+            return result if self.fs_d <= timeout else ("timeout", None)
+
+        svc._fs = fs
+        svc._executor.run = self.run
+
+    async def run(self, spec, **_kw):
+        self.probe_timeouts.append(spec.timeout_seconds)
+        self.clock.now += min(self.probe_d, spec.timeout_seconds)
+        outcome = CliOutcome.TIMEOUT if self.probe_d > spec.timeout_seconds else CliOutcome.SUCCESS
+        return CommandResult(spec.argv, outcome, 0, "git version 2\n", "", 0.0)
+
+
+async def test_every_stage_gets_min_of_item_timeout_and_time_left_and_the_run_stays_inside_the_deadline(tmp_path, monkeypatch):
+    monkeypatch.setattr(P, "DIAGNOSTICS_DEADLINE_SECONDS", 7.0)
+    clock = Clock()
+    svc, projects, *_ = make(tmp_path, clock=clock)
+    called = []
+
+    async def capability():
+        called.append("capability")
+        return await _ok_capability()
+
+    async def tracked(pid):
+        called.append("tracked")
+        return await _ok_tracked(pid)
+
+    with_readers(svc, capability=capability, tracked=tracked)
+    stubs = StageStubs(svc, clock)
+    started = clock.now
+    report = await svc.diagnose(projects.add(workspace(tmp_path)).id)
+    items = by_code(report)
+    assert stubs.fs_timeouts == [5.0] and stubs.probe_timeouts == [3.0]       # min(5, 7), then min(5, 7 - 4)
+    assert clock.now - started <= P.DIAGNOSTICS_DEADLINE_SECONDS + 1e-9
+    assert called == []                                                       # no time left: the readers never started
+    for code in ("PROCESS_TRACKING", "TRACKED_EXECUTIONS"):
+        assert items[code].status is Status.UNKNOWN and "overall diagnostics deadline" in items[code].cause
+        assert not items[code].blocks_execution
+    assert svc._cache == {}                                                   # a deadline-cut report is partial
+    assert report.can_start and report.blockers == ()                         # UNKNOWN never blocks (only FAIL does)
+
+
+async def test_a_stage_with_no_time_left_is_not_started_and_its_items_are_unknown(tmp_path, monkeypatch):
+    monkeypatch.setattr(P, "DIAGNOSTICS_DEADLINE_SECONDS", 4.0)
+    clock = Clock()
+    svc, projects, *_ = make(tmp_path, clock=clock)
+    stubs = StageStubs(svc, clock, fs=0.0)
+    stubs.fs_d = 4.0                                             # the inspection used the whole deadline, but finished
+    report = await svc.diagnose(projects.add(workspace(tmp_path)).id)
+    items = by_code(report)
+    assert stubs.fs_timeouts == [4.0] and stubs.probe_timeouts == []         # no probe started, no forced 1 s
+    assert items["GIT_AVAILABLE"].status is Status.UNKNOWN and "deadline" in items["GIT_AVAILABLE"].cause
+    assert svc._cache == {}
+
+
+async def test_with_nothing_left_not_even_the_file_inspection_starts(tmp_path, monkeypatch):
+    monkeypatch.setattr(P, "DIAGNOSTICS_DEADLINE_SECONDS", 0.0)
+    clock = Clock()
+    svc, projects, *_ = make(tmp_path, clock=clock)
+    stubs = StageStubs(svc, clock, fs=0.0)
+    report = await svc.diagnose(projects.add(workspace(tmp_path)).id)
+    items = by_code(report)
+    assert stubs.fs_timeouts == [] and stubs.probe_timeouts == []
+    assert items["WORKSPACE_ACCESS"].status is Status.UNKNOWN and "overall diagnostics deadline" in items["WORKSPACE_ACCESS"].cause
+    assert items["GIT_AVAILABLE"].status is Status.UNKNOWN and report.can_start and svc._cache == {}
+
+
+async def test_a_reader_is_cut_at_the_remaining_time_by_the_real_clock(tmp_path, monkeypatch):
+    monkeypatch.setattr(P, "DIAGNOSTICS_ITEM_TIMEOUT_SECONDS", 5.0)
+    monkeypatch.setattr(P, "DIAGNOSTICS_DEADLINE_SECONDS", 0.4)
+    svc, projects, *_ = make(tmp_path, clock=time.monotonic)
+    with_readers(svc, capability=_hanging, tracked=_hanging)
+    began = time.monotonic()
+    report = await svc.diagnose(projects.add(workspace(tmp_path)).id)
+    assert time.monotonic() - began < 2.0                                    # not 5 + 5 s of reader timeouts
+    items = by_code(report)
+    assert items["PROCESS_TRACKING"].status is Status.UNKNOWN and "deadline" in items["PROCESS_TRACKING"].cause
+    assert items["TRACKED_EXECUTIONS"].status is Status.UNKNOWN and "deadline" in items["TRACKED_EXECUTIONS"].cause
+    assert svc._cache == {}

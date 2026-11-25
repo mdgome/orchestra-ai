@@ -4,6 +4,8 @@ Never run here: a provider/agent, the auth probe (`probe_write_blocked` spends t
 project's test command. Only version probes of tools (`git --version`, `java -version`) and file inspection.
 
 Deadlines, honestly:
+* the whole run is bounded by DIAGNOSTICS_DEADLINE_SECONDS, cooperatively: every stage gets min(item timeout, time left)
+  and a stage with no time left is not started (its items are UNKNOWN);
 * a subprocess (CommandExecutor) is bounded by its own timeout and terminated by the executor;
 * file inspection runs in a worker thread and its timeout is COOPERATIVE/best-effort: a stalled filesystem cannot be
   interrupted from Python, so a waiter that gives up leaves the thread running. Two caps keep such threads from piling
@@ -12,7 +14,8 @@ Deadlines, honestly:
 
 Single flight: every request for the same key shares ONE `asyncio.Task` (`_inflight`). Cache lookup, in-flight lookup and
 task registration happen under `_lock`, which is never held while the diagnosis itself runs. A waiter that is cancelled
-only ends itself (`asyncio.shield`). The task stores a complete result in the TTL cache BEFORE it finishes and the done
+only ends itself (`asyncio.shield`). The task stores a COMPLETE result in the TTL cache BEFORE it finishes (a partial one - busy/timed-out/failed stage or
+the overall deadline hit, items UNKNOWN - is returned but never cached) and the done
 callback removes it from `_inflight` only if it is still the registered one, so there is no gap in which a request finds
 neither and starts a second diagnosis, and a stale callback cannot remove a newer task.
 """
@@ -134,6 +137,7 @@ class _ProjectView:
     test_policy: dict | None
     write_owner_task_id: uuid.UUID | None
     workspace_state: str
+    profile_hash: str | None = None      # content hash of the ACTIVE project profile; None = the project has none
 
 
 def _first_line(text: str) -> str:
@@ -161,15 +165,15 @@ class DiagnosticsService:
 
     # --- single flight ---------------------------------------------------------------------------------
     async def diagnose(self, project_id: uuid.UUID, *, refresh: bool = False) -> DiagnosticsReport:
-        project = await self._projects.get_project(project_id)       # 404 for an unknown project
+        project, profile_hash = await self._projects.get_project_and_profile_hash(project_id)   # 404 for an unknown project
         view = _ProjectView(project.id, project.workspace_path, project.test_policy, project.write_owner_task_id,
-                            project.workspace_state)
-        # workspace identity + test policy + policy version + the live state some items are derived from (the background
+                            project.workspace_state, profile_hash)
+        # workspace identity + test policy + policy version + active profile hash + the live state some items are derived from (the background
         # revision, Runner readiness, the derived display set of the SAME snapshot, write-lock owner, workspace state): a
         # change of any of them makes the old entry unreachable (14.3). The ONE runtime snapshot of this read is passed on.
         runtime = self._get_runtime()
         key = (view.id, os.path.normcase(view.workspace_path), stable_hash(view.test_policy), P.DIAGNOSTICS_POLICY_VERSION,
-               runtime.background_revision, runtime.ready, runtime.blockers, runtime.derived_states,
+               view.profile_hash, runtime.background_revision, runtime.ready, runtime.blockers, runtime.derived_states,
                view.write_owner_task_id, view.workspace_state)
         async with self._lock:
             hit = self._cache.get(key)
@@ -254,13 +258,29 @@ class DiagnosticsService:
         return facts
 
     # --- one run ------------------------------------------------------------------------------------------
+    def _stage_timeout(self, deadline: float) -> float | None:
+        """min(item timeout, time left of the overall deadline); None = no time left, the stage must not start."""
+        left = deadline - self._clock()
+        return None if left <= 0 else min(P.DIAGNOSTICS_ITEM_TIMEOUT_SECONDS, left)
+
     async def _run(self, key: tuple, view: _ProjectView, runtime: RuntimeSnapshot) -> DiagnosticsReport:
         deadline = self._clock() + P.DIAGNOSTICS_DEADLINE_SECONDS
-        status, facts = await self._fs(view.id, partial(self._inspect_fs, view), P.DIAGNOSTICS_ITEM_TIMEOUT_SECONDS)
+        cut = (f"the overall diagnostics deadline ({P.DIAGNOSTICS_DEADLINE_SECONDS:g} s) was reached before this check "
+               "could finish")
+        # `complete` is the cache predicate: a failed, timed-out, busy or deadline-cut stage makes the report partial, and a
+        # partial report is returned but never cached (a "missing" tool is a valid, complete answer)
+        timeout = self._stage_timeout(deadline)
+        if timeout is None:
+            status, facts = "deadline", None
+        else:
+            status, facts = await self._fs(view.id, partial(self._inspect_fs, view), timeout)
+            if status == "timeout" and timeout < P.DIAGNOSTICS_ITEM_TIMEOUT_SECONDS:
+                status = "deadline"                 # it was the shrunk, deadline-derived timeout that ran out
+        complete = status == "ok"
         facts = facts if status == "ok" else None
         fs_note = {"busy": "a previous file inspection of this project is still running",
                    "timeout": "the file inspection did not finish in time (the filesystem may be slow)",
-                   "error": "the file inspection failed unexpectedly", "ok": ""}[status]
+                   "error": "the file inspection failed unexpectedly", "deadline": cut, "ok": ""}[status]
         root: Path | None = facts.get("root") if facts else None
         policy = facts.get("policy") if facts else None
         preset = (policy or {}).get("preset")
@@ -271,9 +291,11 @@ class DiagnosticsService:
                 argvs["java"] = ["java", "-version"]
             results = await asyncio.gather(*(self._version(root, argv, deadline) for argv in argvs.values()))
             probes = dict(zip(argvs, results))
+            complete = complete and all(state not in ("timeout", "error", "deadline") for state, _ in results)
         git, java = probes.get("git"), probes.get("java")
-        capability = await self._reading(self._read_capability)
-        tracked = await self._reading(self._read_tracked, view.id)
+        capability = await self._reading(self._read_capability, deadline=deadline)
+        tracked = await self._reading(self._read_tracked, view.id, deadline=deadline)
+        complete = complete and all(kind in ("ok", "unconfigured") for kind, _ in (capability, tracked))
         items = [*self._workspace_items(facts, fs_note), self._git_item(root, git, fs_note),
                  *self._cli_items(), self._settings_item(facts, fs_note), self._auth_item(),
                  *self._policy_items(facts, fs_note), self._java_item(facts, java), self._python_item(facts, policy),
@@ -281,13 +303,17 @@ class DiagnosticsService:
                  self._process_tracking_item(capability), self._tracked_item(tracked), self._lock_item(view)]
         blockers = tuple(i.code for i in items if i.blocks_execution)
         report = DiagnosticsReport(view.id, self._now(), not blockers, blockers, tuple(items))
-        async with self._lock:
-            self._store(key, report)         # BEFORE the task ends, so no request ever sees "no cache, no in-flight"
+        if complete:
+            async with self._lock:
+                self._store(key, report)     # BEFORE the task ends, so no request ever sees "no cache, no in-flight"
         return report
 
     async def _version(self, root: Path, argv: list[str], deadline: float) -> tuple[str, str]:
-        """("ok"|"missing"|"timeout"|"error", first line). A version probe only; no project code runs."""
-        timeout = max(1, int(min(P.DIAGNOSTICS_ITEM_TIMEOUT_SECONDS, deadline - self._clock())))
+        """("ok"|"missing"|"timeout"|"error"|"deadline", first line). A version probe only; no project code runs.
+        "deadline": no time was left, so the probe was not started."""
+        timeout = self._stage_timeout(deadline)
+        if timeout is None:
+            return "deadline", ""
         try:
             result = await self._executor.run(CommandSpec(argv=argv, cwd=root, timeout_seconds=timeout,
                                                           idle_seconds=None, workspace_root=root))
@@ -323,6 +349,8 @@ class DiagnosticsService:
         if root is None or probe is None:
             return self._unknown("GIT_AVAILABLE", note or "the workspace was not accessible")
         state, text = probe
+        if state == "deadline":
+            return self._unknown("GIT_AVAILABLE", "the overall diagnostics deadline was reached before `git --version` ran")
         if state == "ok":
             return self._item("GIT_AVAILABLE", Status.PASS, text)
         return self._item("GIT_AVAILABLE", Status.WARN, f"git could not be run ({state})",
@@ -395,6 +423,8 @@ class DiagnosticsService:
         if probe is None:
             return self._unknown("JAVA_RUNTIME", "not checked")
         state, text = probe
+        if state == "deadline":
+            return self._unknown("JAVA_RUNTIME", "the overall diagnostics deadline was reached before `java -version` ran")
         if state == "ok":
             return self._item("JAVA_RUNTIME", Status.PASS, text)
         if state in ("missing", "error"):
@@ -440,14 +470,20 @@ class DiagnosticsService:
                               "run with a rerun option if a task fails for that reason (not handled automatically yet)")
         return self._item("JUNIT_COLLECTION", Status.PASS, detail)
 
-    async def _reading(self, fn, *args) -> tuple[str, object]:
-        """("ok", value) | ("unconfigured", None) | ("failed", None): an injected reader is bounded by the item timeout and a
-        failure of it is an UNKNOWN item, never an exception of the whole diagnosis."""
+    async def _reading(self, fn, *args, deadline: float) -> tuple[str, object]:
+        """("ok", value) | ("unconfigured", None) | ("failed", None) | ("deadline", None): an injected reader is bounded by
+        min(item timeout, time left); with no time left it is not started. A failure of it is an UNKNOWN item, never an
+        exception of the whole diagnosis."""
         if fn is None:
             return "unconfigured", None
+        timeout = self._stage_timeout(deadline)
+        if timeout is None:
+            return "deadline", None
         try:
-            return "ok", await asyncio.wait_for(fn(*args), P.DIAGNOSTICS_ITEM_TIMEOUT_SECONDS)
-        except Exception:  # noqa: BLE001 - includes TimeoutError; the detail is never put into a response
+            return "ok", await asyncio.wait_for(fn(*args), timeout)
+        except TimeoutError:
+            return ("deadline" if timeout < P.DIAGNOSTICS_ITEM_TIMEOUT_SECONDS else "failed"), None
+        except Exception:  # noqa: BLE001 - the detail is never put into a response
             return "failed", None
 
     def _runner_item(self, snap: RuntimeSnapshot) -> DiagnosticItem:
@@ -542,7 +578,8 @@ class DiagnosticsService:
                               "TESTER steps fail closed", "fix the host environment and restart the Runner", True)
         else:
             why = {"unconfigured": "the capability reader is not configured",
-                   "failed": "the capability could not be read"}.get(
+                   "failed": "the capability could not be read",
+                   "deadline": "the overall diagnostics deadline was reached before the capability could be read"}.get(
                 kind, "the capability of the current Runner incarnation cannot be confirmed")
             item = self._item("PROCESS_TRACKING", Status.UNKNOWN, f"PROCESS_TRACKING_STATUS_UNKNOWN: {why}",
                               "wait for the Runner to publish its capability, or retry the diagnostics later")
@@ -553,8 +590,9 @@ class DiagnosticsService:
         information in the text and keeps PASS."""
         kind, value = reading
         if kind != "ok":
-            why = ("the tracked-executions reader is not configured" if kind == "unconfigured"
-                   else "the tracked executions of the project could not be read")
+            why = {"unconfigured": "the tracked-executions reader is not configured",
+                   "deadline": "the overall diagnostics deadline was reached before the tracked executions could be read"
+                   }.get(kind, "the tracked executions of the project could not be read")
             return self._unknown("TRACKED_EXECUTIONS", why)
         causes = merge_causes(value.causes)
         if not causes:

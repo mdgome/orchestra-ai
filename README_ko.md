@@ -72,7 +72,7 @@ URI에는 명사를 사용하고 동작은 HTTP 메서드로 표현합니다. �
 | GET/POST | `/projects/{id}/tasks` | Project Workspace를 공유하는 Task 목록/생성(201, 실행은 하지 않음) |
 | GET | `/projects/{id}/profile` | 활성 Project Profile 버전(*Project Profile* 참고) |
 | GET/POST | `/projects/{id}/profile-versions` | 버전 목록(최신순, 페이지네이션) / 새 버전 생성 **및 활성화**: 201, 활성 버전과 같으면 200 `created: false` |
-| GET | `/projects/{id}/diagnostics` | 읽기 전용 실행 준비 점검(*Health와 진단* 참고). `?refresh=true`는 30초 캐시를 우회 |
+| GET | `/projects/{id}/diagnostics` | 읽기 전용 실행 준비 점검(*Health와 진단* 참고). `?refresh=true`는 30초 캐시를 우회(완전한 결과만 캐시) |
 | GET | `/health` | API 생존 여부와 Runner 준비 상태(*Health와 진단* 참고) |
 | GET/POST | `/tasks` | POST는 PENDING 작업을 **생성만** 하며(201), 아무 작업도 실행하지 않음 |
 | GET/PATCH | `/tasks/{id}` | GET 응답에 현재 lease, 최신 checkpoint 및 미결 승인 포함 |

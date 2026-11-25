@@ -22,6 +22,7 @@ from app.infra.redaction import redact_credentials
 from app.infra.workspace_fingerprint import FingerprintError, compute_fingerprint
 from app.models.states import CliOutcome
 from app.models.tables import Project
+from app.repositories.profile_repository import ProfileRepository
 from app.repositories.project_repository import ProjectRepository
 from app.services import profile_service
 from app.validation import policies as P
@@ -137,6 +138,16 @@ class ProjectService:
         if project is None:
             raise NotFound("project not found")
         return project
+
+    async def get_project_and_profile_hash(self, project_id: uuid.UUID) -> tuple[Project, str | None]:
+        """The project and the content hash of its ACTIVE profile (None: no active profile), read in ONE transaction."""
+        async with self.db.transaction() as s:
+            project = await ProjectRepository(s).get(project_id)
+            if project is None:
+                raise NotFound("project not found")
+            active = (await ProfileRepository(s).get(project_id, project.profile_version)
+                      if project.profile_version else None)
+        return project, (active.content_hash if active is not None else None)
 
     async def list_projects(self, status: str | None, limit: int, offset: int) -> list[Project]:
         async with self.db.transaction() as s:

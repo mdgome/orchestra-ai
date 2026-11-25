@@ -168,7 +168,7 @@ ROLE_PROVIDER = {
 # --- Project diagnostics (read-only) -----------------------------------------------
 DIAGNOSTICS_POLICY_VERSION = 2             # part of the cache key: bump it when the set of checks changes (2: causes, 14.3)
 DIAGNOSTICS_ITEM_TIMEOUT_SECONDS = 5.0     # one check: a subprocess, or one filesystem inspection
-DIAGNOSTICS_DEADLINE_SECONDS = 15.0        # the whole run; a check still pending is reported UNKNOWN
+DIAGNOSTICS_DEADLINE_SECONDS = 15.0        # the whole run (cooperative); a stage with no time left is not started (UNKNOWN), the partial report is not cached
 DIAGNOSTICS_CACHE_TTL_SECONDS = 30.0
 # Global cap of filesystem-inspection worker threads, abandoned ones (a waiter timed out) included: a thread cannot be
 # killed, so a stalled filesystem may keep a worker alive. The cap is what stops such workers from piling up.
