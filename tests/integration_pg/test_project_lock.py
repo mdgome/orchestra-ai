@@ -4,6 +4,8 @@ import dataclasses
 from pathlib import Path
 
 import pytest
+
+from app.services.project_recovery_effect import OptionNotAvailable
 from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError
 
@@ -334,7 +336,8 @@ async def test_retry_is_not_an_offered_option_for_a_dirty_gate(db, tmp_path):
     waiting = await new_task(h, project, "wants the lock now")
     await h.start(waiting.id)
     approval = (await h.approvals(waiting.id))[0]
-    with pytest.raises(ValidationFailed):
+    # B2 contract change (design 7.5 item 1(i)): a PROJECT_DIRTY gate validates in its effect, so a bogus option is 409, not 422
+    with pytest.raises(OptionNotAvailable):
         await h.decide(approval.id, "APPROVED", "retry", key="k-retry")
 
 

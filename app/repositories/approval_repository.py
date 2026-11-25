@@ -71,6 +71,17 @@ class ApprovalRepository:
             .values(used_at=func.now()))
         return result.rowcount == 1
 
+    async def successors_of(self, approval_id: uuid.UUID) -> list[Approval]:
+        """Every direct lineage successor (`target.supersedes_approval_id` link only, never an order by time or UUID): normally 0
+        or 1 (uq_approvals_lineage_successor); more than one is the abnormal APPROVAL_LINEAGE_CONFLICT."""
+        rows = await self.s.execute(select(Approval).where(Approval.target["supersedes_approval_id"].astext == str(approval_id)))
+        return list(rows.scalars())
+
+    async def successor_of(self, approval_id: uuid.UUID) -> Approval | None:
+        """The direct lineage successor of an approval (`target.supersedes_approval_id`; at most one, uq_approvals_lineage_successor)."""
+        found = await self.successors_of(approval_id)
+        return found[0] if len(found) == 1 else None
+
 
 class ExecutionRequestRepository:
     def __init__(self, session: AsyncSession):
@@ -84,6 +95,14 @@ class ExecutionRequestRepository:
     async def get(self, request_id: uuid.UUID) -> ExecutionRequest | None:
         return (await self.s.execute(
             select(ExecutionRequest).where(ExecutionRequest.id == request_id))).scalar_one_or_none()
+
+    async def add_resume_if_absent(self, task_id: uuid.UUID, approval_id: uuid.UUID) -> bool:
+        """Insert-if-absent of the RESUME of one approval (`execution_requests.approval_id` is UNIQUE): True when this call
+        inserted it, False when one already exists (it is reused, never duplicated)."""
+        result = await self.s.execute(pg_insert(ExecutionRequest).values(
+            id=uuid.uuid4(), task_id=task_id, kind="RESUME", status="PENDING", approval_id=approval_id)
+            .on_conflict_do_nothing(index_elements=[ExecutionRequest.approval_id]))
+        return result.rowcount == 1
 
     async def by_approval(self, approval_id: uuid.UUID) -> ExecutionRequest | None:
         return (await self.s.execute(

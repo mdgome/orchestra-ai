@@ -6,8 +6,11 @@ A result that arrives after lease ownership was lost is never recorded as a norm
 """
 import asyncio
 import logging
+import os
+import socket
 import time
 import uuid
+from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -18,9 +21,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import Database
 from app.infra.event_bus import EventBus
-from app.infra.process_control import CONFIRMED_GONE, ProcessIdentity
+from app.infra.command_executor import OnStarted, TrackedRun
+from app.infra.process_control import CONFIRMED_GONE, IdentityFenced, ProcessIdentity, capture_identity
 from app.infra.workspace_snapshot import take_snapshot
-from app.models.states import CliOutcome, StepState
+from app.models.states import TERMINAL_TASK_STATES, CliOutcome, ProcessLifecycle, StepState, TaskState
 from app.models.tables import Execution, Task, TaskStep
 from app.providers.base import CliProvider, ProviderRequest, ProviderResult
 from app.repositories.approval_repository import ApprovalRepository
@@ -30,6 +34,7 @@ from app.services.hashing import stable_hash
 from app.services.lease_service import Lease, LeaseService
 from app.services.session_service import PreparedSession, SessionService
 from app.services.state_service import change_step_state
+from app.services.tracked_classifier import classify_row
 from app.validation import policies as P
 from app.validation.exceptions import AppError, FailClosed, LeaseLost
 
@@ -59,9 +64,21 @@ class TerminationUnconfirmed(AppError):
     status_code = 409
     code = "TERMINATION_UNCONFIRMED"
 
-    def __init__(self, message: str, step: "TaskStep | None" = None, execution_id: uuid.UUID | None = None):
+    def __init__(self, message: str, step: "TaskStep | None" = None, execution_id: uuid.UUID | None = None,
+                 checkpoint_step_key: str | None = None):
         super().__init__(message)
         self.execution_id = execution_id
+        # B2 (7.2): where a continue of the RECOVERY gate re-enters when no step is RUNNING/INTERRUPTED (STEP_TEST for the
+        # test commands and `collect_ids`, which run before the tester step begins).
+        self.checkpoint_step_key = checkpoint_step_key
+
+
+class ProcessTrackingUnavailable(FailClosed):
+    """The tracked-command infrastructure failed (capability gate, Job creation/assignment, identity, resume): no user code
+    ran and the Task fails closed with this code, never a "failed test" that would loop the developer CLI (7.2 item 6)."""
+
+    def __init__(self, message: str = P.PROCESS_TRACKING_UNAVAILABLE, details: dict | None = None):
+        super().__init__(message, details)
 
 
 @dataclass
@@ -94,11 +111,14 @@ def _utcnow() -> datetime:
 class StepRunner:
     def __init__(self, db: Database, leases: LeaseService, sessions: SessionService,
                  providers: dict[str, CliProvider], events: EventBus | None = None, clock=_utcnow,
-                 cancel_poll_seconds: float = 1.0):
+                 cancel_poll_seconds: float = 1.0, process_tracking_state: Callable[[], str] | None = None):
         self.db, self.leases, self.sessions, self.providers = db, leases, sessions, providers
         self.events = events or EventBus()
         self._now = clock
         self._cancel_poll = cancel_poll_seconds
+        # Plain seam of design 6.2: SUPPORTED | UNAVAILABLE | UNSUPPORTED_PLATFORM | UNKNOWN. The default trusts the host
+        # (the executor decides platform support); phase 4/6 wires the Runner's capability state here.
+        self._tracking_state = process_tracking_state or (lambda: "SUPPORTED")
 
     # --- begin ---------------------------------------------------------------------------------
     async def begin(self, lease: Lease, task_id: uuid.UUID, step_key: str, role: str, input_hash: str,
@@ -159,7 +179,7 @@ class StepRunner:
                         await s.execute(update(Execution).where(Execution.id == _eid)
                                         .values(pid=identity.pid, process_create_time=identity.create_time))
 
-            watcher = asyncio.create_task(self._watch_cancel(handle.task_id, provider, run_key))
+            watcher = asyncio.create_task(self.watch_cancel(handle.task_id, provider.cancel, run_key))
             started = time.monotonic()
             try:
                 if prepared.resume_id:
@@ -183,14 +203,16 @@ class StepRunner:
             snapshot_after = await asyncio.to_thread(take_snapshot, workspace)
             return StepExecution(result, execution_id, snapshot_after, action)
 
-    async def _watch_cancel(self, task_id: uuid.UUID, provider: CliProvider, run_key: str) -> None:
+    async def watch_cancel(self, task_id: uuid.UUID, cancel: Callable[[str], None], key: str) -> None:
+        """Polls the Task's cancel request and calls `cancel(key)` once: a provider's run key for an agent CLI, a scope key
+        for a group of tracked commands (`CommandExecutor.cancel` reaches every command under the key)."""
         while True:
             await asyncio.sleep(self._cancel_poll)
             try:
                 async with self.db.transaction() as s:
                     task = await TaskRepository(s).get(task_id)
                 if task is not None and task.cancel_requested_at is not None:
-                    provider.cancel(run_key)
+                    cancel(key)
                     return
             except Exception:  # noqa: BLE001 - DB hiccup must not kill the watcher silently
                 log.exception("cancel watcher failed")
@@ -283,3 +305,145 @@ class StepRunner:
             raise
         self.events.publish(handle.task_id, {"event": "step.finished", "step": handle.step_key, "status": str(status)})
         return step
+
+
+class TrackedCommandPort(ABC):
+    """What `TestPolicyService` needs to run a group of commands as TRACKED commands (design 7.1): an abstract base (no
+    Protocol), implemented by `TrackedCommandSession`. The service never sees the database."""
+    scope_key: str                  # `{run_id}:tracked:{scope_id}`: the cancel scope of the whole group
+    checkpoint_step_key: str        # where a RECOVERY `continue` re-enters (STEP_TEST)
+
+    @abstractmethod
+    def check_capability(self) -> None:
+        """Raises FailClosed(PROCESS_TRACKING_UNAVAILABLE) when the capability state forbids tracked commands."""
+
+    @abstractmethod
+    async def begin_command(self) -> tuple[TrackedRun, OnStarted]:
+        """Registers the STARTING row (own short transaction) and returns the TrackedRun and its fenced `on_started`."""
+
+    @abstractmethod
+    async def finish_command(self, tracked: TrackedRun, raised: BaseException | None) -> None:
+        """Closes (or deliberately leaves open) the row from `tracked.result`. Never raises."""
+
+    @abstractmethod
+    async def watch_cancel(self, cancel: Callable[[str], None]) -> None:
+        """Runs until cancelled; calls `cancel(scope_key)` once when the Task's cancellation was requested."""
+
+
+class TrackedCommandSession(TrackedCommandPort):
+    """The tracked-run factory of one command group (design 7.1): the registration of the STARTING row, the fenced identity
+    write and the closing write of each command. It is the concrete form of `TrackedCommandPort`
+    (test_policy_service.py), which `TestPolicyService` drives without knowing the database.
+
+    Every closing write is ONE lease-independent UPDATE with the JSONB-merged proof (6.1): `Runner.stop` revokes the lease
+    before it cancels, and the rows must still close."""
+
+    def __init__(self, steps: "StepRunner", lease: Lease, task_id: uuid.UUID, *, scope_id: str, checkpoint_step_key: str,
+                 step_id: uuid.UUID | None = None,
+                 owner_check: Callable[[AsyncSession, Task], Awaitable[None]] | None = None):
+        self._steps, self._lease, self._task_id = steps, lease, task_id
+        self._step_id, self._owner_check = step_id, owner_check
+        self.scope_key = f"{lease.run_id}:tracked:{scope_id}"
+        self.checkpoint_step_key = checkpoint_step_key
+
+    def check_capability(self) -> None:
+        state = self._steps._tracking_state()
+        if state == "UNSUPPORTED_PLATFORM":
+            return                                  # the POSIX degrade: untracked, decided by the executor (6.2)
+        if state != "SUPPORTED":
+            raise ProcessTrackingUnavailable(details={"state": str(state)})
+
+    async def watch_cancel(self, cancel: Callable[[str], None]) -> None:
+        await self._steps.watch_cancel(self._task_id, cancel, self.scope_key)
+
+    async def begin_command(self) -> tuple[TrackedRun, OnStarted]:
+        """Registration transaction (7.1 step 1): Task row lock -> lease -> Task not terminal -> owner of the project write
+        lock -> INSERT. The order Task -> TaskRun is that of `_record_start`; no new lock edge."""
+        steps = self._steps
+        identity = capture_identity(os.getpid())
+        detail = {"tracked": True, "v": P.DETAIL_SCHEMA_VERSION, "checkpoint_step_key": self.checkpoint_step_key,
+                  "runner_process": {"host": socket.gethostname(), "pid": os.getpid(),
+                                     "create_time": identity.create_time if identity else None}}
+        async with steps.db.transaction() as s:
+            task = await TaskRepository(s).lock(self._task_id)
+            await steps.leases.verify(s, self._lease)
+            if task is None or TaskState(task.status) in TERMINAL_TASK_STATES:
+                raise FailClosed("the task is terminal: no tracked command can be registered")
+            if task.cancel_requested_at is not None:
+                raise TaskCancelled("cancellation requested")
+            if self._owner_check is not None:
+                await self._owner_check(s, task)
+            execution = await TaskRepository(s).add_execution(Execution(
+                id=uuid.uuid4(), task_id=task.id, step_id=self._step_id, run_id=self._lease.run_id, role="TESTER",
+                provider="LOCAL", outcome=str(CliOutcome.STARTING), runner_id=self._lease.runner_id, detail=detail))
+            execution_id = execution.id
+        tracked = TrackedRun(execution_id, run_key=f"{self.scope_key}:{execution_id}", cancel_scope=self.scope_key)
+
+        async def on_started(proc_identity: ProcessIdentity | None) -> None:
+            """The fenced identity update (5.1 step 5): only while the row is open and the lease holds; a lost fence is an
+            IdentityFenced, so the executor kills the suspended process and the command never runs."""
+            if proc_identity is None:
+                raise IdentityFenced("process identity unavailable")
+            try:
+                async with steps.db.transaction() as s2:
+                    await TaskRepository(s2).lock(self._task_id)
+                    await steps.leases.verify(s2, self._lease)
+                    if not await TaskRepository(s2).set_tracked_identity(
+                            execution_id, proc_identity.pid, proc_identity.create_time):
+                        raise IdentityFenced("the execution row is no longer open")
+            except LeaseLost as exc:
+                raise IdentityFenced("lease lost before the identity was persisted") from exc
+
+        return tracked, on_started
+
+    async def finish_command(self, tracked: TrackedRun, raised: BaseException | None) -> None:
+        """The shielded caller `finally` (7.1 step 4, table of 6.1). Never raises: a failing write leaves the row open (the
+        conservative state), which the terminal rules and the sweeper then handle."""
+        try:
+            await self._finish(tracked, raised)
+        except Exception:  # noqa: BLE001 - a DB error here must not hide the command's own outcome
+            log.exception("closing write of tracked execution %s failed; the row stays open", tracked.execution_id)
+
+    async def _finish(self, tracked: TrackedRun, raised: BaseException | None) -> None:
+        result = tracked.result
+        close, proof, merge = True, P.PROOF_NEVER_RAN, {}
+        outcome, exit_code, terminated, out, err = str(CliOutcome.ERROR), None, False, None, None
+        if result is None:
+            if tracked.spawned:
+                close, proof = False, None                      # RESULT_MISSING: stays unresolved
+                merge = {"reason": P.TRACKED_RESULT_MISSING}
+                outcome = None
+            else:                                               # raised before the process existed: user code never ran
+                merge = {"lifecycle": str(ProcessLifecycle.NOT_STARTED), "tree": "EMPTY",
+                         "reason": type(raised).__name__ if raised is not None else "NOT_STARTED"}
+                if isinstance(raised, asyncio.CancelledError):
+                    outcome = str(CliOutcome.CANCELLED)
+        else:
+            outcome, exit_code = str(result.outcome), result.exit_code
+            out, err = (result.stdout or "")[-4000:], (result.stderr or "")[-4000:]
+            merge = {"lifecycle": str(result.lifecycle), "tree": str(result.tree), "survivors": result.survivors}
+            if result.termination:
+                merge["termination"] = result.termination
+            if result.reason:
+                merge["reason"] = result.reason
+            if result.lifecycle in (ProcessLifecycle.EXITED, ProcessLifecycle.TERMINATED):
+                proof = P.PROOF_JOB_EMPTY
+                terminated = result.lifecycle is ProcessLifecycle.TERMINATED or result.survivors
+            elif result.spawn_failed or result.lifecycle in (ProcessLifecycle.NOT_STARTED, ProcessLifecycle.SPAWN_FAILED):
+                proof = P.PROOF_NEVER_RAN
+            else:                                               # TERMINATION_UNCONFIRMED (or no lifecycle): never closed
+                close, proof = False, None
+                if result.lifecycle is not ProcessLifecycle.TERMINATION_UNCONFIRMED:
+                    merge["reason"] = "LIFECYCLE_MISSING"
+        if proof is not None:
+            merge["proof"] = proof
+        async with self._steps.db.transaction() as s:
+            written = await TaskRepository(s).write_tracked_result(
+                tracked.execution_id, merge=merge, outcome=outcome, exit_code=exit_code, close=close,
+                terminated=terminated, stdout_tail=out, stderr_tail=err)
+            row = None if written else await TaskRepository(s).tracked_row(tracked.execution_id)
+        if not written:
+            # rowcount 0 is never success (6.1): re-read and classify; a row somebody else already proved is settled
+            verdict = classify_row(row.id, row.pid, row.finished_at, row.detail_text) if row is not None else None
+            log.warning("closing write of tracked execution %s matched no open row (now %s)", tracked.execution_id,
+                        verdict.row_class if verdict else "MISSING")

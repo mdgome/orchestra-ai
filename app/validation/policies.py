@@ -166,7 +166,7 @@ ROLE_PROVIDER = {
 }
 
 # --- Project diagnostics (read-only) -----------------------------------------------
-DIAGNOSTICS_POLICY_VERSION = 1             # part of the cache key: bump it when the set of checks changes
+DIAGNOSTICS_POLICY_VERSION = 2             # part of the cache key: bump it when the set of checks changes (2: causes, 14.3)
 DIAGNOSTICS_ITEM_TIMEOUT_SECONDS = 5.0     # one check: a subprocess, or one filesystem inspection
 DIAGNOSTICS_DEADLINE_SECONDS = 15.0        # the whole run; a check still pending is reported UNKNOWN
 DIAGNOSTICS_CACHE_TTL_SECONDS = 30.0
@@ -243,3 +243,155 @@ CHANGES_PAGE_MAX_LIMIT = 100
 SENSITIVE_PATH_PATTERNS = (".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*", "id_ed25519*", "id_ecdsa*",
                            "credentials*", "*.keystore", "*.jks", "secrets.*", ".netrc", ".npmrc", ".pypirc")
 CHANGES_RESPONSE_MAX_BYTES = 2 * 1024 * 1024    # a whole /changes answer: the diff bodies (<= CHANGES_TOTAL_DIFF_MAX_BYTES) plus a page
+
+# --- B2 process lifecycle hardening (docs/design/process-lifecycle-hardening.md, 9.2 - 9.4) ---------------------------
+# Every constant below is a code literal: no environment variable and no Settings field overrides it. All defaults are
+# design defaults proposed by the design (none is verified on a real host). Relations between them are checked together
+# by validate_process_timing_limits(), validate_process_input_constants() and validate_process_risk_limits() when the
+# Runner is constructed (validate_process_policy()); nothing here is read by a behaviour yet except those validators.
+
+# Orphan sweeper (9.2).
+ORPHAN_SWEEP_BATCH_ROWS = 50                     # rows per pass (U and A together)
+ORPHAN_SWEEP_PASS_SECONDS = 60                   # budget of one pass
+ORPHAN_SWEEP_INTERVAL_SECONDS = 30.0             # between two passes
+ORPHAN_SWEEP_BACKOFF_MIN_SECONDS = 30.0          # delay after the first failed pass
+ORPHAN_SWEEP_BACKOFF_MAX_SECONDS = 300.0         # cap of the exponential backoff
+ORPHAN_SWEEP_LOG_THROTTLE_SECONDS = 300.0
+ORPHAN_SWEEP_MAX_INTERVAL_SECONDS = 86400.0      # ceiling of every sweeper retry/throttle interval (exactly this value)
+ORPHAN_SWEEP_CONFIG_FALLBACK_SECONDS = 86400.0   # retry wait after SWEEP_CONFIG_INVALID (exactly the ceiling)
+ORPHAN_SWEEP_STARTUP_WAIT_SECONDS = 10           # startup recovery waits for the first pass
+ORPHAN_SWEEP_STALL_THRESHOLD = 5                 # consecutive failed passes before SWEEPER_STALLED (1..1000)
+ORPHAN_SWEEP_BACKOFF_EXPONENT_CAP = 16           # exponent cap before the power (0..62)
+
+# Background supervisor and components (9.2, 9.3).
+BACKGROUND_COMPONENT_SETTLE_TIMEOUT_SECONDS = 15.0
+BACKGROUND_READY_TIMEOUT_SECONDS = 5.0
+BACKGROUND_RECOVERY_SETTLE_MARGIN_SECONDS = 5.0
+BACKGROUND_RESTART_BACKOFF_BASE_SECONDS = 5.0
+BACKGROUND_RESTART_BACKOFF_CAP_SECONDS = 60.0
+BACKGROUND_RESTART_BACKOFF_EXPONENT_CAP = 10     # 0..62
+BACKGROUND_MAX_RESTARTS = 5                      # consecutive failures per component (1..100)
+BACKGROUND_STABLE_SECONDS = 300.0
+BACKGROUND_RESTART_WINDOW_SECONDS = 3600.0
+BACKGROUND_RESTART_WINDOW_MAX = 10               # 1..1000
+BACKGROUND_WAKEUP_DEBOUNCE_SECONDS = 5.0
+BACKGROUND_MIN_INTERVAL_SECONDS = 0.1            # floor of every loop/retry/throttle/debounce interval (fixed literal 0.1)
+BACKGROUND_DB_CONCURRENCY = 1                    # 1..8
+BACKGROUND_COMPONENT_IDS = ("sweeper", "risk-worker", "capability")
+
+# Process-tracking capability (6.2).
+CAPABILITY_REFRESH_SECONDS = 10
+CAPABILITY_WRITE_TIMEOUT_SECONDS = 5
+CAPABILITY_TTL_SECONDS = 30
+
+# Tracked command execution (5.1, 9).
+PUMP_DRAIN_SECONDS = 5
+TRACKED_IDENTITY_PERSIST_TIMEOUT_SECONDS = 10
+TREE_SETTLE_POLL_SECONDS = 1.0
+JOB_CLOSE_SETTLE_SECONDS = 2.0
+JOB_TERMINATE_EXIT_CODE = 0x4B494C4C             # 1263094860, ASCII "KILL"; 1 .. 2147483647
+# Polling granularity of the executor (phase 2; the design leaves these two intervals undefined, 5.1 step 8/9, 9).
+EXECUTOR_POLL_SECONDS = 0.1                      # root-exit / cancel / timeout / idle tick (> 0, finite)
+JOB_POLL_INTERVAL_SECONDS = 0.05                 # ActiveProcesses polling interval (> 0, finite)
+
+# Operator risk acceptance worker (7.5 item 5).
+PROCESS_RISK_IDLE_INTERVAL_SECONDS = 15
+PROCESS_RISK_ROW_OVERHEAD_SECONDS = 3
+PROCESS_RISK_ROW_TIMEOUT_SECONDS = 10
+PROCESS_RISK_DB_OVERHEAD_SECONDS = 20
+PROCESS_RISK_REQUEST_TIMEOUT_SECONDS = 120
+PROCESS_RISK_PASS_OVERHEAD_SECONDS = 20
+PROCESS_RISK_PASS_SECONDS = 150
+PROCESS_RISK_CLAIM_MARGIN_SECONDS = 120
+PROCESS_RISK_CLAIM_TIMEOUT_SECONDS = 300
+PROCESS_RISK_BACKOFF_BASE_SECONDS = 5
+PROCESS_RISK_BACKOFF_CAP_SECONDS = 60
+PROCESS_RISK_MAX_ATTEMPTS = 5
+PROCESS_RISK_BATCH_REQUESTS = 4
+PROCESS_RISK_BATCH_ROWS = 32
+PROCESS_RISK_MAX_TARGETS = 8                     # 1 .. PROCESS_RISK_TARGETS_DB_LIMIT
+PROCESS_RISK_TARGETS_DB_LIMIT = 500              # schema-fixed: the cardinality CHECK of migration 0005
+PROCESS_RISK_NORMAL_UNRESOLVED_PER_TASK = 1
+PROCESS_RISK_TARGET_LOCK_SECONDS = 3
+PROCESS_RISK_TARGET_LOCK_STATEMENT_TIMEOUT_SECONDS = 2
+PROCESS_RISK_TARGET_LOCK_WAIT_TIMEOUT_SECONDS = 1
+
+# Recheck rate limit (7.5 item 8).
+PROCESS_RECHECK_COOLDOWN_BASE_SECONDS = 60
+PROCESS_RECHECK_COOLDOWN_CAP_SECONDS = 900
+PROCESS_RECHECK_WINDOW_SECONDS = 3600
+PROCESS_RECHECK_MAX_PER_WINDOW = 4
+
+# Diagnostics thresholds (14.1).
+TRACKED_EXECUTION_MAX_AGE_SECONDS = 3660         # MAX_CLI_TIMEOUT_SECONDS + a fixed margin of 60 s (live sum is the minimum)
+PROCESS_RISK_REQUEST_STALE_SECONDS = 165         # PROCESS_RISK_IDLE_INTERVAL_SECONDS + PROCESS_RISK_PASS_SECONDS
+DIAGNOSTIC_MAX_ANOMALIES = 50
+DIAGNOSTIC_MAX_RELATED_IDS = 50                  # ids named by one diagnostics cause (14.1): bounded like the anomaly list
+DIAGNOSTIC_TRACKED_PROJECT_ROWS = 50             # process-risk requests read for one project diagnosis
+
+# Candidate scan (7.4).
+CANDIDATE_PAGE_ROWS = 50
+CANDIDATE_MAX_SCANNED_ROWS = 1000
+CANDIDATE_SCAN_MAX_SECONDS = 5
+CANDIDATE_PAGE_STATEMENT_TIMEOUT_SECONDS = 2
+
+# --- Schema-fixed input constants (9.3): the same numbers are written into migration 0005 ---------------------------
+REQUESTED_BY_MAX_LENGTH = 128                    # exactly 128: CHECK char_length(requested_by) BETWEEN 1 AND 128
+REQUESTED_BY_PATTERN = r"[A-Za-z0-9._@:+-]+"     # full match after trimming
+PROCESS_RISK_RATIONALE_MAX_LENGTH = 2000         # exactly 2000: CHECK char_length(rationale) BETWEEN 1 AND 2000
+DETAIL_SCHEMA_VERSION = 1
+DISPOSITION_KIND_RISK_ACCEPTED = "OPERATOR_RISK_ACCEPTED"
+
+# The nine detail keys that only the B2 tracked writers write (6.1); the SQL predicates are rendered from this one set.
+TRACKED_ONLY_KEYS = frozenset({"v", "runner_process", "checkpoint_step_key", "proof", "disposition", "reason_code",
+                               "risk_acceptance", "anomaly_original", "anomaly_settlement"})
+
+
+@dataclass(frozen=True)
+class RiskAcceptanceField:
+    key: str
+    required: bool
+    json_type: str                            # the jsonb_typeof of the value
+    allowed: tuple[str, ...] | None = None    # a closed value set, when the schema has one
+
+
+# The one definition of the risk_acceptance record (7.5 item 7): the SQL text, the classifier and the tests follow it.
+RISK_ACCEPTANCE_SCHEMA = (
+    RiskAcceptanceField("approval_id", True, "string"),
+    RiskAcceptanceField("execution_id", True, "string"),
+    RiskAcceptanceField("pid", True, "number"),
+    RiskAcceptanceField("create_time", True, "number"),
+    RiskAcceptanceField("last_verdict", True, "string", ("UNCLEAR",)),
+    RiskAcceptanceField("requested_at", True, "string"),
+    RiskAcceptanceField("rationale", True, "string"),
+    RiskAcceptanceField("reverify_result", True, "string",
+                        ("UNKNOWN", "ACCESS_DENIED", "OTHER_HOST", "H3_DISABLED", "IDENTITY_RECORD_MISSING")),
+    RiskAcceptanceField("applied_at", True, "string"),
+    RiskAcceptanceField("requested_by", False, "string"),
+)
+RISK_ACCEPTANCE_REQUIRED_KEYS = frozenset(f.key for f in RISK_ACCEPTANCE_SCHEMA if f.required)
+RISK_ACCEPTANCE_UUID_RE = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+RISK_ACCEPTANCE_TS_RE = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,6})?Z$"
+RISK_ACCEPTANCE_REQUESTED_BY_RE = rf"^[A-Za-z0-9._@:+-]{{1,{REQUESTED_BY_MAX_LENGTH}}}$"
+# Every control character except newline and tab, U+2028, U+2029 and the bidirectional controls. The low ranges stay
+# regex escapes (PostgreSQL and Python both read \uXXXX); the high ones are the literal characters, as in the design.
+RISK_ACCEPTANCE_RATIONALE_FORBIDDEN = ("[\u0001-\u0008\u000B-\u001F\u007F-\u009F"
+                                       "\u2028\u2029\u202a-\u202e\u2066-\u2069]")
+
+# --- B2 phase 3: tracked-row settlement (design 6.1, 7.2, 8) ------------------------------------------------------------
+PROCESS_TRACKING_UNAVAILABLE = "PROCESS_TRACKING_UNAVAILABLE"       # FailClosed message / Task failure code (6.2, 7.2 item 6)
+PROOF_JOB_EMPTY = "JOB_EMPTY"
+PROOF_JOB_KILL_ON_CLOSE_ASSUMED = "JOB_KILL_ON_CLOSE_ASSUMED"
+PROOF_NEVER_RAN = "NEVER_RAN"
+POSITIVE_PROOFS = (PROOF_JOB_EMPTY, PROOF_JOB_KILL_ON_CLOSE_ASSUMED, PROOF_NEVER_RAN)
+# SPAWN_FAILED reasons that are infrastructure failures (7.2 item 6): the Task fails closed, it is never a "failed test".
+# SPAWN_OSERROR (the OS refused the spawn) stays a normal ERROR outcome as today.
+TRACKED_INFRA_SPAWN_REASONS = frozenset({"JOB_CREATE_FAILED", "JOB_ASSIGN_FAILED", "IDENTITY_UNAVAILABLE",
+                                         "IDENTITY_PERSIST_FAILED", "IDENTITY_FENCED", "RESUME_FAILED"})
+TRACKED_RESULT_MISSING = "RESULT_MISSING"
+TRACKED_SUSPENDED_ORPHAN_POSSIBLE = "SUSPENDED_ORPHAN_POSSIBLE"
+TRACKED_SPAWNED_PROCESS_UNPROVEN = "SPAWNED_PROCESS_UNPROVEN"   # pid IS NULL but the row records an unproven spawned process
+TRACKED_DEGRADE_UNTRACKED_PLATFORM = "UNTRACKED_PLATFORM"
+# Decision H3 (8): "the Job dies with its owner" is a conditional OS guarantee; False turns the policy off, so every crash of a
+# Runner with a recorded pid ends in TERMINATION_UNCONFIRMED. A code literal, like every constant of this block.
+JOB_KILL_ON_CLOSE_ASSUMPTION_ENABLED = True

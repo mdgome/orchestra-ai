@@ -12,9 +12,12 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from app.infra.command_executor import CommandExecutor, CommandSpec
-from app.models.states import CliOutcome
+from app.infra.command_executor import CommandExecutor, CommandResult, CommandSpec, TrackedRun
+from app.models.states import CliOutcome, ProcessLifecycle
 from app.services.hashing import stable_hash
+from app.services.step_runner import (
+    ProcessTrackingUnavailable, TaskCancelled, TerminationUnconfirmed, TrackedCommandPort,
+)
 from app.validation import policies as P
 
 
@@ -29,6 +32,7 @@ class TestRunResult:
     outcomes: list[str] = field(default_factory=list)
     output_tail: str = ""
     junit_ok: bool = False
+    tracking: str | None = None      # "UNTRACKED_PLATFORM" when the commands ran untracked (B2 degrade); never in to_dict()
 
     def to_dict(self) -> dict:
         return {"passed": self.passed, "reason": self.reason, "executed": self.executed, "skipped": self.skipped,
@@ -108,27 +112,96 @@ def _argv(command: list[str]) -> list[str]:
     return [sys.executable if command[0] == "python" else command[0], *command[1:]]
 
 
+async def _shielded(coro) -> None:
+    """Runs `coro` to completion even when this coroutine is cancelled meanwhile; the cancellation is re-raised afterwards."""
+    task = asyncio.ensure_future(coro)
+    cancelled: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            if task.done():
+                break
+            cancelled = cancelled or exc
+    if task.exception() is not None:
+        raise task.exception()
+    if cancelled is not None:
+        raise cancelled
+
+
 class TestPolicyService:
     __test__ = False  # not a pytest class
 
     def __init__(self, executor: CommandExecutor):
         self._executor = executor
 
-    async def collect_ids(self, cwd: Path, policy: dict, workspace_root: Path | None = None) -> set[str] | None:
-        """pytest --collect-only node ids; None when collection itself fails."""
+    # --- tracked commands (B2, design 7.1, 7.2) ---------------------------------------------------------------
+    async def _execute(self, spec: CommandSpec, port: TrackedCommandPort | None) -> CommandResult:
+        """One command. Without a port, exactly today's untracked run. With one, the command is registered, run with its
+        TrackedRun, the row is closed in a shielded `finally`, and the outcome is mapped (7.2) AFTER the row is settled."""
+        if port is None or not self._executor.tracking_enabled:
+            return await self._executor.run(spec)             # no port, or POSIX: untracked (the executor degrades)
+        port.check_capability()
+        tracked, on_started = await port.begin_command()
+        raised: BaseException | None = None
+        try:
+            run = await self._executor.run(spec, tracked=tracked, on_started=on_started)
+        except BaseException as exc:      # noqa: BLE001 - CancelledError included: the row is closed first
+            raised = exc
+            raise
+        finally:
+            await _shielded(port.finish_command(tracked, raised))
+        self._raise_for(run, tracked, port)
+        return run
+
+    @staticmethod
+    def _raise_for(run: CommandResult, tracked: TrackedRun, port: TrackedCommandPort) -> None:
+        if run.lifecycle is ProcessLifecycle.TERMINATION_UNCONFIRMED:
+            raise TerminationUnconfirmed(
+                f"test command termination not confirmed ({run.termination})", execution_id=tracked.execution_id,
+                checkpoint_step_key=port.checkpoint_step_key)        # the row stays open; nothing is parsed as a pass
+        if run.outcome is CliOutcome.CANCELLED:
+            raise TaskCancelled("cancelled")                         # after the row is closed: never a failed test
+        if run.spawn_failed and run.reason in P.TRACKED_INFRA_SPAWN_REASONS:
+            raise ProcessTrackingUnavailable(details={"reason": run.reason})
+
+    async def _group(self, port: TrackedCommandPort | None, work):
+        """Runs `work()` inside the cancel scope of the group, with the Task-cancel watcher attached."""
+        if port is None or not self._executor.tracking_enabled:
+            return await work()
+        watcher = asyncio.create_task(port.watch_cancel(self._executor.cancel))
+        try:
+            with self._executor.tracked_scope(port.scope_key):
+                return await work()
+        finally:
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+
+    async def collect_ids(self, cwd: Path, policy: dict, workspace_root: Path | None = None,
+                          tracked: TrackedCommandPort | None = None) -> set[str] | None:
+        """pytest --collect-only node ids; None when collection itself fails (or times out). With `tracked` the command runs as
+        a tracked command: an unconfirmed termination raises TerminationUnconfirmed, a cancel raises TaskCancelled."""
         base = _argv(policy["commands"][0])
         if base[1:3] != ["-m", "pytest"]:
             return None
-        res = await self._executor.run(CommandSpec(
+        spec = CommandSpec(
             argv=[base[0], "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider"], cwd=cwd,
             timeout_seconds=policy["timeout_seconds"], idle_seconds=None, workspace_root=workspace_root,
-            drop_cli_auth=True))
+            drop_cli_auth=True)
+        res = await self._group(tracked, lambda: self._execute(spec, tracked))
         if res.outcome is not CliOutcome.SUCCESS:
             return None
         return {line.strip() for line in res.stdout.splitlines() if "::" in line}
 
-    async def run(self, cwd: Path, policy: dict, workspace_root: Path | None = None) -> TestRunResult:
+    async def run(self, cwd: Path, policy: dict, workspace_root: Path | None = None,
+                  tracked: TrackedCommandPort | None = None) -> TestRunResult:
         result = TestRunResult(passed=False, reason="not run")
+        if tracked is not None and not self._executor.tracking_enabled:
+            result.tracking = P.TRACKED_DEGRADE_UNTRACKED_PLATFORM
+        return await self._group(tracked, lambda: self._run(cwd, policy, workspace_root, tracked, result))
+
+    async def _run(self, cwd: Path, policy: dict, workspace_root: Path | None, tracked: TrackedCommandPort | None,
+                   result: TestRunResult) -> TestRunResult:
         pattern = policy["junit_path"]
         # Result files are NEVER deleted (target/, build/, reports/ belong to the user): note what exists now and
         # accept only files that are new or changed once the commands have run.
@@ -136,10 +209,10 @@ class TestPolicyService:
         env = {name: os.environ[name] for name in policy.get("env_allow", []) if name in os.environ}   # exact names
         tails = []
         for command in policy["commands"]:
-            run = await self._executor.run(CommandSpec(argv=_argv(command), cwd=cwd,
-                                                       timeout_seconds=policy["timeout_seconds"], idle_seconds=None,
-                                                       extra_env=env, workspace_root=workspace_root,
-                                                       drop_cli_auth=True))
+            run = await self._execute(CommandSpec(argv=_argv(command), cwd=cwd,
+                                                  timeout_seconds=policy["timeout_seconds"], idle_seconds=None,
+                                                  extra_env=env, workspace_root=workspace_root,
+                                                  drop_cli_auth=True), tracked)
             result.exit_codes.append(run.exit_code)
             result.outcomes.append(str(run.outcome))
             tails.append((run.stdout + run.stderr)[-1500:])

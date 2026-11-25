@@ -11,22 +11,31 @@ Dispatch is bounded: a free slot is checked BEFORE claiming, so a claimed reques
 requests live in a registry; a done-callback collects the exception, frees the slot and wakes the loop.
 """
 import asyncio
+import contextlib
 import enum
+import itertools
+import json
 import logging
 import os
 import socket
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncConnection, async_sessionmaker
 
 from app.db import Database
+from app.infra.process_control import platform_supports_tracking, run_tracking_self_test
 from app.models.states import ApprovalType, StepState, TaskState, TERMINAL_TASK_STATES
 from app.models.tables import ExecutionRequest, Task
 from app.repositories.approval_repository import ExecutionRequestRepository
+from app.repositories.runtime_capability_repository import RuntimeCapabilityRepository
 from app.repositories.task_repository import TaskRepository
+from app.services.background_supervisor import (
+    COMPONENT_IDS, CODE_READY_TIMEOUT, SUPERVISOR_ID, BackgroundSupervisor, HostView, Origin, TaskCancelReason, UnitState,
+    Verdict as CreateVerdict, settle_tasks)
 from app.services.human_gate_service import HumanGateService
 from app.services.lease_service import AcquireStatus, Lease, LeaseService
 from app.services.recovery_transaction import (
@@ -36,9 +45,13 @@ from app.services.recovery_transaction import (
 from app.services.request_backoff import defer_delay
 from app.services.session_service import SessionService
 from app.services.state_service import change_step_state, change_task_state
+from app.services.sweeper_stall import (
+    CANDIDATE, PAGE_AFTER, SWEEP_NO_PROGRESS, SweeperConfigInvalidSnapshot, SweeperStallSnapshot, SweeperStallState,
+    backoff_delay)
 from app.services.workflow_service import WorkflowService
 from app.validation import policies as P
-from app.validation.validators import validate_recovery_timeouts
+from app.validation.validators import (
+    SweeperPassPolicy, build_background_policy, build_sweeper_pass_policy, validate_recovery_timeouts)
 
 log = logging.getLogger(__name__)
 
@@ -52,13 +65,45 @@ class RunnerStopIncomplete(RuntimeError):
     registry are KEPT: a live coroutine (a task, or a recovery transaction) may still change the database or a
     workspace, so the lock must not be reported as released. Call stop() again."""
 
-    def __init__(self, run_ids: list[str], recovery: str | None = None):
+    def __init__(self, run_ids=(), recovery: str | None = None, *, components=()):
+        run_ids, components = tuple(run_ids), tuple(components)
         what = [f"{len(run_ids)} task(s) are still running after the shutdown grace period"] if run_ids else []
+        if components:
+            what.append(f"{len(components)} background unit(s) are unsettled ({', '.join(components)})")
         if recovery:
             what.append(f"request recovery is unsettled ({recovery})")
         super().__init__("; ".join(what) or "the Runner could not settle its resources")
         self.run_ids = run_ids
         self.recovery = recovery
+        self.components = components          # canonical ids (SUP-24): never a run id
+        self.cleanup_errors: tuple[BaseException, ...] = ()
+
+
+class BackgroundReadyTimeout(RuntimeError):
+    """SUP-20: a required unit missed its READY boundary (the entry point of its task) within the READY timeout."""
+
+
+class ConfigWakeResult(enum.Enum):
+    """SUP-30 / RV-3: the result of `_recheck_sweeper_configuration`, in the order of its precedence."""
+    STALE_GENERATION = "STALE_GENERATION"
+    NOT_RUNNING = "NOT_RUNNING"
+    STILL_INVALID = "STILL_INVALID"
+    NO_SWEEPER_TASK = "NO_SWEEPER_TASK"
+    NO_INVALID_STATE = "NO_INVALID_STATE"
+    ALREADY_PENDING = "ALREADY_PENDING"
+    WAKE_SCHEDULED = "WAKE_SCHEDULED"
+
+
+@dataclass(frozen=True)
+class PassOutcome:
+    """What one sweeper pass reports to the stall bookkeeping (the candidate scan itself is the phase-5 seam)."""
+    kind: str = "OK"                          # OK | FAILED | NO_PROGRESS
+    committed: object = None                  # the committed cursor after the pass (None = no cursor)
+    advanced: bool = False
+    wrapped: bool = False
+    code: str | None = None                   # a SWEEP_* failure code for FAILED
+    position: object = None
+    position_kind: str = PAGE_AFTER
 
 
 class RecoveryError(Exception):
@@ -163,6 +208,37 @@ class _InFlight:
     run_id: uuid.UUID | None = field(default=None)      # set once the lease exists (used by shutdown)
 
 
+@dataclass(eq=False)
+class StartContext:
+    """The per-generation start state (R31-6, SUP-19): the failed-start marker, the single `start_failed` signal, the startup
+    mutation gate and the startup registry. Never shared with another generation."""
+    generation: int
+    start_failed: "asyncio.Future"
+    mutation_done: asyncio.Event
+    aborting: bool = False                                   # a plain bool: set without the lifecycle lock (D31-3)
+    registry: dict = field(default_factory=dict)             # canonical id -> startup task (reaped on every failure path)
+    recovery_task: "asyncio.Task | None" = None
+    ready_task: "asyncio.Task | None" = None
+    first_pass: asyncio.Event = field(default_factory=asyncio.Event)    # the first sweeper pass (startup wait of _recover_rest)
+
+    def fail(self, exc: BaseException) -> None:
+        """Only the FIRST failure is the value; a later one is a note and never overwrites it (SUP-T T36)."""
+        if self.start_failed.done():
+            first = self.start_failed.exception() if not self.start_failed.cancelled() else None
+            if first is not None and first is not exc:
+                first.add_note(f"a later start failure: {exc!r}")
+            return
+        self.start_failed.set_exception(exc)
+
+    def discard(self) -> None:
+        """Retrieve the result exactly once and drop it; never `cancel()` a Future the supervisor may still complete."""
+        if self.start_failed.done() and not self.start_failed.cancelled():
+            self.start_failed.exception()
+
+
+_NO_SELF_TEST = object()
+
+
 class Runner:
     def __init__(self, db: Database, leases: LeaseService, workflow: WorkflowService, gates: HumanGateService,
                  cancel_providers: list, advisory_key: int, claim_timeout_seconds: int = 300,
@@ -172,9 +248,15 @@ class Runner:
                  shutdown_grace_seconds: float = P.DEFAULT_RUNNER_SHUTDOWN_GRACE_SECONDS,
                  recovery_statement_timeout_seconds: float = P.DEFAULT_RECOVERY_STATEMENT_TIMEOUT_SECONDS,
                  recovery_timeout_seconds: float = P.DEFAULT_RUNNER_RECOVERY_TIMEOUT_SECONDS,
-                 recovery_shutdown_wait_seconds: float = P.DEFAULT_RUNNER_RECOVERY_SHUTDOWN_WAIT_SECONDS):
+                 recovery_shutdown_wait_seconds: float = P.DEFAULT_RUNNER_RECOVERY_SHUTDOWN_WAIT_SECONDS,
+                 executor=None, capability_self_test=_NO_SELF_TEST, capability_enabled: bool | None = None,
+                 sweep_pass: Callable | None = None, risk_pass: Callable | None = None,
+                 supervisor_clock: Callable[[], float] | None = None, supervisor_sleep: Callable | None = None):
         validate_recovery_timeouts(recovery_statement_timeout_seconds, recovery_timeout_seconds,
                                    recovery_shutdown_wait_seconds)
+        # R31-9: ONE policy factory validates the whole linked set (a refused configuration changes no lifecycle) and builds
+        # the construction copies that every start, settle and supervisor path uses.
+        self._bg = build_background_policy(recovery_shutdown_wait_seconds)
         self.db, self.leases, self.workflow, self.gates = db, leases, workflow, gates
         self._recovery_statement_ms = int(recovery_statement_timeout_seconds * 1000)
         self._recovery_timeout = recovery_timeout_seconds
@@ -210,6 +292,28 @@ class Runner:
         self._recovery: _RecoveryCtx | None = None             # the registered, not yet reaped operation
         self._recovery_unsettled: RecoveryEvidence | None = None          # DB outcome of a MUTATION is UNCERTAIN
         self._recovery_cleanup_unsettled: RecoveryEvidence | None = None  # a session could not be confirmed released
+        # --- B2 background units (design 9.1) ---
+        self._executor = executor
+        self._ctx: StartContext | None = None                  # the context of the current (or last) generation
+        self._supervisor = BackgroundSupervisor(self._bg, self._host_view, clock=supervisor_clock, sleep=supervisor_sleep)
+        self._stall = SweeperStallState()                      # Runner-owned, in memory, kept across stop/start (row 31)
+        self._committed_cursor = None                          # the sweeper's cursors belong to the task (restart: first page)
+        self._sweeper_wake = asyncio.Event()
+        self._risk_wake = asyncio.Event()
+        self._sweep_pass_fn = sweep_pass                       # phase-5 seam: the candidate scan (None = nothing to sweep yet)
+        self._risk_pass_fn = risk_pass                         # phase-5 seam: the process-risk request worker
+        self._capability_enabled = platform_supports_tracking() if capability_enabled is None else capability_enabled
+        self._self_test = run_tracking_self_test if capability_self_test is _NO_SELF_TEST else capability_self_test
+        self._tracking_state = "UNKNOWN" if self._capability_enabled else "UNSUPPORTED_PLATFORM"
+        self._capability_value: dict | None = None             # the value of the current incarnation (None before the self-test)
+        self._incarnation_id: str | None = None
+        self._background_revision = 0                          # 14.3: see `background_revision`
+        self._background_fp: tuple | None = None
+        self._pass_count = itertools.count(1)
+        self._sleep = supervisor_sleep or asyncio.sleep
+        # BACKGROUND_DB_CONCURRENCY (9.1 item 7, R31-10 (a)): the three components share it, so at most this many of their DB
+        # sections hold a pool connection at once. Closing writes, dispatch and recovery never use it. Built at start().
+        self._db_slots = asyncio.Semaphore(self._bg.db_concurrency)
 
     @property
     def runner_id(self) -> str:
@@ -222,6 +326,65 @@ class Runner:
     @property
     def lifecycle(self) -> RunnerLifecycle:
         return self._state
+
+    # --- read-only views for the runtime status (phase 6 maps them to DTOs) -------------------------------------------
+    @property
+    def process_tracking_state(self) -> str:
+        """The capability of THIS incarnation (own memory, 6.2): SUPPORTED, UNAVAILABLE, UNSUPPORTED_PLATFORM or UNKNOWN."""
+        return self._tracking_state
+
+    @property
+    def supervisor_degraded(self) -> bool:
+        return self._supervisor.supervisor_degraded
+
+    @property
+    def background_degraded(self) -> bool:
+        return self._supervisor.status().background_degraded
+
+    def background_status(self):
+        return self._supervisor.status()
+
+    @property
+    def sweeper_stall(self) -> SweeperStallSnapshot:
+        return self._stall.snapshot()
+
+    @property
+    def sweeper_config_invalid(self) -> SweeperConfigInvalidSnapshot:
+        return self._stall.config_snapshot()
+
+    @property
+    def background_revision(self) -> int:
+        """The background-state revision of the diagnostics cache key (14.3): a non-negative int that grows only when a listed
+        value REALLY changed (component state and details, stall and configuration-invalid records, the supervisor DEGRADED
+        state) and never on a tick, a read or an unchanged re-evaluation. It is detected when it is read (a fingerprint of the
+        listed values, compared with the last one), which is synchronous: there is no await between the reads, so the
+        increment is atomic on the one event loop. The evaluation timestamps and the derived display values are NOT part of
+        the fingerprint (the derived-state set is its own part of the cache key)."""
+        fingerprint = self._background_fingerprint()
+        if self._background_fp is None:
+            self._background_fp = fingerprint
+        elif fingerprint != self._background_fp:
+            self._background_fp = fingerprint
+            self._background_revision += 1
+        return self._background_revision
+
+    def _background_fingerprint(self) -> tuple:
+        status = self._supervisor.status()
+        stall, config = self._stall.snapshot(), self._stall.config_snapshot()
+        config_part = (config.config_invalid_active, config.config_invalid_detected_at, config.config_invalid_trigger_position,
+                       config.config_invalid_next_retry_at, config.config_invalid_reasons, config.config_currently_valid,
+                       config.clearance_pending)                    # config_evaluated_at never bumps the revision
+        units = tuple((u.unit_id, u.state, u.reason_code, u.since, u.restart_exhausted, u.consecutive_failure_count,
+                       u.last_failure_code) for u in status.units)
+        return stall, config_part, units, status.supervisor_degraded
+
+    def last_failures(self) -> dict:
+        return self._supervisor.last_failures()
+
+    def _host_view(self) -> HostView:
+        ctx = self._ctx
+        aborting = bool(ctx is not None and ctx.aborting and ctx.generation == self._generation)
+        return HostView(self._state.value, self._generation, aborting)
 
     @property
     def recovery_unsettled(self) -> bool:
@@ -236,16 +399,27 @@ class Runner:
     # it is not re-entrant, so no settle coroutine calls a public start/stop/recover while holding it.
     async def start(self) -> None:
         """STOPPED -> STARTING -> RUNNING. Only a STOPPED, empty Runner may start (no implicit grace recovery).
-        A second start()/stop()/recover() issued during STARTING is refused immediately instead of queueing."""
+        A second start()/stop()/recover() issued during STARTING is refused immediately instead of queueing.
+
+        B2 order (SUP-19, one order): (1) the entry section, (2) the lock, the capability UNKNOWN upsert, the self-test and
+        the result upsert, (3) ONE synchronous section that creates the supervisor and the required components, (4) the
+        startup recovery as the task `startup-recovery`, (5) one wait over READY, the recovery, `start_failed` and a caller
+        cancellation, then the success boundary (SUP-21) under the lifecycle lock. Every failure path hands over
+        synchronously (marker + settling record) and `_fail_start` reaps the startup tasks inside its shielded settle task."""
         async with self._lifecycle_lock:
             if self._state is not RunnerLifecycle.STOPPED:
                 raise RuntimeError(f"Runner cannot start from {self._state.value}")
             if (self._inflight or self._lock_conn is not None or self._loop_task is not None
-                    or not self._recovery_clean()):
+                    or not self._recovery_clean() or not self._supervisor.registry_empty
+                    or any(not t.done() for t in self._startup_alive())):
                 raise RuntimeError("Runner is STOPPED but still holds resources")
             self._state = RunnerLifecycle.STARTING
             self._generation += 1
             self._wake.clear()
+            ctx = StartContext(self._generation, asyncio.get_running_loop().create_future(), asyncio.Event())
+            self._ctx = ctx
+            self._supervisor.begin_generation(ctx.generation, ctx.fail)          # the SUP-11 reset
+            self._db_slots = asyncio.Semaphore(self._bg.db_concurrency)          # not read on a live process: built at start
         local_conn: AsyncConnection | None = None            # until the lock is held, start() owns this connection
         try:
             local_conn = await self.db.engine.connect()
@@ -254,21 +428,212 @@ class Runner:
             if not got:
                 raise RunnerAlreadyActive("another Runner process already holds the runner lock")
             self._lock_conn = local_conn                     # from here on the Runner field owns the cleanup
-            await self.recover(startup=True)                 # re-checks STARTING + lock held, under the lifecycle lock
-            async with self._lifecycle_lock:
-                self._loop_task = asyncio.create_task(self._loop())
-                self._state = RunnerLifecycle.RUNNING
+            await self._publish_capability()                 # UNKNOWN upsert, self-test, result upsert (R31-11)
+            await self._create_startup_units(ctx)            # step 3: one synchronous section
+            ctx.recovery_task = asyncio.create_task(self._startup_recovery(ctx), name="startup-recovery")
+            ctx.registry["startup-recovery"] = ctx.recovery_task
+            ctx.ready_task = asyncio.create_task(self._wait_ready(ctx), name="startup-ready")
+            ctx.registry["startup-ready"] = ctx.ready_task
+            await self._await_start(ctx)
         except BaseException as exc:
-            await self._fail_start(local_conn, exc)          # always raises
+            self._start_hand_off(ctx)                        # synchronous: marker, last_failure rows 8/9, settling record
+            await self._fail_start(local_conn, exc, ctx)     # always raises
             raise
 
-    async def _fail_start(self, local_conn: AsyncConnection | None, original: BaseException) -> None:
+    def _startup_alive(self) -> list:
+        ctx = self._ctx
+        return list(ctx.registry.values()) if ctx is not None else []
+
+    # --- capability publication (6.2, R31-11) -------------------------------------------------------------------------
+    async def _publish_capability(self) -> None:
+        """UNKNOWN upsert (mandatory: a failure fails the start closed), the self-test (a thread: it blocks), the result upsert
+        for the SAME incarnation only. `lock_backend_pid` is read on `_lock_conn` itself (R31-11). POSIX publishes nothing."""
+        self._capability_value = None
+        if not self._capability_enabled:
+            return
+        self._incarnation_id = uuid.uuid4().hex
+        pid = (await self._lock_conn.execute(text("select pg_backend_pid()"))).scalar()
+        base = {"incarnation_id": self._incarnation_id, "lock_backend_pid": pid, "host": socket.gethostname(),
+                "pid": os.getpid(), "reason_code": None}
+        async with self.db.transaction() as s:
+            await RuntimeCapabilityRepository(s).upsert(
+                "process_tracking", {**base, "state": "UNKNOWN", "checked_at": datetime.now(UTC).isoformat()})
+        self._tracking_state = "UNKNOWN"
+        try:
+            result = await asyncio.to_thread(self._self_test)
+            state, reason = result.state.value, result.reason_code
+        except Exception as exc:  # noqa: BLE001 - a crashing self-test is an unavailable environment, never a failed start
+            log.error("the process-tracking self-test raised %r", exc)
+            state, reason = "UNAVAILABLE", P.PROCESS_TRACKING_UNAVAILABLE
+        self._tracking_state = state
+        self._capability_value = {**base, "state": state, "reason_code": reason}
+        await self._write_capability()                       # step (4); a failed write leaves UNKNOWN, retried by the refresh
+
+    async def _write_capability(self) -> bool:
+        value = self._capability_value
+        if value is None:
+            return False
+        try:
+            async with self.background_db_section():
+                async with self.db.transaction() as s:
+                    return await asyncio.wait_for(
+                        RuntimeCapabilityRepository(s).upsert(
+                            "process_tracking", {**value, "checked_at": datetime.now(UTC).isoformat()},
+                            expected_incarnation_id=value["incarnation_id"]),
+                        timeout=self._bg.capability_write_timeout_seconds)
+        except Exception as exc:  # noqa: BLE001 - logged and retried on the next tick (the TTL then expires)
+            log.warning("the capability write failed: %r", exc)
+            return False
+
+    # --- startup units ------------------------------------------------------------------------------------------------
+    @contextlib.asynccontextmanager
+    async def background_db_section(self):
+        """The DB sections of the components (capability refresh, a sweeper or risk-worker pass body) run inside this: a shared
+        semaphore of BACKGROUND_DB_CONCURRENCY slots, waiting cancellable, released on every exit. Keep the section to short
+        transactions; never hold it across OS work or a sleep."""
+        async with self._db_slots:
+            yield
+
+    def _unit_factories(self) -> dict:
+        return {"sweeper": self._sweeper_body, "risk-worker": self._risk_body, "capability": self._capability_body}
+
+    async def _create_startup_units(self, ctx: StartContext) -> None:
+        """SUP-19 step 3: under the lifecycle lock, no await inside; checks the lifecycle, the generation and the marker."""
+        async with self._lifecycle_lock:
+            if (self._state is not RunnerLifecycle.STARTING or ctx.generation != self._generation or ctx.aborting):
+                raise RuntimeError("the startup units cannot be created: the start is no longer current")
+            task = self._supervisor.create_supervisor(ctx.generation)
+            ctx.registry[SUPERVISOR_ID] = task
+            for uid, factory in self._unit_factories().items():
+                verdict = self._supervisor.ensure_component(uid, factory, Origin.START, ctx.generation)
+                if verdict is not CreateVerdict.CREATED:
+                    raise RuntimeError(f"the component {uid} was refused at creation: {verdict.value}")
+                ctx.registry[uid] = self._supervisor.units[uid].task
+
+    async def _startup_recovery(self, ctx: StartContext) -> None:
+        """The explicit task of SUP-19 step 4: calls `self.recover(startup=True)` THROUGH THE INSTANCE ATTRIBUTE (tests replace
+        it). Setter 2 of `startup_mutation_done` (R31-4): a normal return, under the common set condition."""
+        await self.recover(startup=True)
+        self._set_mutation_done(ctx)
+
+    def _set_mutation_done(self, ctx: StartContext) -> bool:
+        """The common set condition (D35-3): the current generation, a valid STARTING lifecycle and `_start_aborting` false.
+        An already-set event stays set; it is never reset and never decides whether a start succeeded."""
+        if ctx.mutation_done.is_set():
+            return True
+        if ctx.generation == self._generation and self._state is RunnerLifecycle.STARTING and not ctx.aborting:
+            ctx.mutation_done.set()
+            return True
+        return False
+
+    async def _wait_ready(self, ctx: StartContext) -> list[str]:
+        """SUP-20: one bounded wait for every required READY event (the deadlines run concurrently, so the phase is bounded by
+        one timeout). Returns the ids that missed it."""
+        waits = {}
+        sup_ready = self._supervisor.supervisor_ready
+        if sup_ready is not None:
+            waits[SUPERVISOR_ID] = asyncio.ensure_future(sup_ready.wait())
+        for uid in COMPONENT_IDS:
+            ev = self._supervisor.units[uid].ready_event
+            if ev is not None:
+                waits[uid] = asyncio.ensure_future(ev.wait())
+        try:
+            if waits:
+                await asyncio.wait(set(waits.values()), timeout=self._bg.ready_timeout_seconds)
+            return [name for name in (SUPERVISOR_ID, *COMPONENT_IDS) if name in waits and not waits[name].done()]
+        finally:
+            for w in waits.values():
+                if not w.done():
+                    w.cancel()
+
+    async def _await_start(self, ctx: StartContext) -> None:
+        """SUP-19 step 5 and the success boundary. Raises the failure of the lowest SUP-21 group; returns on success."""
+        sup = self._supervisor
+        while True:
+            if not (ctx.recovery_task.done() and ctx.ready_task.done()) and not ctx.start_failed.done():
+                watch = {w for w in (ctx.start_failed, ctx.recovery_task, ctx.ready_task) if not w.done()}
+                await asyncio.wait(watch, return_when=asyncio.FIRST_COMPLETED)
+            if ctx.start_failed.done():                                           # group 2 (B3): the recorded first failure
+                raise ctx.start_failed.exception()
+            ended = sup.ended_required()                                          # group 4 (B4, B5)
+            if ended:
+                raise sup.first_exit_error(ended[0])
+            if ctx.ready_task.done():
+                missed = ctx.ready_task.result() if not ctx.ready_task.cancelled() else []
+                if missed:                                                        # group 5 (B6)
+                    for uid in missed:
+                        if uid != SUPERVISOR_ID:
+                            sup.record_last_failure(uid, CODE_READY_TIMEOUT, ctx.generation, sup.units[uid].identity)
+                    raise BackgroundReadyTimeout(f"{CODE_READY_TIMEOUT}: {missed[0]}")
+            if ctx.recovery_task.done():                                          # group 6 (B10)
+                if ctx.recovery_task.cancelled():
+                    err = RuntimeError("the startup recovery was cancelled without a request")
+                    err.__cause__ = asyncio.CancelledError()
+                    raise err
+                if ctx.recovery_task.exception() is not None:
+                    raise ctx.recovery_task.exception()                           # the SAME exception object
+            if ctx.recovery_task.done() and ctx.ready_task.done():
+                break
+        await self._publish_running(ctx)
+
+    def _boundary_problems(self, ctx: StartContext) -> tuple[int, BaseException] | None:
+        """Table SUP-B (B1 to B10), every item in one synchronous read; returns (group, error) of the lowest failing group."""
+        sup = self._supervisor
+        found: list[tuple[int, BaseException]] = []
+        if ctx.aborting:
+            found.append((2, RuntimeError("the start is aborting (_start_aborting)")))                       # B9 / B7
+        if ctx.start_failed.done():
+            found.append((2, ctx.start_failed.exception() or RuntimeError("start failed")))                  # B3
+        if self._state is not RunnerLifecycle.STARTING:
+            found.append((3, RuntimeError(f"the lifecycle is {self._state.value}, not STARTING (defect)")))  # B1
+        if ctx.generation != self._generation:
+            found.append((3, RuntimeError("the generation changed during the start (defect)")))               # B2
+        ended = sup.ended_required()                                                                         # B4, B5
+        if ended:
+            found.append((4, sup.first_exit_error(ended[0])))
+        missing = [n for n in COMPONENT_IDS if sup.units[n].task is None or not sup.units[n].ready_seen]     # B5, B6
+        if sup.supervisor_task is None or sup.supervisor_ready is None or not sup.supervisor_ready.is_set():
+            missing.insert(0, SUPERVISOR_ID)
+        if missing and not ended:
+            found.append((5, BackgroundReadyTimeout(f"{CODE_READY_TIMEOUT}: {missing[0]}")))
+        rec = ctx.recovery_task
+        if rec is None or not rec.done() or rec.cancelled() or rec.exception() is not None:                  # B10
+            found.append((6, RuntimeError("the startup recovery is not done without error")))
+        conn = self._lock_conn
+        if conn is None or getattr(conn, "closed", False) or not self._recovery_clean():                     # B8
+            found.append((7, RuntimeError("the lock connection or the start resources are not valid")))
+        return min(found, key=lambda f: f[0]) if found else None
+
+    async def _publish_running(self, ctx: StartContext) -> None:
+        async with self._lifecycle_lock:
+            problem = self._boundary_problems(ctx)
+            if problem is None:
+                ctx.registry.clear()                          # R31-7: startup-only entries dropped; the supervisor keeps its own
+                self._supervisor.clear_last_failures()        # SUP-LF row 7, in the publishing critical section
+                ctx.discard()
+                self._loop_task = asyncio.create_task(self._loop())
+                self._state = RunnerLifecycle.RUNNING
+        if problem is not None:
+            raise problem[1]
+
+    def _start_hand_off(self, ctx: StartContext) -> None:
+        """SUP-19 step 6: SYNCHRONOUS, no await. The marker, the audit records of the required tasks that abnormally exited
+        (SUP-LF rows 8 and 9, written BEFORE the settling record because a recorded FAILED_START would read as normal) and
+        the settling record of SUP-22 in the same section."""
+        ctx.aborting = True
+        self._supervisor.observe_ended_required(ctx.generation)
+        self._supervisor.record_settling(TaskCancelReason.FAILED_START)
+
+    async def _fail_start(self, local_conn: AsyncConnection | None, original: BaseException,
+                          ctx: StartContext | None = None) -> None:
         """Settles a failed start and raises the right error. Priority: an original start error stays the main error
         (cleanup problems become notes); a CancelledError is never swallowed — a cancellation that is the original
         error stays final, a cancellation that arrives while cleaning up becomes final and keeps the start error and the
         cleanup errors as its cause. Further cancellations only add a note."""
-        settle = asyncio.ensure_future(self._settle_failed_start(local_conn))
+        settle = asyncio.ensure_future(self._settle_failed_start(local_conn, ctx))
         cancels = await self._wait_shielded(settle)
+        if ctx is not None:
+            ctx.discard()
         if settle.cancelled():
             problems: list[BaseException] = []
         elif settle.exception() is not None:
@@ -293,19 +658,49 @@ class Runner:
             raise final
         raise final from _combine(causes)
 
-    async def _settle_failed_start(self, local_conn: AsyncConnection | None) -> list[BaseException]:
+    async def _settle_startup(self, ctx: StartContext | None) -> list[str]:
+        """SUP-19 steps 7 and 8, inside the settle task: cancel every startup task that is not done and await them, the
+        component set under the common deadline and `startup-recovery` under its own (R31-8). Returns the unsettled ids."""
+        comp_extra, rec = {}, {}
+        if ctx is not None:
+            for name, task in ctx.registry.items():
+                if name == "startup-recovery":
+                    rec[name] = task
+                elif name not in (SUPERVISOR_ID, *COMPONENT_IDS):
+                    comp_extra[name] = task
+        comp = asyncio.ensure_future(self._supervisor.settle(TaskCancelReason.FAILED_START,
+                                                             self._bg.settle_timeout_seconds))
+        extra = asyncio.ensure_future(settle_tasks(comp_extra, self._bg.settle_timeout_seconds))
+        recovery = asyncio.ensure_future(settle_tasks(rec, self._bg.recovery_settle_deadline_seconds))
+        unsettled = [*await comp, *await extra, *await recovery]
+        if ctx is not None:
+            for name in list(ctx.registry):
+                if ctx.registry[name].done():
+                    ctx.registry.pop(name)
+        return unsettled
+
+    async def _settle_failed_start(self, local_conn: AsyncConnection | None, ctx: StartContext | None = None
+                                   ) -> list[BaseException]:
         """Decides ONCE which connection to clean up (the Runner field if the lock was taken, else the local one),
         unlocks (only when the lock was held) and closes it, then makes the final lifecycle transition: STOPPED when
-        the close is confirmed, STOP_INCOMPLETE (connection kept in `_lock_conn`) when it is not."""
+        the close is confirmed, STOP_INCOMPLETE (connection kept in `_lock_conn`) when it is not. The startup tasks are
+        reaped first (steps 7 and 8); the lock connection is closed only when the registry is empty (step 9)."""
         problems: list[BaseException] = []
         owned = self._lock_conn if self._lock_conn is not None else local_conn
-        closed = owned is None
+        unsettled: list[str] = []
+        closed = False
         try:
+            try:
+                unsettled = await self._settle_startup(ctx)
+            except Exception as exc:  # noqa: BLE001 - recorded; the lock decision below uses the real registry
+                problems.append(exc)
+                unsettled = self._supervisor.unsettled_ids()
+            closed = owned is None and not unsettled
             try:                                             # a startup recovery may still be live / unsettled
                 await self._settle_recovery_for_stop()
             except Exception as exc:  # noqa: BLE001 - recorded; the lock decision below uses the real state
                 problems.append(exc)
-            if owned is not None and self._recovery_clean():
+            if owned is not None and self._recovery_clean() and not unsettled:
                 if owned is self._lock_conn:
                     await self._unlock_best_effort(owned)
                 try:
@@ -314,13 +709,17 @@ class Runner:
                 except Exception as exc:  # noqa: BLE001 - recorded; the connection is kept for a later stop()
                     problems.append(exc)
             elif owned is not None:
-                log.error("failed start: the request recovery is unsettled; the advisory lock is kept")
+                log.error("failed start: the request recovery or a startup task is unsettled; the advisory lock is kept")
+            if unsettled:                                    # R31-5: a structured note on the original error, never a replacement
+                problems.append(RunnerStopIncomplete(components=unsettled))
         finally:
             async with self._lifecycle_lock:
                 self._loop_task = None
                 if closed:
                     self._lock_conn = None
                     self._wake.clear()
+                    self._supervisor.clear_flags()           # SUP-25: no stale degraded flag after STOPPED
+                    self._supervisor.mark_stopped()
                     self._state = RunnerLifecycle.STOPPED
                 else:
                     self._lock_conn = owned
@@ -373,10 +772,13 @@ class Runner:
                 if self._loop_task is not None and self._loop_task.done():
                     self._loop_task = None
                 self._reap_recovery_locked()
+                self._supervisor.release_confirmed()
+                self._prune_startup_registry()
                 clean = (not self._inflight and self._lock_conn is None and self._loop_task is None
-                         and self._recovery_clean())
+                         and self._recovery_clean() and self._supervisor.registry_empty and not self._startup_alive())
                 if clean:
                     self._wake.clear()
+                    self._supervisor.mark_stopped()
                 self._state = RunnerLifecycle.STOPPED if clean else RunnerLifecycle.STOP_INCOMPLETE
         except BaseException as exc:  # noqa: BLE001
             log.critical("the Runner lifecycle could not be settled and may stay in %s", self._state.value)
@@ -386,9 +788,65 @@ class Runner:
                 error.add_note(f"the lifecycle transition also failed: {exc!r}")
         if error is None and self._state is RunnerLifecycle.STOP_INCOMPLETE:
             raise RunnerStopIncomplete([str(e.run_id) if e.run_id else "<no lease yet>"
-                                        for e in self._inflight.values()], self._recovery_description())
+                                        for e in self._inflight.values()], self._recovery_description(),
+                                       components=self._unsettled_components())
         if error is not None:
             raise error
+
+    def _prune_startup_registry(self) -> None:
+        ctx = self._ctx
+        if ctx is not None:
+            for name in [n for n, t in ctx.registry.items() if t.done()]:
+                ctx.registry.pop(name)
+
+    def _unsettled_components(self) -> list[str]:
+        """Canonical ids (SUP-24) of everything background that is still alive or still registered."""
+        ids = self._supervisor.unsettled_ids()
+        if self._loop_task is not None:
+            ids.append("runner-loop")
+        ids += [n for n, t in (self._ctx.registry.items() if self._ctx is not None else []) if n not in ids]
+        return ids
+
+    async def _settle_background(self, reason: TaskCancelReason) -> list[str]:
+        """SUP-23 / SUP-32 / R31-8: the component set (the supervisor first, the components, the restart waiters) under ONE
+        common deadline and, concurrently, the loop task and startup-recovery under their own; a unit that is still alive keeps
+        its reference and is returned by its canonical id."""
+        rec: dict[str, asyncio.Task] = {}
+        if self._loop_task is not None:
+            rec["runner-loop"] = self._loop_task
+        ctx = self._ctx
+        extra: dict[str, asyncio.Task] = {}
+        if ctx is not None:
+            for name, task in ctx.registry.items():
+                if name == "startup-recovery":
+                    rec[name] = task
+                elif name not in (SUPERVISOR_ID, *COMPONENT_IDS):
+                    extra[name] = task
+        comp = asyncio.ensure_future(self._supervisor.settle(reason, self._bg.settle_timeout_seconds))
+        ext = asyncio.ensure_future(settle_tasks(extra, self._bg.settle_timeout_seconds))
+        recovery = asyncio.ensure_future(settle_tasks(rec, self._bg.recovery_settle_deadline_seconds))
+        unsettled = [*await comp, *await ext, *await recovery]
+        if self._loop_task is not None and "runner-loop" not in unsettled:
+            self._loop_task = None                          # only after the loop task is confirmed finished
+        self._prune_startup_registry()
+        return unsettled
+
+    @staticmethod
+    def _merge_incomplete(errors: list[BaseException], components: list[str], recovery: str | None) -> BaseException:
+        """One RunnerStopIncomplete (never a group of run, component and recovery errors; SUP-24). Other cleanup failures are
+        attached to it as cleanup_errors and notes and the incomplete error stays the primary error."""
+        incomplete = [e for e in errors if isinstance(e, RunnerStopIncomplete)]
+        others = [e for e in errors if not isinstance(e, RunnerStopIncomplete)]
+        if not components and not incomplete:
+            return _combine(errors)
+        run_ids = tuple(r for e in incomplete for r in e.run_ids)
+        text_ = next((e.recovery for e in incomplete if e.recovery), None) or recovery
+        merged = RunnerStopIncomplete(run_ids, text_, components=tuple(dict.fromkeys(
+            [*components, *(c for e in incomplete for c in e.components)])))
+        merged.cleanup_errors = tuple(others)
+        for other in others:
+            merged.add_note(f"cleanup also failed: {other!r}")
+        return merged
 
     async def _shutdown_resources(self) -> None:
         """Best-effort, in order: loop task end -> request-recovery settlement -> in-flight drain -> advisory-lock
@@ -399,11 +857,14 @@ class Runner:
         bounded here (current contract). Never changes the lifecycle; RunnerStopIncomplete if tasks are still alive."""
         errors: list[BaseException] = []
         self._wake.set()
-        loop_task = self._loop_task
-        if loop_task is not None:
-            loop_task.cancel()
-            await asyncio.gather(loop_task, return_exceptions=True)
-            self._loop_task = None                          # only after the loop task is confirmed finished
+        self._risk_wake.set()
+        self._sweeper_wake.set()
+        components: list[str] = []
+        try:
+            components = await self._settle_background(TaskCancelReason.STOP)   # STOP is recorded before the first cancel
+        except BaseException as exc:  # noqa: BLE001 - collected; the rest of the cleanup still runs
+            errors.append(exc)
+            components = self._unsettled_components()
         try:
             await self._settle_recovery_for_stop()
         except BaseException as exc:  # noqa: BLE001 - collected; the drain still runs
@@ -414,16 +875,16 @@ class Runner:
         except BaseException as exc:  # noqa: BLE001
             drained = False
             errors.append(exc)
-        if drained and self._recovery_clean():
+        if drained and self._recovery_clean() and not components:
             try:
                 await self._release_lock_connection()
-            except BaseException as exc:  # noqa: BLE001
+            except BaseException as exc:  # noqa: BLE001 - a close failure alone is re-raised itself (D35-4)
                 errors.append(exc)
         elif drained:
-            log.error("runner stop: the request recovery is unsettled (%s); the advisory lock is kept",
-                      self._recovery_description())
-        if errors:
-            raise _combine(errors)
+            log.error("runner stop: the request recovery or a background unit is unsettled (%s); the advisory lock is kept",
+                      self._recovery_description() or ", ".join(components))
+        if errors or components:
+            raise self._merge_incomplete(errors, components, self._recovery_description())
 
     async def _unlock_best_effort(self, conn: AsyncConnection) -> None:
         """Closing the connection releases a session lock anyway, so an unlock problem (or a false result) is logged."""
@@ -497,9 +958,17 @@ class Runner:
     def _cancel_cli(self, run_id: uuid.UUID) -> None:
         for provider in self._providers:
             provider.cancel(str(run_id))
+        if self._executor is not None:                       # also the tracked commands: their keys start with the run id
+            self._executor.cancel(str(run_id))
+
+    @property
+    def incarnation_id(self) -> str | None:
+        """The id of the current start's capability incarnation (None before the first start); the claim owner of the risk worker."""
+        return self._incarnation_id
 
     def notify(self) -> None:
         self._wake.set()
+        self._risk_wake.set()
 
     # --- recovery ---------------------------------------------------------------------------------------------
     async def recover(self, *, startup: bool = False) -> dict:
@@ -801,7 +1270,9 @@ class Runner:
                 checked and self._state not in (RunnerLifecycle.STARTING, RunnerLifecycle.RUNNING)):
             summary["rest_skipped"] = True
             return summary
-        return await self._recover_rest(summary)
+        if startup and self._ctx is not None and self._ctx.generation == ctx.generation:
+            self._set_mutation_done(self._ctx)             # setter 1 (R31-4): immediately before _recover_rest, common condition
+        return await self._recover_rest(summary, ctx.generation, startup)
 
     async def _recovery_body(self, startup: bool, session, evidence: RecoveryEvidence) -> dict:
         """The request changes, inside the recovery transaction. Candidates (id, claim token, intent) are all recorded
@@ -839,9 +1310,49 @@ class Runner:
                 summary["fenced"] += 1
         return summary
 
-    async def _recover_rest(self, summary: dict) -> dict:
+    def _ensure_background_tasks(self, generation: int, origin: Origin) -> list[str]:
+        """The guarded start (SUP-31, table SUP-O): synchronous, idempotent, creates only what the origin allows. Returns the
+        ids it created (normally none: `start()` already created every unit with the origin START)."""
+        created = []
+        if self._ctx is None or self._ctx.generation != generation:     # no `start()` of this generation: nothing to supervise
+            return created
+        for uid, factory in self._unit_factories().items():
+            if self._supervisor.ensure_component(uid, factory, origin, generation) is CreateVerdict.CREATED:
+                created.append(uid)
+        return created
+
+    async def _await_first_sweep(self, generation: int) -> None:
+        """Only the startup recovery waits (item 2, SUP-20): for the first sweeper pass, at most
+        `ORPHAN_SWEEP_STARTUP_WAIT_SECONDS`, ended early when the lifecycle leaves STARTING/RUNNING or the generation changes.
+        Its expiry neither passes nor fails the start. In case (iv-b) the wait ends at the settlement's cancellation or at the
+        expiry, never unbounded."""
+        ctx = self._ctx
+        sweeper = self._supervisor.units["sweeper"]
+        if ctx is None or ctx.first_pass.is_set():
+            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + P.ORPHAN_SWEEP_STARTUP_WAIT_SECONDS
+        waiter = asyncio.ensure_future(ctx.first_pass.wait())
+        try:
+            while not waiter.done():
+                if (generation != self._generation or self._state not in (RunnerLifecycle.STARTING, RunnerLifecycle.RUNNING)
+                        or sweeper.task is None or sweeper.task.done() or sweeper.state is UnitState.DEGRADED):
+                    return
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return
+                await asyncio.wait({waiter}, timeout=min(remaining, self._bg.min_interval_seconds))
+        finally:
+            waiter.cancel()
+
+    async def _recover_rest(self, summary: dict, generation: int | None = None, startup: bool = False) -> dict:
         """Work that may measure a workspace (slow on a big repository), so it runs OUTSIDE the lifecycle lock. It only
         touches cancelled tasks without a run and write locks of finished tasks, never a live claim."""
+        if generation is None:
+            generation = self._generation
+        self._ensure_background_tasks(generation, Origin.RECOVERY)      # a no-op while the units exist (table SUP-O)
+        if startup:
+            await self._await_first_sweep(generation)
         summary["cancelled"] = await self._cancel_idle_tasks()
         summary["reconciled"] = await self.workflow.locks.reconcile()    # write locks left by finished tasks
         if summary["requeued"]:
@@ -896,8 +1407,11 @@ class Runner:
     async def _dispatch(self) -> int:
         """Claims while a slot is free. The slot is checked first: nothing claimed ever waits for one."""
         started = 0
-        while self._state is RunnerLifecycle.RUNNING and len(self._inflight) < self._max_tasks:
+        while (self._state is RunnerLifecycle.RUNNING and len(self._inflight) < self._max_tasks
+               and not self._dispatch_blocked()):                       # guard point (1): no database access
             async with self.db.transaction() as s:
+                if self._dispatch_blocked():                            # guard point (2): immediately before claim_next
+                    break
                 request = await ExecutionRequestRepository(s).claim_next(
                     self.runner_id, busy_project_ids=self._busy_projects())
                 project_id = None
@@ -906,9 +1420,16 @@ class Runner:
                                   ).scalar_one_or_none()
             if request is None:
                 break
+            if self._dispatch_blocked():                                # guard point (3): after the commit, before _launch
+                break           # `break`, never `continue`: the row stays CLAIMED without a lease (R31-3, stale-claim recovery)
             self._launch(request, project_id)
             started += 1
         return started
+
+    def _dispatch_blocked(self) -> bool:
+        """R31-2: dispatch is blocked ONLY by `supervisor_degraded`; a degraded sweeper, risk worker or capability updater
+        never blocks it. Reads exactly this one flag."""
+        return self._supervisor.supervisor_degraded
 
     def _launch(self, request: ExecutionRequest, project_id: uuid.UUID | None) -> None:
         entry = _InFlight(project_id)
@@ -929,6 +1450,136 @@ class Runner:
             raise
         except Exception:  # noqa: BLE001 - one task's failure must not stop the others; the claim is recovered
             log.exception("request %s failed; it stays CLAIMED and is recovered after the grace period", request.id)
+
+    # --- background component bodies (design 9.1; the candidate scan and the risk worker are phase-5 seams) -----------------
+    async def _sweeper_body(self, ready) -> None:
+        """READY is the entry point (SUP-20); then the first pass is HELD until the startup mutation is done (SUP-31)."""
+        ready()
+        ctx = self._ctx
+        try:
+            await ctx.mutation_done.wait()
+            while True:
+                wait = await self._sweeper_pass()
+                ctx.first_pass.set()
+                await self._sweeper_sleep(wait)
+        finally:
+            self._stall.next_recheck_at = None                   # no sweeper task, no scheduled recheck
+
+    def _schedule_recheck(self, seconds: float) -> None:
+        """Records the instant at which the sweeper will next evaluate the configuration (`next_recheck_at`, design 14.2)."""
+        try:
+            self._stall.next_recheck_at = self._now() + timedelta(seconds=seconds)
+        except (OverflowError, TypeError, ValueError):
+            self._stall.next_recheck_at = None                  # unknown, never a guess
+
+    async def _sweeper_sleep(self, seconds: float) -> None:
+        """A cancellable wait that a stop ends at once; a CI-7 wake-up ends it once, debounced. The scheduled end of whichever
+        wait is running is recorded as `next_recheck_at` and cleared whenever no wait is scheduled (a pass runs, a stop)."""
+        self._schedule_recheck(seconds)
+        try:
+            try:
+                await asyncio.wait_for(self._sweeper_wake.wait(), timeout=seconds)
+                woke = True
+            except TimeoutError:
+                woke = False
+            if woke and self._stall.wake_pending:
+                debounce = (self._bg.min_interval_seconds if P.BACKGROUND_WAKEUP_DEBOUNCE_SECONDS < self._bg.min_interval_seconds
+                            else P.BACKGROUND_WAKEUP_DEBOUNCE_SECONDS)
+                self._schedule_recheck(debounce)
+                await self._sleep(debounce)
+                self._stall.wake_pending = False
+            self._sweeper_wake.clear()
+        finally:
+            self._stall.next_recheck_at = None
+
+    async def _sweeper_pass(self) -> float:
+        """One pass: the entry-time policy snapshot (SUP-28), the pass body (an injectable seam), the stall bookkeeping (rows
+        1 to 13, 16, 22 to 26, 29, 30). Returns the wait until the next pass. A corrupted fallback (row 28) propagates:
+        the task ends abnormally and the supervisor restarts it."""
+        stall, now, start = self._stall, self._now(), self._committed_cursor
+        try:
+            policy = build_sweeper_pass_policy()
+        except ValueError as exc:
+            reason = getattr(exc, "reason", None)                   # one of SWEEPER_CONFIG_INVALID_REASONS, never the message
+            stall.record_config_invalid(pass_start=start, boundary_cursor=start, now=now,
+                                        fallback_seconds=P.ORPHAN_SWEEP_CONFIG_FALLBACK_SECONDS,
+                                        reasons=(reason,) if reason else ())
+            return P.ORPHAN_SWEEP_CONFIG_FALLBACK_SECONDS
+        stall.note_config_evaluation(True, now)
+        try:
+            outcome = await self._run_sweep_body(start, policy)
+        except asyncio.CancelledError:
+            task = asyncio.current_task()
+            if task is not None and task.cancelling() > 0:
+                raise                                   # the top-level task itself: rows 14, 15 and 27, never a failure
+            outcome = PassOutcome("FAILED", code="SWEEP_CANCELLED", position=start)       # a child operation (row 16)
+        except Exception:  # noqa: BLE001 - one failed pass is a stall-record event, never the end of the task
+            log.exception("sweeper pass failed")
+            outcome = PassOutcome("FAILED", code="SWEEP_EXCEPTION", position=start)
+        if outcome.kind == "OK":
+            if outcome.advanced or outcome.wrapped:
+                self._committed_cursor = None if outcome.wrapped else outcome.committed
+            stall.record_pass_without_failure(committed=outcome.committed, advanced=outcome.advanced,
+                                              wrapped=outcome.wrapped, config_valid=True, now=now)
+            return policy.interval_seconds
+        if outcome.kind == "FAILED" and outcome.advanced:
+            self._committed_cursor = outcome.committed      # rule (g)(iv): a failed processing moves over its committed prefix
+        code = SWEEP_NO_PROGRESS if outcome.kind == "NO_PROGRESS" else outcome.code
+        delay = backoff_delay(stall.peek_count(start), policy.backoff_min_seconds, policy.backoff_max_seconds,
+                              policy.backoff_exponent_cap)
+        stall.record_failed_pass(pass_start=start, position=outcome.position, kind=outcome.position_kind, code=code,
+                                 now=now, retry_delay_seconds=delay)
+        return delay
+
+    async def _run_sweep_body(self, start, policy: SweeperPassPolicy) -> PassOutcome:
+        """The candidate scan and the per-row settlement are the phase-5 seam (`sweep_pass`); without it a pass sweeps
+        nothing and reports an empty candidate set read to its end (a wrap-around, row 10)."""
+        if self._sweep_pass_fn is None:
+            return PassOutcome("OK", committed=None, advanced=False, wrapped=True)
+        return await self._sweep_pass_fn(start, policy)
+
+    async def _risk_body(self, ready) -> None:
+        ready()
+        while True:
+            if self._risk_pass_fn is not None:
+                await self._risk_pass_fn()
+            try:
+                await asyncio.wait_for(self._risk_wake.wait(), timeout=self._bg.risk_idle_interval_seconds)
+            except TimeoutError:
+                pass
+            self._risk_wake.clear()
+
+    async def _capability_body(self, ready) -> None:
+        """The refresh task of 6.2: its own bounded task, every CAPABILITY_REFRESH_SECONDS, each write bounded; a failed write
+        is logged and retried on the next tick."""
+        ready()
+        while True:
+            await self._sleep(self._bg.capability_refresh_seconds)
+            await self._write_capability()
+
+    def _recheck_sweeper_configuration(self, generation: int, policy: Callable | None = None) -> ConfigWakeResult:
+        """RV-3 (SUP-30): an explicit recheck, no production caller, no hot reload. `policy` builds the snapshot (default: the
+        live one). The first matching result decides; nothing is written except `wake_pending` and the wake event."""
+        if generation != self._generation:
+            return ConfigWakeResult.STALE_GENERATION
+        if self._state is not RunnerLifecycle.RUNNING:
+            return ConfigWakeResult.NOT_RUNNING
+        try:
+            (policy or build_sweeper_pass_policy)()
+        except ValueError:
+            self._stall.note_config_evaluation(False, self._now())
+            return ConfigWakeResult.STILL_INVALID
+        task = self._supervisor.units["sweeper"].task
+        if task is None or task.done():
+            self._stall.wake_pending = False
+            return ConfigWakeResult.NO_SWEEPER_TASK
+        if not self._stall.config_invalid_active:
+            return ConfigWakeResult.NO_INVALID_STATE
+        if self._stall.wake_pending:
+            return ConfigWakeResult.ALREADY_PENDING
+        self._stall.wake_pending = True
+        self._sweeper_wake.set()
+        return ConfigWakeResult.WAKE_SCHEDULED
 
     # --- main loop ---------------------------------------------------------------------------------------------
     async def _loop(self) -> None:
@@ -1026,10 +1677,25 @@ class Runner:
                          if StepState(st.status) in (StepState.RUNNING, StepState.INTERRUPTED)), None)
             pending_recovery = [a for a in await self._pending(s, task.id) if a.type == str(ApprovalType.RECOVERY)]
             if not pending_recovery:
-                key = step.step_key if step else (task.resume_step_key or "PLAN")
+                key = step.step_key if step else (await self._tracked_checkpoint_key(repo, task.id)
+                                                   or task.resume_step_key or "PLAN")
                 await self.gates.open_recovery(s, task, step, reason=reason, checkpoint_step_key=key)
             await ExecutionRequestRepository(s).finish(request.id, "NEEDS_REVIEW", reason[:120],
                                                        token=request.claim_token)
+
+    @staticmethod
+    async def _tracked_checkpoint_key(repo: TaskRepository, task_id: uuid.UUID) -> str | None:
+        """`detail.checkpoint_step_key` of the unresolved tracked row (written at registration, 7.1 / 8): without a RUNNING or
+        INTERRUPTED step it decides where the RECOVERY gate attaches (for example STEP_TEST for `ids_before`)."""
+        for row in reversed(await repo.unresolved_for_task(task_id)):
+            try:
+                detail = json.loads(row.detail_text) if row.detail_text else None
+            except ValueError:
+                continue
+            key = detail.get("checkpoint_step_key") if isinstance(detail, dict) else None
+            if isinstance(key, str) and key:
+                return key
+        return None
 
     @staticmethod
     async def _pending(s, task_id):

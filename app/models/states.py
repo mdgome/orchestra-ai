@@ -69,6 +69,26 @@ class CliOutcome(StrEnum):
     STARTING = "STARTING"
 
 
+class ProcessLifecycle(StrEnum):
+    """Lifecycle of one command's process (B2 design 4); carried by CommandResult next to the CliOutcome."""
+    NOT_STARTED = "NOT_STARTED"
+    STARTING = "STARTING"
+    RUNNING = "RUNNING"
+    EXITED = "EXITED"
+    CANCEL_REQUESTED = "CANCEL_REQUESTED"
+    TERMINATING = "TERMINATING"
+    TERMINATED = "TERMINATED"
+    TERMINATION_UNCONFIRMED = "TERMINATION_UNCONFIRMED"
+    SPAWN_FAILED = "SPAWN_FAILED"
+
+
+class TreeProof(StrEnum):
+    """Descriptive only: no release rule reads it (they read detail.proof)."""
+    EMPTY = "EMPTY"
+    NOT_EMPTY = "NOT_EMPTY"
+    UNKNOWN = "UNKNOWN"
+
+
 # Step keys, in workflow order. Each maps to one Task State and one agent role.
 STEP_PLAN = "PLAN"
 STEP_DESIGN_REVIEW = "DESIGN_REVIEW"

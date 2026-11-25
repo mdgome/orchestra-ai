@@ -11,7 +11,7 @@ from app.routers import approvals, conversations, events, projects, reports, tas
 from app.services.runner import RunnerAlreadyActive
 from app.services.runtime_status import StartupOutcome
 from app.validation.error_handlers import register_error_handlers
-from app.validation.validators import validate_response_limits
+from app.validation.validators import validate_process_timing_limits, validate_response_limits
 
 log = logging.getLogger("orchestrator")
 
@@ -65,6 +65,7 @@ async def shutdown_runtime(c: Container, owns_db: bool, body_error: BaseExceptio
 def create_app(settings: Settings | None = None, container: Container | None = None,
                run_preflight: bool = True) -> FastAPI:
     validate_response_limits()      # a limit that cannot hold one answer stops the application from starting
+    validate_process_timing_limits()  # B2 timing relations (design 9.2): refused before any Runner exists
     settings = settings or get_settings()
 
     @asynccontextmanager

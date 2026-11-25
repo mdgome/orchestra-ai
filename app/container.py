@@ -1,4 +1,5 @@
 """Dependency wiring (the only place concrete classes are assembled)."""
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -10,23 +11,29 @@ from app.infra.workspace_guard import WorkspaceGuard
 from app.providers.claude_cli import ClaudeCliProvider
 from app.providers.codex_cli import CodexCliProvider
 from app.providers.preflight import PreflightReport
+from app.infra.process_control import platform_supports_tracking
+from app.services.capability_reader import CapabilityReader
 from app.services.change_service import ChangeService
 from app.services.diagnostics_service import DiagnosticsService
 from app.services.human_gate_service import HumanGateService
 from app.services.lease_service import LeaseService
+from app.services.orphan_sweeper import OrphanSweeper
+from app.services.process_risk_worker import ProcessRiskWorker
+from app.services.risk_followup import RiskFollowUp
 from app.services.project_lock_service import ProjectLockService
 from app.services.project_recovery_effect import ProjectDirtyRecoveryEffect
 from app.services.profile_service import ProfileService
 from app.services.project_service import ProjectService
 from app.services.report_service import ReportService
 from app.services.recovery_effects import RecoveryEffects
-from app.services.runner import Runner, new_runner_id
+from app.services.runner import Runner, RunnerLifecycle, new_runner_id
 from app.services.runtime_status import RuntimeSnapshot, StartupOutcome, snapshot_of
 from app.services.session_service import SessionService
 from app.services.step_runner import StepRunner
 from app.services.task_finalizer import TaskFinalizer
 from app.services.task_service import TaskService
 from app.services.test_policy_service import TestPolicyService
+from app.services.tracked_diagnostics import TrackedDiagnosticsReader
 from app.services.workflow_service import WorkflowService
 from app.validation import policies as P
 from app.validation.exceptions import ServiceNotConfigured
@@ -90,9 +97,14 @@ def build_container(settings: Settings, providers: dict | None = None, db: Datab
     events = EventBus()
     providers = providers or {"CLAUDE": ClaudeCliProvider(executor, settings.claude_bin),
                               "CODEX": CodexCliProvider(executor, settings.codex_bin)}
-    leases = LeaseService(database, new_runner_id(), ttl_seconds=settings.lease_ttl_seconds)
+    # The retained-handle registry of the executor settles a retained Job again on a takeover (7.3); the capability state
+    # is the Runner's own memory (6.2), read through a holder because the Runner is built after the StepRunner.
+    leases = LeaseService(database, new_runner_id(), ttl_seconds=settings.lease_ttl_seconds,
+                          retained_settler=executor.resettle_retained, retained_present=executor.has_retained)
     sessions = SessionService()
-    steps = StepRunner(database, leases, sessions, providers, events)
+    runner_ref: list = []
+    steps = StepRunner(database, leases, sessions, providers, events,
+                       process_tracking_state=lambda: runner_ref[0].process_tracking_state if runner_ref else "UNKNOWN")
     # assembly order: repositories -> project_terminal (stateless) -> locks -> finalizer -> effects -> gates -> workflow
     locks = ProjectLockService(database, leases)
     finalizer = TaskFinalizer(database, locks)
@@ -100,6 +112,17 @@ def build_container(settings: Settings, providers: dict | None = None, db: Datab
     gates = HumanGateService(database, effects=effects, measure=locks.measure_for_task)
     workflow = WorkflowService(database, leases, steps, gates, TestPolicyService(executor), guard, sessions, events,
                                locks=locks, finalizer=finalizer)
+    def db_section():
+        return runner_ref[0].background_db_section()
+
+    def incarnation():
+        value = runner_ref[0].incarnation_id if runner_ref else None
+        return uuid.UUID(hex=value) if value else None
+
+    sweeper = OrphanSweeper(database, db_section, incarnation=lambda: runner_ref[0].incarnation_id,
+                            retained_settler=executor.resettle_retained, retained_present=executor.has_retained)
+    risk_worker = ProcessRiskWorker(database, db_section, incarnation=incarnation, notify=lambda: runner_ref[0].notify(),
+                                    retained_settler=executor.resettle_retained, retained_present=executor.has_retained, follow_up=RiskFollowUp(gates))
     runner = Runner(database, leases, workflow, gates, list(providers.values()),
                     advisory_key=settings.runner_advisory_lock_key, claim_timeout_seconds=settings.claim_timeout_seconds,
                     max_concurrent_tasks=settings.max_concurrent_tasks,
@@ -107,13 +130,21 @@ def build_container(settings: Settings, providers: dict | None = None, db: Datab
                     shutdown_grace_seconds=settings.runner_shutdown_grace_seconds,
                     recovery_statement_timeout_seconds=settings.recovery_statement_timeout_seconds,
                     recovery_timeout_seconds=settings.runner_recovery_timeout_seconds,
-                    recovery_shutdown_wait_seconds=settings.runner_recovery_shutdown_wait_seconds)
+                    recovery_shutdown_wait_seconds=settings.runner_recovery_shutdown_wait_seconds,
+                    executor=executor, sweep_pass=sweeper, risk_pass=risk_worker)
+    runner_ref.append(runner)
     projects = ProjectService(database, executor, clone_root=Path(settings.project_clone_root),
                               protected=(root, Path(__file__).resolve().parents[1]))
-    container = Container(settings, database, guard, executor, events, TaskService(database, guard), gates, runner,
+    container = Container(settings, database, guard, executor, events, TaskService(database, guard, options_provider=gates.current_options_for_approvals), gates, runner,
                           providers, projects=projects)
+    # 6.2: a Runner that is RUNNING in this process reads its own memory; every other instance applies the trust rule
+    capability = CapabilityReader(
+        database, settings.runner_advisory_lock_key, platform_supported=platform_supports_tracking,
+        own_state=lambda: runner.process_tracking_state if runner.lifecycle is RunnerLifecycle.RUNNING else None)
     container.diagnostics = DiagnosticsService(projects, executor, protected=projects.protected,
-                                               get_runtime=container.runtime, get_preflight=lambda: container.preflight)
+                                               get_runtime=container.runtime, get_preflight=lambda: container.preflight,
+                                               read_capability=capability,
+                                               read_tracked=TrackedDiagnosticsReader(database, read_capability=capability))
     container.reports = ReportService(database, get_runtime=container.runtime)
     container.profiles = ProfileService(database)
     container.changes = ChangeService(database)

@@ -23,7 +23,7 @@ import os
 import sys
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import partial
@@ -35,7 +35,8 @@ from app.models.states import CliOutcome
 from app.providers.preflight import PreflightReport, scan_home_settings, scan_project_settings
 from app.services.hashing import stable_hash
 from app.services.project_service import ProjectService
-from app.services.runtime_status import RuntimeSnapshot
+from app.services.runtime_status import BackgroundComponentStatus, RuntimeSnapshot
+from app.services.sweeper_stall import SweeperConfigInvalidSnapshot, SweeperStallSnapshot
 from app.services.test_policy_resolver import resolve_test_policy
 from app.validation import policies as P
 from app.validation import validators as V
@@ -52,6 +53,31 @@ class Status(str, enum.Enum):
     UNKNOWN = "UNKNOWN"
 
 
+_SEVERITY_RANK = {Status.FAIL: 3, Status.WARN: 2, Status.UNKNOWN: 1, Status.PASS: 0}
+
+
+@dataclass(frozen=True)
+class DiagnosticCause:
+    """One cause of an item (design 14.1, 14.2). Internal view model: its attribute names equal the field names of
+    `DiagnosticCauseOut`; it carries identifiers and fixed codes only, never `detail`, SQL text or an exception string."""
+    reason_code: str
+    severity: Status
+    blocks_execution: bool
+    cause: str
+    recommendation: str
+    related_execution_ids: tuple[uuid.UUID, ...] = ()
+    related_request_ids: tuple[uuid.UUID, ...] = ()
+    anomalies: tuple = ()                           # TrackedAnomaly items (project_terminal), only TRACKED_EXECUTION_ANOMALY
+    anomalies_returned: int = 0
+    anomalies_truncated: bool = False
+    anomalies_total: int | None = None
+    anomalies_total_is_exact: bool = False
+    may_be_permanently_stuck: bool = False
+    sweeper: SweeperStallSnapshot | None = None
+    config_invalid: SweeperConfigInvalidSnapshot | None = None
+    components: tuple[BackgroundComponentStatus, ...] = ()
+
+
 @dataclass(frozen=True)
 class DiagnosticItem:
     code: str
@@ -60,6 +86,33 @@ class DiagnosticItem:
     cause: str = ""
     recommendation: str = ""
     blocks_execution: bool = False        # only ever true for a FAIL
+    causes: tuple[DiagnosticCause, ...] = ()
+    blocks_features: tuple[str, ...] = ()   # PROCESS_TRACKING only, and only when the capability is not SUPPORTED
+
+
+@dataclass(frozen=True)
+class TrackedVerdict:
+    """What the injected tracked-executions reader returns for one project: the causes (unmerged) and the number of tracked
+    executions that are running normally (information only)."""
+    causes: tuple[DiagnosticCause, ...] = ()
+    running: int = 0
+
+
+def merge_causes(causes) -> tuple[DiagnosticCause, ...]:
+    """14.1: duplicates by `reason_code` are removed (their ids merged in ascending order); FAIL before WARN, then by
+    `reason_code` in ascending ASCII order."""
+    merged: dict[str, DiagnosticCause] = {}
+    for c in causes:
+        first = merged.get(c.reason_code)
+        if first is None:
+            merged[c.reason_code] = c
+            continue
+        merged[c.reason_code] = dataclasses.replace(
+            first, blocks_execution=first.blocks_execution or c.blocks_execution,
+            severity=max(first.severity, c.severity, key=_SEVERITY_RANK.get),
+            related_execution_ids=tuple(sorted({*first.related_execution_ids, *c.related_execution_ids})),
+            related_request_ids=tuple(sorted({*first.related_request_ids, *c.related_request_ids})))
+    return tuple(sorted(merged.values(), key=lambda c: (-_SEVERITY_RANK[c.severity], c.reason_code)))
 
 
 @dataclass(frozen=True)
@@ -91,9 +144,14 @@ def _first_line(text: str) -> str:
 class DiagnosticsService:
     def __init__(self, projects: ProjectService, executor: CommandExecutor, *, protected: tuple[Path, ...],
                  get_runtime: Callable[[], RuntimeSnapshot], get_preflight: Callable[[], PreflightReport | None],
-                 clock: Callable[[], float] = time.monotonic, now: Callable[[], datetime] = lambda: datetime.now(UTC)):
+                 clock: Callable[[], float] = time.monotonic, now: Callable[[], datetime] = lambda: datetime.now(UTC),
+                 read_capability: Callable[[], Awaitable] | None = None,
+                 read_tracked: Callable[[uuid.UUID], Awaitable[TrackedVerdict]] | None = None):
         self._projects, self._executor, self._protected = projects, executor, tuple(protected)
         self._get_runtime, self._get_preflight = get_runtime, get_preflight
+        # plain async callables (no import of a repository or a session here): the capability reader of 6.2 (a reading with
+        # `.state` and `.reason_code`) and the project-scoped tracked-executions reader of 14.1; None = not configured
+        self._read_capability, self._read_tracked = read_capability, read_tracked
         self._clock, self._now = clock, now
         self._lock = asyncio.Lock()
         self._cache: dict[tuple, tuple[float, DiagnosticsReport]] = {}
@@ -106,11 +164,13 @@ class DiagnosticsService:
         project = await self._projects.get_project(project_id)       # 404 for an unknown project
         view = _ProjectView(project.id, project.workspace_path, project.test_policy, project.write_owner_task_id,
                             project.workspace_state)
-        # workspace identity + test policy + policy version + the live state some items are derived from (Runner readiness,
-        # write-lock owner, workspace state): a change of any of them makes the old entry unreachable
+        # workspace identity + test policy + policy version + the live state some items are derived from (the background
+        # revision, Runner readiness, the derived display set of the SAME snapshot, write-lock owner, workspace state): a
+        # change of any of them makes the old entry unreachable (14.3). The ONE runtime snapshot of this read is passed on.
         runtime = self._get_runtime()
         key = (view.id, os.path.normcase(view.workspace_path), stable_hash(view.test_policy), P.DIAGNOSTICS_POLICY_VERSION,
-               runtime.ready, runtime.blockers, view.write_owner_task_id, view.workspace_state)
+               runtime.background_revision, runtime.ready, runtime.blockers, runtime.derived_states,
+               view.write_owner_task_id, view.workspace_state)
         async with self._lock:
             hit = self._cache.get(key)
             if hit is not None and not refresh and hit[0] > self._clock():
@@ -119,7 +179,7 @@ class DiagnosticsService:
             if shared is not None and shared.done():
                 shared = None                       # finished, its callback has not run yet: not "in flight" any more
             if shared is None:
-                shared = asyncio.create_task(self._run(key, view))      # created, not awaited: the lock stays short
+                shared = asyncio.create_task(self._run(key, view, runtime))      # created, not awaited: the lock stays short
                 self._inflight[key] = shared
                 shared.add_done_callback(partial(self._finished, key))
         return await asyncio.shield(shared)          # this waiter's cancellation never cancels the shared task
@@ -194,7 +254,7 @@ class DiagnosticsService:
         return facts
 
     # --- one run ------------------------------------------------------------------------------------------
-    async def _run(self, key: tuple, view: _ProjectView) -> DiagnosticsReport:
+    async def _run(self, key: tuple, view: _ProjectView, runtime: RuntimeSnapshot) -> DiagnosticsReport:
         deadline = self._clock() + P.DIAGNOSTICS_DEADLINE_SECONDS
         status, facts = await self._fs(view.id, partial(self._inspect_fs, view), P.DIAGNOSTICS_ITEM_TIMEOUT_SECONDS)
         facts = facts if status == "ok" else None
@@ -212,10 +272,13 @@ class DiagnosticsService:
             results = await asyncio.gather(*(self._version(root, argv, deadline) for argv in argvs.values()))
             probes = dict(zip(argvs, results))
         git, java = probes.get("git"), probes.get("java")
+        capability = await self._reading(self._read_capability)
+        tracked = await self._reading(self._read_tracked, view.id)
         items = [*self._workspace_items(facts, fs_note), self._git_item(root, git, fs_note),
                  *self._cli_items(), self._settings_item(facts, fs_note), self._auth_item(),
                  *self._policy_items(facts, fs_note), self._java_item(facts, java), self._python_item(facts, policy),
-                 self._env_item(policy), self._junit_item(policy), self._runner_item(), self._lock_item(view)]
+                 self._env_item(policy), self._junit_item(policy), self._runner_item(runtime),
+                 self._process_tracking_item(capability), self._tracked_item(tracked), self._lock_item(view)]
         blockers = tuple(i.code for i in items if i.blocks_execution)
         report = DiagnosticsReport(view.id, self._now(), not blockers, blockers, tuple(items))
         async with self._lock:
@@ -377,8 +440,31 @@ class DiagnosticsService:
                               "run with a rerun option if a task fails for that reason (not handled automatically yet)")
         return self._item("JUNIT_COLLECTION", Status.PASS, detail)
 
-    def _runner_item(self) -> DiagnosticItem:
-        snap = self._get_runtime()
+    async def _reading(self, fn, *args) -> tuple[str, object]:
+        """("ok", value) | ("unconfigured", None) | ("failed", None): an injected reader is bounded by the item timeout and a
+        failure of it is an UNKNOWN item, never an exception of the whole diagnosis."""
+        if fn is None:
+            return "unconfigured", None
+        try:
+            return "ok", await asyncio.wait_for(fn(*args), P.DIAGNOSTICS_ITEM_TIMEOUT_SECONDS)
+        except Exception:  # noqa: BLE001 - includes TimeoutError; the detail is never put into a response
+            return "failed", None
+
+    def _runner_item(self, snap: RuntimeSnapshot) -> DiagnosticItem:
+        """The base PASS / WARN / FAIL decision from the blockers is unchanged; the background and sweeper causes (14.1) are
+        independent of it and the item keeps the HIGHEST severity of its base status and of every cause (revision 34, A5)."""
+        base = self._runner_base(snap)
+        causes = merge_causes(self._runner_causes(snap))
+        if not causes:
+            return base
+        status = max((base.status, *(c.severity for c in causes)), key=_SEVERITY_RANK.get)
+        return dataclasses.replace(
+            base, status=status, blocks_execution=base.blocks_execution or any(c.blocks_execution for c in causes),
+            cause="; ".join([base.cause, *(c.cause for c in causes)]),
+            recommendation="; ".join(dict.fromkeys([base.recommendation, *(c.recommendation for c in causes)])),
+            causes=causes)
+
+    def _runner_base(self, snap: RuntimeSnapshot) -> DiagnosticItem:
         if snap.ready:
             return self._item("RUNNER_STATE", Status.PASS, "the Runner is running and ready")
         if snap.blockers == ("ADVISORY_LOCK_HELD",):
@@ -392,6 +478,96 @@ class DiagnosticsService:
                           f"the Runner is not ready ({', '.join(snap.blockers)}): execution requests are stored as "
                           "PENDING and wait until a Runner is ready",
                           "fix the blocker (see the other items) or restart the API", True)
+
+    @staticmethod
+    def _runner_causes(snap: RuntimeSnapshot) -> list[DiagnosticCause]:
+        out: list[DiagnosticCause] = []
+        degraded = tuple(c for c in snap.background_components if not c.is_derived)
+        derived = tuple(c for c in snap.background_components if c.is_derived)
+        if snap.background_degraded and degraded:       # the REAL cause exists only while a unit is really DEGRADED
+            supervisor = any(c.component == "supervisor" for c in degraded)
+            out.append(DiagnosticCause(
+                "BACKGROUND_COMPONENT_DEGRADED", Status.FAIL if supervisor else Status.WARN, supervisor,
+                "background component(s) are degraded: " + ", ".join(c.component for c in degraded),
+                "restart the Runner after diagnosing the component; it is not restarted automatically", components=degraded))
+        if derived:                                     # display only: always WARN, never a blocker (RUNNING snapshots only)
+            out.append(DiagnosticCause(
+                "BACKGROUND_COMPONENT_DERIVED", Status.WARN, False,
+                "background component(s) are in a derived abnormal state that the supervisor has not settled (display only): "
+                + ", ".join(f"{c.component} ({c.display_state})" for c in derived),
+                "check the Runner; the underlying component state is unchanged and a lookup starts nothing",
+                components=derived))
+        stall, config = snap.sweeper_stall, snap.sweeper_config_invalid
+        if stall is not None and stall.stalled:
+            out.append(DiagnosticCause(
+                "SWEEPER_STALLED", Status.WARN, False,
+                f"the orphan sweeper is stalled at the position {stall.current_failure_cursor} (first failure at "
+                f"{stall.first_failure_cursor}) after {stall.consecutive_failures} failed passes (last fixed failure code "
+                f"{stall.last_failure_code}, counted since the Runner started); it skips no row and retries with a capped backoff",
+                "diagnose the failing page or classification (an operator action; B2 never skips the row)", sweeper=stall))
+        if config is not None and config.config_invalid_active:
+            if config.config_currently_valid is True:
+                text = ("an earlier orphan sweeper configuration error is not cleared yet; the configuration is valid now and "
+                        "the state clears when a pass has passed the position "
+                        f"({config.config_invalid_trigger_position}); no row is skipped")
+                rec = "no correction is needed; wait for the sweeper pass"
+            else:
+                text = ("the orphan sweeper configuration is invalid (the fixed code SWEEP_CONFIG_INVALID); the entry of a pass "
+                        f"failed at the trigger position ({config.config_invalid_trigger_position}); the last entry-time "
+                        "snapshot failure set a wait of ORPHAN_SWEEP_CONFIG_FALLBACK_SECONDS that the wake-up of CI-7 ends "
+                        "once when the configuration is valid again; no row is skipped")
+                rec = ("correct the sweeper configuration (an operator action); the state clears when the failure position "
+                       "has been passed afterwards")
+            neutral = SweeperStallSnapshot(False, None, None, None, None, 0, None, None, None)
+            out.append(DiagnosticCause("SWEEPER_CONFIG_INVALID", Status.WARN, False, text, rec,
+                                       sweeper=stall if stall is not None else neutral, config_invalid=config))
+        return out
+
+    def _process_tracking_item(self, reading: tuple[str, object]) -> DiagnosticItem:
+        """6.2: the reason codes are the `cause`; `blocks_features` only for the three non-SUPPORTED states."""
+        kind, value = reading
+        state = getattr(value, "state", None) if kind == "ok" else None
+        reason = getattr(value, "reason_code", None) if kind == "ok" else None
+        suffix = f" ({reason})" if reason else ""
+        if state == "SUPPORTED":
+            return self._item("PROCESS_TRACKING", Status.PASS, "process tracking is supported by the Runner of this host")
+        if state == "UNSUPPORTED_PLATFORM":
+            item = self._item("PROCESS_TRACKING", Status.WARN,
+                              "PROCESS_TRACKING_UNSUPPORTED_PLATFORM: process tracking is not supported on this platform; "
+                              "workflow Tasks and TESTER steps still run, untracked",
+                              "run the Runner on a supported host for features that require tracked commands")
+        elif state == "UNAVAILABLE":
+            item = self._item("PROCESS_TRACKING", Status.FAIL,
+                              f"PROCESS_TRACKING_UNAVAILABLE: the tracking self-test of the Runner failed{suffix}; tracked "
+                              "TESTER steps fail closed", "fix the host environment and restart the Runner", True)
+        else:
+            why = {"unconfigured": "the capability reader is not configured",
+                   "failed": "the capability could not be read"}.get(
+                kind, "the capability of the current Runner incarnation cannot be confirmed")
+            item = self._item("PROCESS_TRACKING", Status.UNKNOWN, f"PROCESS_TRACKING_STATUS_UNKNOWN: {why}",
+                              "wait for the Runner to publish its capability, or retry the diagnostics later")
+        return dataclasses.replace(item, blocks_features=("TEST_RUN",))
+
+    def _tracked_item(self, reading: tuple[str, object]) -> DiagnosticItem:
+        """14.1: every applicable cause, merged and ordered; the status is the highest severity; normal progress is only
+        information in the text and keeps PASS."""
+        kind, value = reading
+        if kind != "ok":
+            why = ("the tracked-executions reader is not configured" if kind == "unconfigured"
+                   else "the tracked executions of the project could not be read")
+            return self._unknown("TRACKED_EXECUTIONS", why)
+        causes = merge_causes(value.causes)
+        if not causes:
+            text = (f"{value.running} tracked executions running" if value.running
+                    else "the project has no unresolved or anomalous tracked execution")
+            return self._item("TRACKED_EXECUTIONS", Status.PASS, text)
+        status = max((c.severity for c in causes), key=_SEVERITY_RANK.get)
+        text = "; ".join(c.cause for c in causes)
+        if value.running:
+            text += f"; {value.running} tracked executions running"
+        return DiagnosticItem("TRACKED_EXECUTIONS", status, self._now(), text,
+                              "; ".join(dict.fromkeys(c.recommendation for c in causes)),
+                              any(c.blocks_execution for c in causes), causes)
 
     def _lock_item(self, view: _ProjectView) -> DiagnosticItem:
         if view.write_owner_task_id is not None:

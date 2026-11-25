@@ -20,7 +20,7 @@ from app.repositories.artifact_repository import ArtifactRepository
 from app.repositories.task_repository import TaskRepository
 from app.services.completion_checker import DoDInput, evaluate_definition_of_done
 from app.services.fingerprints import design_review_basis, profile_criteria_of
-from app.services.runtime_status import RuntimeSnapshot
+from app.services.runtime_status import RuntimeSnapshot, sweeper_status_dict
 from app.validation import policies as P
 from app.validation.exceptions import NotFound, ValidationFailed
 from app.validation.validators import validate_artifact_kind
@@ -284,6 +284,8 @@ class ReportService:
                 "decision": decision.decision if decision else None,
                 "selected_option": _s(sanitizer, decision.selected_option, 64) if decision and decision.selected_option else None,
                 "rationale": _s(sanitizer, decision.rationale) if decision and decision.rationale else None,
+                # the stored payload is the snapshot at the opening of the gate, never the options selectable now (design 7.5 item 2)
+                "request_label": "SNAPSHOT_AT_OPENING",
                 "request": _sj(sanitizer, {"target": approval.target, "request_payload": approval.request_payload},
                                max_bytes=8 * 1024)}
 
@@ -323,10 +325,14 @@ class ReportService:
                 "event": _sj(sanitizer, row.event, max_bytes=8 * 1024) if row.event is not None else None}
 
     def _runtime(self) -> dict:
+        """The runtime part (14.2): a plain dictionary that `RuntimeOut` validates in `finalize`. `warnings` and `sweeper` are
+        always present (`[]` and the default object when the state is UNKNOWN); no cursor, no component list."""
         if self._get_runtime is None:
-            return {"state": "UNKNOWN", "ready": None, "blockers": []}
+            return {"state": "UNKNOWN", "ready": None, "blockers": [], "warnings": [],
+                    "sweeper": sweeper_status_dict(None, None), "background_degraded": False}
         snap = self._get_runtime()
-        return {"state": "KNOWN", "ready": snap.ready, "blockers": list(snap.blockers)}
+        return {"state": "KNOWN", "ready": snap.ready, "blockers": list(snap.blockers), "warnings": list(snap.warnings),
+                "sweeper": snap.sweeper, "background_degraded": snap.background_degraded}
 
     def _next_actions(self, task: Task, pending: list, has_open_request: bool) -> list[dict]:
         status = TaskState(task.status)

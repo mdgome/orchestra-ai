@@ -156,9 +156,9 @@ def stall_body(r: Runner, monkeypatch, *, ignore_cancel=False, only_periodic=Fal
 def count_rest(r: Runner, monkeypatch) -> list:
     calls, real = [], r._recover_rest
 
-    async def rest(summary):
+    async def rest(summary, generation=None, startup=False):    # B2 signature (SUP-19 / R31-4): forwarded as it comes
         calls.append(summary)
-        return await real(summary)
+        return await real(summary, generation, startup)
 
     monkeypatch.setattr(r, "_recover_rest", rest)
     return calls

@@ -6,8 +6,11 @@ from sqlalchemy import (
     BigInteger, CheckConstraint, DateTime, Float, ForeignKey, ForeignKeyConstraint, Index, Integer, LargeBinary, String,
     Text, UniqueConstraint, func, text,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+from app.repositories.tracked_sql import ANOMALY_SQL, U_SQL
+from app.validation import policies as P
 
 
 class Base(DeclarativeBase):
@@ -268,6 +271,12 @@ class Execution(Base):
     stderr_tail: Mapped[str | None] = mapped_column(Text)
     discarded_result: Mapped[dict | None] = mapped_column(JSONB)
     detail: Mapped[dict | None] = mapped_column(JSONB)
+    __table_args__ = (
+        # B2 (migration 0005): the partial predicates are the canonical raw SQL of app/repositories/tracked_sql.py, written as
+        # literals (an index predicate cannot hold a bind); a test compares them with the frozen migration text.
+        Index("ix_executions_tracked_unresolved", "task_id", postgresql_where=text(U_SQL)),
+        Index("ix_executions_tracked_anomaly", "task_id", postgresql_where=text(ANOMALY_SQL)),
+    )
 
 
 class StateTransition(Base):
@@ -306,6 +315,9 @@ class Approval(Base):
         # At most one pending PROJECT_DIRTY recovery gate per task (back-stop for the row-lock check).
         Index("uq_approvals_project_dirty_pending", "task_id", unique=True,
               postgresql_where=text("status = 'PENDING' AND (target ->> 'reason_code') = 'PROJECT_DIRTY'")),
+        # B2 (migration 0005): at most one direct successor per approval (the lineage lives in `target`, written once).
+        Index("uq_approvals_lineage_successor", text("(target ->> 'supersedes_approval_id')"), unique=True,
+              postgresql_where=text("(target ->> 'supersedes_approval_id') IS NOT NULL")),
     )
 
 
@@ -379,4 +391,58 @@ class AgentSession(Base):
             name="ck_agent_sessions_role"),
         CheckConstraint("provider IN ('CODEX','CLAUDE')", name="ck_agent_sessions_provider"),
         CheckConstraint("status IN ('ACTIVE','INVALID','CLOSED')", name="ck_agent_sessions_status"),
+    )
+
+
+class RuntimeCapability(Base):
+    """Process-tracking capability shared with API-only instances (design 6.2): one row per key (`process_tracking`)."""
+    __tablename__ = "runtime_capabilities"
+    key: Mapped[str] = mapped_column(Text, primary_key=True)
+    value: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ProcessRiskRequest(Base):
+    """An operator's risk-acceptance or recheck request (design 7.5 item 4); the request id is the approval id.
+    `target_execution_ids` is the final snapshot (sorted ascending); no foreign key points into `executions` on purpose."""
+    __tablename__ = "process_risk_requests"
+    approval_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("approvals.id", name="fk_process_risk_requests_approval_id"), primary_key=True)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tasks.id", name="fk_process_risk_requests_task_id"), nullable=False)
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("projects.id", name="fk_process_risk_requests_project_id"), nullable=False)
+    dirty_epoch: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    target_execution_ids: Mapped[list[uuid.UUID]] = mapped_column(ARRAY(UUID(as_uuid=True)), nullable=False)
+    requested_by: Mapped[str | None] = mapped_column(Text)
+    rationale: Mapped[str] = mapped_column(Text, nullable=False)
+    claimed_by_incarnation: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    claim_generation: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0", nullable=False)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    reason: Mapped[str | None] = mapped_column(Text)
+    result: Mapped[dict] = mapped_column(JSONB, server_default=text("'{}'::jsonb"), nullable=False)
+    created_at: Mapped[datetime] = _now()
+    updated_at: Mapped[datetime] = _now()
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        CheckConstraint("kind IN ('ACCEPT','RECHECK')", name="ck_process_risk_requests_kind"),
+        CheckConstraint("status IN ('REQUESTED','VERIFYING','APPLIED','REFUSED_ALIVE','RETRYABLE','NEEDS_REDECISION')",
+                        name="ck_process_risk_requests_status"),
+        # The absolute limit is fixed in the migration (a corruption/runaway guard); it never reads a runtime constant.
+        CheckConstraint(f"cardinality(target_execution_ids) BETWEEN 1 AND {P.PROCESS_RISK_TARGETS_DB_LIMIT}",
+                        name="ck_process_risk_requests_target_count"),
+        CheckConstraint(f"requested_by IS NULL OR char_length(requested_by) BETWEEN 1 AND {P.REQUESTED_BY_MAX_LENGTH}",
+                        name="ck_process_risk_requests_requested_by"),
+        CheckConstraint(f"char_length(rationale) BETWEEN 1 AND {P.PROCESS_RISK_RATIONALE_MAX_LENGTH}",
+                        name="ck_process_risk_requests_rationale"),
+        Index("ix_process_risk_requests_status_next_attempt", "status", "next_attempt_at"),
+        Index("ix_process_risk_requests_project_finished", "project_id", "finished_at",
+              postgresql_where=text("finished_at IS NOT NULL")),
+        Index("uq_process_risk_recheck_active", "project_id", "dirty_epoch", unique=True,
+              postgresql_where=text("kind = 'RECHECK' AND status IN ('REQUESTED','VERIFYING','RETRYABLE')")),
     )

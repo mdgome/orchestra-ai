@@ -17,6 +17,7 @@ from app.repositories.approval_repository import ApprovalRepository, ExecutionRe
 from app.repositories.task_repository import TaskRepository
 from app.services.fingerprints import current_basis
 from app.services.hashing import stable_hash
+from app.services.dirty_gate_options import ProviderResult
 from app.services.recovery_effects import EffectRetry, RecoveryEffects
 from app.services.state_service import change_step_state, change_task_state
 from app.validation import policies as P
@@ -44,8 +45,11 @@ class DecisionOutcome:
     created: bool           # False -> an identical earlier decision was returned (HTTP 200)
 
 
-def request_fingerprint(decision: str, selected_option: str | None) -> str:
-    return stable_hash("decision", decision, selected_option or "")
+def request_fingerprint(decision: str, selected_option: str | None, requested_by: str | None = None) -> str:
+    """Without `requested_by` the input is byte-identical to the pre-B2 fingerprint (no new null key); with it, it is part of it."""
+    if requested_by is None:
+        return stable_hash("decision", decision, selected_option or "")
+    return stable_hash("decision", decision, selected_option or "", "requested_by", requested_by)
 
 
 class HumanGateService:
@@ -57,6 +61,9 @@ class HumanGateService:
         self._now = clock
         self.effects = effects
         self._measure = measure
+        for effect in (effects.all() if effects is not None else ()):
+            if hasattr(effect, "bind"):
+                effect.bind(self)
 
     # --- opening gates (always inside the caller's transaction) -----------------------------
     async def open_gate(self, session: AsyncSession, task: Task, step: TaskStep | None, *, type_: ApprovalType,
@@ -101,11 +108,31 @@ class HumanGateService:
             session, task, step, type_=ApprovalType.RECOVERY, checkpoint_step_key=checkpoint_step_key,
             request_payload=payload, target=target, scope="STEP")
 
+    # --- reads: the options provider (design 7.5 item 2) --------------------------------------------------------------
+    async def current_options_for_approvals(self, session: AsyncSession, approvals) -> dict:
+        """`options_provider(session, approvals) -> {approval_id: ProviderResult | None}`; None = a static gate. A PENDING, unexpired
+        dynamic gate gets the recomputed options; a DECIDED, rejected or expired one gets `[]`. Batch: the effect loads in bulk."""
+        out: dict = {}
+        live: dict = {}
+        for approval in approvals:
+            effect = self._effect_for(approval)
+            if effect is None or not hasattr(effect, "allowed_options_batch"):
+                out[approval.id] = None
+            elif approval.status != "PENDING" or approval.valid_until <= self._now():
+                out[approval.id] = ProviderResult([], [])
+            else:
+                live.setdefault(effect, []).append(approval)
+        for effect, items in live.items():
+            out.update(await effect.allowed_options_batch(session, items))
+        return out
+
     # --- decisions --------------------------------------------------------------------------
     async def decide(self, approval_id: uuid.UUID, *, decision: str, selected_option: str | None,
-                     rationale: str | None, idempotency_key: str | None) -> DecisionOutcome:
+                     rationale: str | None, idempotency_key: str | None, requested_by: str | None = None) -> DecisionOutcome:
         V.validate_decision(decision, idempotency_key, selected_option)
-        fp = request_fingerprint(decision, selected_option)
+        rationale = V.validate_rationale(rationale, selected_option)             # before any transaction (422)
+        requested_by = V.validate_requested_by(requested_by, selected_option)
+        fp = request_fingerprint(decision, selected_option, requested_by)
         # Optimistic retry: anything that needs the workspace measured is measured OUTSIDE the transaction. If the
         # proof is stale when it is checked under the project lock, the whole transaction rolled back (no decision,
         # no status change, no RESUME request was committed) and the decision is retried as ONE logical decision
@@ -114,7 +141,7 @@ class HumanGateService:
             prepared = await self._prepare(approval_id, decision, selected_option)
             try:
                 return await self._decide_once(approval_id, decision, selected_option, rationale, idempotency_key,
-                                               fp, prepared)
+                                               fp, prepared, requested_by)
             except EffectRetry:
                 continue
         raise ProofUnstable("the project workspace kept changing while the decision was being applied; nothing was "
@@ -138,7 +165,8 @@ class HumanGateService:
             return None
         return self.effects.get((approval.target or {}).get("reason_code"))
 
-    async def _decide_once(self, approval_id, decision, selected_option, rationale, idempotency_key, fp, prepared):
+    async def _decide_once(self, approval_id, decision, selected_option, rationale, idempotency_key, fp, prepared,
+                           requested_by=None):
         async with self.db.transaction() as s:
             repo = ApprovalRepository(s)
             approval = await repo.lock(approval_id)                     # (1) serialise concurrent decisions
@@ -161,7 +189,8 @@ class HumanGateService:
                 raise StaleBasis("the plan/requirements/decisions changed after this approval was requested",
                                  {"approval_basis": approval.basis})
             options = [o.get("id") for o in approval.request_payload.get("options", []) if isinstance(o, dict)]
-            if decision == "APPROVED" and options and selected_option not in options:
+            dynamic = hasattr(self._effect_for(approval), "allowed_options")     # its effect validates the option under the project lock
+            if decision == "APPROVED" and options and not dynamic and selected_option not in options:
                 raise V.ValidationFailed("selected_option must be one of the offered options", {"options": options})
             row = ApprovalDecision(
                 id=uuid.uuid4(), approval_id=approval_id, decision=decision, selected_option=selected_option,
@@ -169,21 +198,20 @@ class HumanGateService:
             if not await repo.insert_decision_if_absent(row):
                 raise Conflict("approval was decided concurrently")
             await repo.mark_decided(approval_id)
-            await self._apply(s, repo, approval, task, row, prepared)   # (4) effects, same transaction
+            await self._apply(s, repo, approval, task, row, prepared, requested_by)   # (4) effects, same transaction
             stored = await repo.get_decision(approval_id)
             return DecisionOutcome(stored, created=True)
 
     async def _apply(self, s: AsyncSession, repo: ApprovalRepository, approval: Approval, task: Task,
-                     decision: ApprovalDecision, prepared=None) -> None:
+                     decision: ApprovalDecision, prepared=None, requested_by: str | None = None) -> None:
         approved = decision.decision == "APPROVED"
         type_ = ApprovalType(approval.type)
         resume = approved
         effect = self._effect_for(approval)
         if effect is not None:
-            result = await effect.apply(s, repo, approval, task, decision, prepared)
+            result = await effect.apply(s, repo, approval, task, decision, prepared, requested_by=requested_by)
             if result.resume:
-                await ExecutionRequestRepository(s).add(ExecutionRequest(
-                    id=uuid.uuid4(), task_id=task.id, kind="RESUME", status="PENDING", approval_id=approval.id))
+                await ExecutionRequestRepository(s).add_resume_if_absent(task.id, approval.id)
             return
         if type_ is ApprovalType.DESIGN:
             summary = f"{decision.decision}: {decision.selected_option or '-'}: {decision.rationale or ''}"
@@ -206,5 +234,4 @@ class HumanGateService:
                                     failure_reason=f"{approval.type}_REJECTED", project_proof=prepared)
             return
         # Approval decision and the RESUME request are one transaction; approval_id is UNIQUE.
-        await ExecutionRequestRepository(s).add(ExecutionRequest(
-            id=uuid.uuid4(), task_id=task.id, kind="RESUME", status="PENDING", approval_id=approval.id))
+        await ExecutionRequestRepository(s).add_resume_if_absent(task.id, approval.id)

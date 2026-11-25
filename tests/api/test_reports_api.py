@@ -24,6 +24,8 @@ from tests.api.test_api import assert_envelope
 from tests.harness import BAD_CODE, GATE, GOOD_CODE, PLAN, Harness, design_pass, structured
 
 UNKNOWN = "00000000-0000-0000-0000-000000000000"
+DEFAULT_SWEEPER = {"stalled": False, "consecutive_failures": 0, "last_failure_code": None, "last_failure_at": None,
+                   "next_retry_at": None, "config_invalid_active": False, "clearance_pending": False}
 NATIVE = "native-dev-session-ABC123"
 SECRETS = ("ghp_abcdefghijklmnop1234", "s3cretT0ken", NATIVE)
 
@@ -113,7 +115,10 @@ async def test_the_report_of_a_completed_task_is_built_from_stored_facts_and_not
         assert now["all_met"] is True and now["evaluated_at"] and "neither confirms nor cancels" in now["note"]
         assert {c["id"] for c in now["conditions"]} >= {"tests_passed", "review_verdict_pass", "design_review_valid"}
         assert now["evaluation_basis"]["test_artifact_id"] and report["next_actions"][0]["code"] == "REVIEW_CHANGES"
-        assert report["runtime"] == {"state": "UNKNOWN", "ready": None, "blockers": []}
+        # exact dict kept: the report runtime part gains `warnings`, `sweeper` (the default SweeperStatusOut) and
+        # `background_degraded` (RuntimeOut, 14.2); an UNKNOWN runtime carries the defaults
+        assert report["runtime"] == {"state": "UNKNOWN", "ready": None, "blockers": [], "warnings": [],
+                                     "sweeper": DEFAULT_SWEEPER, "background_degraded": False}
         # reading never runs an agent, a command or writes an execution
         assert before == (len(h.claude.calls), len(h.codex.calls), len(await h.executions(task.id)))
 
@@ -194,6 +199,7 @@ async def test_a_waiting_task_lists_the_open_gate_and_its_history(db, tmp_path):
         gate = report["human_gates"][0]
         assert gate["type"] == "DESIGN" and gate["status"] == "PENDING" and gate["decision"] is None
         assert [o["id"] for o in gate["request"]["value"]["request_payload"]["options"]] == ["A", "B"]
+        assert gate["request_label"] == "SNAPSHOT_AT_OPENING"           # the stored payload is the snapshot at opening
         assert report["next_actions"][0]["code"] == "DECIDE_GATE" and gate["id"] in report["next_actions"][0]["text"]
         await h.decide(uuid.UUID(gate["id"]))
         await h.run_until_idle()
@@ -222,7 +228,8 @@ async def test_a_waiting_request_is_explained_by_the_runtime_provider_when_one_i
         report = (await client.get(f"/tasks/{task.id}/report")).json()
     action = report["next_actions"][0]
     assert action["code"] == "RUNNER_NOT_READY" and "PREFLIGHT_FAILED" in action["text"] and "PENDING" in action["text"]
-    assert report["runtime"] == {"state": "KNOWN", "ready": False, "blockers": ["PREFLIGHT_FAILED"]}
+    assert report["runtime"] == {"state": "KNOWN", "ready": False, "blockers": ["PREFLIGHT_FAILED"], "warnings": [],
+                                 "sweeper": DEFAULT_SWEEPER, "background_degraded": False}
 
 
 # --- isolation and errors --------------------------------------------------------------------------------------------------
@@ -346,3 +353,61 @@ async def test_session_ids_credentials_and_manifests_never_appear_in_any_respons
     assert "sess:" in report["implementation"]["summary"] and "***" in report["implementation"]["summary"]
     assert str(task.id) in bodies[0]                              # ordinary UUIDs are kept, not turned into fingerprints
     assert re.search(r"sess:[0-9a-f]{8}", report["code_review"]["summary"])
+
+
+# --- B2 phase 6: the runtime part of the report (design 14.2, section 13 'Report runtime schema') -------------------------------
+async def runtime_part(db, tmp_path, snapshot):
+    client, h, task = await run(db, tmp_path, start=False, runtime=lambda: snapshot)
+    async with client:
+        response = await client.get(f"/tasks/{task.id}/report")
+    assert response.status_code == 200
+    return response.json()["runtime"]
+
+
+async def test_a_stalled_sweeper_reaches_the_http_report_with_the_status_and_no_cursor(db, tmp_path):
+    from datetime import UTC, datetime
+    from app.services import sweeper_stall as ss
+    from app.services.runtime_status import RunnerRuntimeState
+    now = datetime(2026, 11, 24, 12, 0, tzinfo=UTC)
+    cursor = uuid.UUID(int=77)
+    st = ss.SweeperStallState(threshold=1)
+    st.record_failed_pass(pass_start=None, position=cursor, kind=ss.CANDIDATE, code="SWEEP_QUERY_FAILED", now=now,
+                          retry_delay_seconds=30)
+    snapshot = runtime_snapshot(L.RUNNING, S.STARTED, False, RunnerRuntimeState(
+        sweeper_stall=st.snapshot(), sweeper_config_invalid=st.config_snapshot(), background_degraded=True))
+    runtime = await runtime_part(db, tmp_path, snapshot)
+    assert runtime == {"state": "KNOWN", "ready": True, "blockers": [],
+                       "warnings": ["BACKGROUND_COMPONENT_DEGRADED", "SWEEPER_STALLED"], "background_degraded": True,
+                       "sweeper": {"stalled": True, "consecutive_failures": 1, "last_failure_code": "SWEEP_QUERY_FAILED",
+                                   "last_failure_at": "2026-11-24T12:00:00Z", "next_retry_at": "2026-11-24T12:00:30Z",
+                                   "config_invalid_active": False, "clearance_pending": False}}
+    assert str(cursor) not in str(runtime)
+
+
+async def test_a_configuration_invalid_state_reaches_the_http_report_immediately(db, tmp_path):
+    from datetime import UTC, datetime
+    from app.services import sweeper_stall as ss
+    from app.services.runtime_status import RunnerRuntimeState
+    st = ss.SweeperStallState()
+    st.record_config_invalid(pass_start=None, boundary_cursor=None, now=datetime(2026, 11, 24, tzinfo=UTC),
+                             fallback_seconds=86400.0)
+    snapshot = runtime_snapshot(L.RUNNING, S.STARTED, False, RunnerRuntimeState(
+        sweeper_stall=st.snapshot(), sweeper_config_invalid=st.config_snapshot()))
+    runtime = await runtime_part(db, tmp_path, snapshot)
+    assert runtime["warnings"] == ["SWEEPER_CONFIG_INVALID"] and runtime["sweeper"]["config_invalid_active"] is True
+    assert runtime["sweeper"]["stalled"] is False and runtime["blockers"] == [] and runtime["ready"] is True
+
+
+async def test_an_api_only_instance_reports_the_default_sweeper_and_no_warning(db, tmp_path):
+    runtime = await runtime_part(db, tmp_path, runtime_snapshot(L.STOPPED, S.ALREADY_ACTIVE, False))
+    assert runtime == {"state": "KNOWN", "ready": False, "blockers": ["ADVISORY_LOCK_HELD"], "warnings": [],
+                       "sweeper": DEFAULT_SWEEPER, "background_degraded": False}
+
+
+async def test_the_http_report_runtime_part_has_no_component_list_and_a_derived_item_changes_nothing_in_it(db, tmp_path):
+    from app.services.runtime_status import BackgroundComponentStatus, RunnerRuntimeState
+    derived = BackgroundComponentStatus("sweeper", None, None, False, "EXITED_UNSUPERVISED")
+    snapshot = runtime_snapshot(L.RUNNING, S.STARTED, False, RunnerRuntimeState(background_components=(derived,)))
+    runtime = await runtime_part(db, tmp_path, snapshot)
+    assert set(runtime) == {"state", "ready", "blockers", "warnings", "sweeper", "background_degraded"}
+    assert runtime["background_degraded"] is False and runtime["warnings"] == [] and runtime["ready"] is True

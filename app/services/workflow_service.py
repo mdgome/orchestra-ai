@@ -28,9 +28,11 @@ from app.models.states import (
     STEP_CODE_REVIEW, STEP_DESIGN_REVIEW, STEP_DEVELOP, STEP_PLAN, STEP_ROLE, STEP_TASK_STATE, STEP_TEST,
     TERMINAL_TASK_STATES, ApprovalType, CliOutcome, StepState, TaskState,
 )
-from app.models.tables import Approval, Execution, Task, TaskStep
+from app.models.tables import Approval, Execution, Project, Task, TaskStep
 from app.providers.permissions import authorize_one_off, is_test_path, permissions_for
 from app.repositories.approval_repository import ApprovalRepository, ExecutionRequestRepository
+from app.repositories.process_risk_repository import ProcessRiskRequestRepository
+from app.repositories.project_repository import ProjectRepository
 from app.repositories.task_repository import TaskRepository
 from app.services import artifacts as A
 from app.services import context_service as C
@@ -40,12 +42,17 @@ from app.services.fingerprints import design_review_basis, profile_criteria_of, 
 from app.services.hashing import stable_hash
 from app.services.human_gate_service import HumanGateService
 from app.services.lease_service import Lease, LeaseService
+from app.services.approval_lineage import GateLineage
+from app.services.dirty_gate_options import RISK_OPTION_KIND
 from app.services.project_lock_service import ProjectLockService, StepGate
 from app.services.project_terminal import UNMEASURED, FingerprintProofStale
+from app.services.risk_followup import open_followup_gate
 from app.services.session_service import SessionService
 from app.services.state_service import change_step_state, change_task_state
+from app.services.tracked_classifier import RowClass, classify_row, decode_detail
 from app.services.step_runner import (
-    LimitExceeded, StepExecution, StepHandle, StepRunner, TaskCancelled, TerminationUnconfirmed,
+    LimitExceeded, ProcessTrackingUnavailable, StepExecution, StepHandle, StepRunner, TaskCancelled,
+    TerminationUnconfirmed, TrackedCommandSession,
 )
 from app.services.task_finalizer import TaskFinalizer
 from app.services.test_policy_service import TestPolicyService, compute_test_signals
@@ -104,6 +111,25 @@ class RunContext:
     request_id: uuid.UUID | None = None
     project_proof: object = None          # FingerprintProof / UNMEASURED for the terminal transition being completed
     defer_reset: bool = False
+    # lineage of the approval this run resumed from (design 7.5 item 11): set ONLY by the verified step L of
+    # `_resume_from_approval`, never from a request body; None for every other run
+    resumed_from_approval_id: uuid.UUID | None = None
+    lineage_root_id: uuid.UUID | None = None
+
+
+RESUME, PARKED, IDEMPOTENT_DONE, FAIL_CLOSED_ACTION = "RESUME", "PARKED", "IDEMPOTENT_DONE", "FAIL_CLOSED"
+
+
+@dataclass(frozen=True)
+class ResumeOutcome:
+    """What `_resume_from_approval` decided inside its (committed) transaction; `run_task` acts on it AFTER the commit
+    (design 7.5 item 10). `parked`: a gate was created or kept, the lease released, the run must stop driving."""
+    action: str
+    code: str | None = None
+    parked: bool = False
+    gate_id: uuid.UUID | None = None
+    request_status: str | None = None
+    message: str | None = None
 
 
 class WorkflowService:
@@ -132,7 +158,11 @@ class WorkflowService:
             ctx = RunContext(lease, workspace, request_id=request_id)
         try:
             if resume_approval_id is not None:
-                await self._resume_from_approval(ctx, task_id, resume_approval_id)
+                outcome = await self._resume_from_approval(ctx, task_id, resume_approval_id)
+                if outcome.parked:
+                    ctx.parked = True                      # after the commit: gate, lease release and outcome are one transaction
+                if outcome.action == FAIL_CLOSED_ACTION:
+                    raise FailClosed(outcome.message or outcome.code or "resume refused")
             while not ctx.parked:
                 task = await self._get_task(task_id)
                 state = TaskState(task.status)
@@ -155,9 +185,12 @@ class WorkflowService:
         except (LimitExceeded, PolicyViolation) as exc:
             await self._guarded(self._fail(ctx, task_id, exc.reason, str(exc)))
         except TerminationUnconfirmed as exc:
-            await self._guarded(self._park_for_recovery(ctx, task_id, f"CLI termination not confirmed: {exc.message}"))
+            await self._guarded(self._park_for_recovery(ctx, task_id, f"CLI termination not confirmed: {exc.message}",
+                                                        exc.checkpoint_step_key))
         except SnapshotError as exc:      # BEFORE FailClosed (its base): the CLI result is already recorded
             await self._guarded(self._fail(ctx, task_id, "SNAPSHOT_FAILED", exc.message))
+        except ProcessTrackingUnavailable as exc:      # BEFORE FailClosed (its base): no process ran (7.2 item 6)
+            await self._guarded(self._fail(ctx, task_id, P.PROCESS_TRACKING_UNAVAILABLE, exc.message))
         except FailClosed as exc:
             await self._guarded(self._fail(ctx, task_id, "FAIL_CLOSED", exc.message))
         return str(TaskState((await self._get_task(task_id)).status))
@@ -229,15 +262,18 @@ class WorkflowService:
         await self.finalizer.finalize_task_with_proof(task_id, work)
         self.events.publish(task_id, {"event": "task.finished", "status": "CANCELLED"})
 
-    async def _park_for_recovery(self, ctx: RunContext, task_id: uuid.UUID, reason: str) -> None:
+    async def _park_for_recovery(self, ctx: RunContext, task_id: uuid.UUID, reason: str,
+                                 checkpoint_step_key: str | None = None) -> None:
         """Task=WAITING_APPROVAL + RECOVERY approval + Step=NEEDS_MANUAL_RECOVERY in one transaction.
-        The run/lease is deliberately NOT released: its processes are not proven stopped."""
+        The run/lease is deliberately NOT released: its processes are not proven stopped. With no RUNNING/INTERRUPTED step the
+        checkpoint is the one the failing call named (`STEP_TEST` for a tracked command that ran before the tester step
+        began), not PLAN."""
         async with self.db.transaction() as s:
             task = await TaskRepository(s).lock(task_id)
             await self.leases.verify(s, ctx.lease)
             step = next((st for st in reversed(await TaskRepository(s).steps_for_task(task_id))
                          if StepState(st.status) in (StepState.RUNNING, StepState.INTERRUPTED)), None)
-            key = step.step_key if step else STEP_PLAN
+            key = step.step_key if step else (checkpoint_step_key or STEP_PLAN)
             await self.gates.open_recovery(s, task, step, reason=reason, checkpoint_step_key=key)
         ctx.parked = True
 
@@ -253,33 +289,184 @@ class WorkflowService:
     # ================================================================================================
     # resume
     # ================================================================================================
-    async def _resume_from_approval(self, ctx: RunContext, task_id: uuid.UUID, approval_id: uuid.UUID) -> None:
+    async def _resume_from_approval(self, ctx: RunContext, task_id: uuid.UUID, approval_id: uuid.UUID) -> ResumeOutcome:
+        """The authoritative handling table of design 7.5 item 10, evaluated in the common tier order
+        1, 6, L, 2, 3, 5, 4, 7, 8, 12, 13, 9, 10, 11, T9, 14 (rows 4 to 16 only for a risk-option decision; every other approval runs
+        rows 1 to 3 and then today's state change). Returns the outcome; `run_task` acts on it after the commit."""
         async with self.db.transaction() as s:
-            task = await TaskRepository(s).lock(task_id)
+            task = await TaskRepository(s).lock(task_id)                                   # Task -> Project -> request row
             await self.leases.verify(s, ctx.lease)
             repo = ApprovalRepository(s)
             approval = await repo.get(approval_id)
             decision = await repo.get_decision(approval_id) if approval else None
-            if approval is None or decision is None or approval.task_id != task_id:
-                raise FailClosed("resume request has no decided approval")
-            if TaskState(task.status) is not TaskState.WAITING_APPROVAL:
-                return                                   # already resumed by an earlier consumption
+            if approval is None or decision is None or approval.task_id != task_id:        # row 1 (T1): raised, nothing written
+                raise FailClosed("resume request has no decided approval", {"code": "APPROVAL_NOT_APPLICABLE"})
+            risk = approval.type == str(ApprovalType.RECOVERY) and decision.selected_option in RISK_OPTION_KIND
+            request = await ProcessRiskRequestRepository(s).get(approval.id) if risk else None
+            if risk:
+                if task.project_id is None or str(task.project_id) != str((approval.target or {}).get("project_id")):
+                    return await self._row_project_mismatch(s, task, approval, request)    # row 6 (T1)
+                await self._restore_lineage(s, ctx, task, approval, decision, request)     # step L: read-only
+            if TaskState(task.status) is not TaskState.WAITING_APPROVAL:                   # row 2 (T2)
+                return ResumeOutcome(IDEMPOTENT_DONE, "TASK_NOT_WAITING_APPROVAL")         # already resumed by an earlier consumption
             if approval.type == str(ApprovalType.RECOVERY):
                 problem = await self._recovery_unsafe(s, task, approval, decision.selected_option, ctx.workspace)
-                if problem:
-                    await self.gates.open_recovery(s, task, None, reason=problem,
-                                                   checkpoint_step_key=approval.checkpoint_step_key)
+                if problem:                                                                # row 3 (T2): any-type PENDING guard (C-a)
+                    pending = await repo.pending_for_task(task.id)
+                    gate = pending[0] if pending else await self.gates.open_recovery(
+                        s, task, None, reason=problem, checkpoint_step_key=approval.checkpoint_step_key)
                     await self.leases.release(ctx.lease, "WAITING_APPROVAL", session=s)
-                    ctx.parked = True
-                    return
-            stage = STEP_TASK_STATE[approval.checkpoint_step_key]
-            if approval.type == str(ApprovalType.DESIGN) and approval.checkpoint_step_key == STEP_PLAN:
-                await s.execute(update(Task).where(Task.id == task.id).values(plan_revision=Task.plan_revision + 1))
-            if approval.type == str(ApprovalType.PERMISSION):
-                ctx.resume_approval = approval
-            await s.execute(update(Task).where(Task.id == task.id).values(resume_step_key=None))
-            await change_task_state(s, task, stage, reason="resumed_after_approval",
-                                    event={"approval_id": str(approval.id), "type": approval.type})
+                    return ResumeOutcome(PARKED, None, True, gate.id, request.status if request else None, problem)
+            if risk:
+                return await self._risk_rows(s, ctx, task, approval, decision, request)    # rows 5, 4, 7, 8, 12, 13, 9, 10, 11, T9, 14
+            return await self._proceed_resume(s, ctx, task, approval)
+
+    async def _proceed_resume(self, s: AsyncSession, ctx: RunContext, task: Task, approval: Approval,
+                              request_status: str | None = None) -> ResumeOutcome:
+        """Row 14 (and every ordinary resume): today's state change, unchanged."""
+        stage = STEP_TASK_STATE[approval.checkpoint_step_key]
+        if approval.type == str(ApprovalType.DESIGN) and approval.checkpoint_step_key == STEP_PLAN:
+            await s.execute(update(Task).where(Task.id == task.id).values(plan_revision=Task.plan_revision + 1))
+        if approval.type == str(ApprovalType.PERMISSION):
+            ctx.resume_approval = approval
+        await s.execute(update(Task).where(Task.id == task.id).values(resume_step_key=None))
+        await change_task_state(s, task, stage, reason="resumed_after_approval",
+                                event={"approval_id": str(approval.id), "type": approval.type})
+        return ResumeOutcome(RESUME, None, False, None, request_status)
+
+    async def _row_project_mismatch(self, s: AsyncSession, task: Task, approval: Approval, request) -> ResumeOutcome:
+        """Row 6: the request must not read as live authority any more; the Task is failed closed after the commit when it is
+        still waiting, otherwise only the audit is written."""
+        status = request.status if request else None
+        if request is not None:
+            requests = ProcessRiskRequestRepository(s)
+            if status in ("REQUESTED", "VERIFYING", "RETRYABLE"):
+                await requests.redecide_if_status(approval.id, status, "TASK_PROJECT_MISMATCH")
+            elif status == "APPLIED":
+                await requests.supersede_applied(approval.id, self._supersede_record(request, None, [], "TASK_PROJECT_MISMATCH"),
+                                                 "TASK_PROJECT_MISMATCH")
+        if TaskState(task.status) is TaskState.WAITING_APPROVAL:
+            return ResumeOutcome(FAIL_CLOSED_ACTION, "TASK_PROJECT_MISMATCH", False, None, status,
+                                 "the task no longer belongs to the project of this approval")
+        return ResumeOutcome(IDEMPOTENT_DONE, "TASK_PROJECT_MISMATCH", False, None, status)
+
+    @staticmethod
+    def _supersede_record(request, project, identities: list, code: str) -> dict:
+        return {"from_status": request.status, "reason_code": code, "superseded_at": datetime.now(UTC).isoformat(),
+                "current_dirty_epoch": project.write_epoch if project is not None else None,
+                "current_identities": identities, "approval_id": str(request.approval_id)}
+
+    async def _restore_lineage(self, s: AsyncSession, ctx: RunContext, task: Task, approval: Approval, decision, request) -> None:
+        """Step L (M-1): read-only, inside the same transaction and under the Task lock, before the Task-state early return. Its
+        seven checks run in order; the first failure ends L with the context untouched (logged LINEAGE_RESTORE_REFUSED)."""
+        def refuse(check: str) -> None:
+            log.info("LINEAGE_RESTORE_REFUSED: task=%s check=%s", task.id, check)
+
+        repo = ApprovalRepository(s)
+        resume = await ExecutionRequestRepository(s).get(ctx.request_id) if ctx.request_id else None
+        if resume is None:
+            return refuse("1_no_request")
+        if (resume.approval_id != approval.id or resume.kind != "RESUME" or resume.task_id != task.id
+                or resume.status != "CLAIMED"):
+            return refuse("2_request_facts")
+        if approval.task_id != task.id or str(task.project_id) != str((approval.target or {}).get("project_id")):
+            return refuse("3_links")
+        if (request is None or request.kind != RISK_OPTION_KIND.get(decision.selected_option) or request.status != "APPLIED"):
+            return refuse("4_request")
+        for key in ("lineage_root_id", "supersedes_approval_id"):
+            value = (approval.target or {}).get(key)
+            if value is None:
+                continue
+            try:
+                named = await repo.get(uuid.UUID(str(value)))
+            except ValueError:
+                return refuse("5_lineage_fields")
+            if named is None or named.task_id != task.id:
+                return refuse("5_lineage_fields")
+        if await repo.successors_of(approval.id):
+            return refuse("6_successor")
+        ctx.resumed_from_approval_id = approval.id
+        ctx.lineage_root_id = uuid.UUID(str((approval.target or {}).get("lineage_root_id") or approval.id))
+
+    async def _identity_changed(self, s: AsyncSession, request, project: Project) -> bool:
+        """Row 13: a target row is gone, belongs to another project, or (a resolved risk row) differs from the pid/create_time the
+        acceptance record named. The request stores ids only, so the record written with the disposition is the snapshot."""
+        tasks = TaskRepository(s)
+        rows = [await tasks.tracked_row(i) for i in request.target_execution_ids]
+        if any(r is None for r in rows):
+            return True
+        in_project = await tasks.task_ids_of_project(project.id, [r.task_id for r in rows])
+        if any(r.task_id not in in_project for r in rows):
+            return True
+        for r in rows:
+            cls = classify_row(r.id, r.pid, r.finished_at, r.detail_text)
+            # A pid that changed after the acceptance makes the record INVALID (the classifier then says ANOMALY, not
+            # RESOLVED_RISK), so the comparison reads the record of any row that carries a decodable acceptance, not only of a
+            # RESOLVED_RISK one: otherwise the changed identity would pass as row 14.
+            if cls.row_class is RowClass.RESOLVED_RISK or cls.is_anomaly:
+                try:
+                    detail = decode_detail(r.detail_text)
+                except Exception:  # noqa: BLE001 - an undecodable detail is the classifier's decode_error, not an identity fact
+                    continue
+                record = detail.get("risk_acceptance") if isinstance(detail, dict) else None
+                if isinstance(record, dict) and "pid" in record:
+                    if record["pid"] != r.pid or (r.process_create_time is not None and "create_time" in record
+                                                  and float(record["create_time"]) != r.process_create_time):
+                        return True
+        return False
+
+    async def _risk_rows(self, s: AsyncSession, ctx: RunContext, task: Task, approval: Approval, decision, request) -> ResumeOutcome:
+        """Rows 5, 4, 7, 8, 12, 13, 9, 10, 11, then T9 (rows 15, 16) and 14 for a risk-option decision."""
+        repo = ApprovalRepository(s)
+        pending = await repo.pending_for_task(task.id)
+        if pending:                                                                       # row 5 (T2): parked on the existing gate
+            await self.leases.release(ctx.lease, "WAITING_APPROVAL", session=s)
+            return ResumeOutcome(PARKED, "GATE_ALREADY_PENDING", True, pending[0].id, request.status if request else None)
+        resume = await ExecutionRequestRepository(s).get(ctx.request_id) if ctx.request_id else None
+        if (resume is None or resume.approval_id != approval.id or resume.kind != "RESUME" or resume.status != "CLAIMED"):
+            raise FailClosed("the RESUME being processed is not this approval's", {"code": "RESUME_REQUEST_MISMATCH"})   # row 4
+        if request is None or request.kind != RISK_OPTION_KIND[decision.selected_option]:
+            raise FailClosed("no matching risk request", {"code": "RISK_REQUEST_NOT_APPLICABLE"})                        # row 7
+        project = await ProjectRepository(s).lock(task.project_id)                                   # Task -> Project
+        status = request.status
+        selected: tuple[int, str | None] | None = None                                            # (row, code)
+        if status in ("REQUESTED", "VERIFYING", "RETRYABLE"):
+            selected = (8, "RISK_REQUEST_NOT_APPLIED")
+        elif project.write_epoch != request.dirty_epoch:
+            selected = (12, "DIRTY_EPOCH_CHANGED")
+        elif await self._identity_changed(s, request, project):
+            selected = (13, "EXECUTION_IDENTITY_CHANGED")
+        elif status == "REFUSED_ALIVE":
+            selected = (9, "LIVE_PROCESS_PRESENT")
+        elif status == "NEEDS_REDECISION":
+            selected = (10, "NO_LIVE_PROCESS_UNPROVEN") if request.reason == "NO_LIVE_PROCESS_UNPROVEN" else (
+                11, request.reason or "NEEDS_REDECISION")
+        else:
+            selected = (14, None)
+        successors = await repo.successors_of(approval.id)                                         # T9, before any gate or the proceed row
+        if successors:
+            if len(successors) == 1 and successors[0].task_id == task.id:
+                return ResumeOutcome(IDEMPOTENT_DONE, "IDEMPOTENT_SUCCESSOR", False, successors[0].id, status)   # row 15: nothing created
+            ids = [str(a.id) for a in successors]                                                  # row 16: one root gate, no pick
+            gate = await self.gates.open_recovery(
+                s, task, None, reason="the approval lineage is inconsistent", checkpoint_step_key=approval.checkpoint_step_key,
+                target_extra={"lineage_dirty_epoch": project.write_epoch, "lineage_origin": "LINEAGE_CONFLICT"},
+                detail={"lineage_conflict": {"approval_id": str(approval.id), "successor_ids": ids}})
+            await self.leases.release(ctx.lease, "WAITING_APPROVAL", session=s)
+            return ResumeOutcome(PARKED, "APPROVAL_LINEAGE_CONFLICT", True, gate.id, status)
+        row, code = selected
+        if row == 14:
+            return await self._proceed_resume(s, ctx, task, approval, status)
+        requests = ProcessRiskRequestRepository(s)
+        if row == 8:
+            await requests.redecide_if_status(approval.id, status, code)
+        elif row in (12, 13) and status == "APPLIED":
+            identities = [{"id": str(r.id), "pid": r.pid, "process_create_time": r.process_create_time}
+                          for r in [await TaskRepository(s).tracked_row(i) for i in request.target_execution_ids] if r is not None]
+            await requests.supersede_applied(approval.id, self._supersede_record(request, project, identities, code), code)
+        gate = await open_followup_gate(self.gates, s, task, approval, project, code, "HANDLER")
+        await self.leases.release(ctx.lease, "WAITING_APPROVAL", session=s)
+        return ResumeOutcome(PARKED, code, True, gate.id, status)
 
     async def _recovery_unsafe(self, s: AsyncSession, task: Task, approval: Approval, option: str | None,
                                workspace: Path) -> str | None:
@@ -310,7 +497,11 @@ class WorkflowService:
         # changing steps and the code review run under the project write lock; the DIRTY gate may open here.
         needs_lock = mutating or step_key == STEP_CODE_REVIEW
         if needs_lock:
-            gate = await self.locks.ensure_for_step(ctx.lease, task.id, step_key, self.gates)
+            if ctx.resumed_from_approval_id is not None:
+                lineage = GateLineage(ctx.resumed_from_approval_id, ctx.lineage_root_id or ctx.resumed_from_approval_id)
+                gate = await self.locks.ensure_for_step(ctx.lease, task.id, step_key, self.gates, lineage=lineage)
+            else:
+                gate = await self.locks.ensure_for_step(ctx.lease, task.id, step_key, self.gates)
             if gate is StepGate.GATE_OPENED:
                 ctx.parked = True
                 return
@@ -743,7 +934,10 @@ class WorkflowService:
         input_hash = stable_hash("test", task.requirements_hash, current["code_fingerprint"], task.test_policy_hash)
         change_summary = await self._latest_dev_summary(task)
         prompt = PR.tester_prompt(C.tester_context(task, plan_step.output, change_summary, policy["commands"][0]))
-        ids_before = await self.tests.collect_ids(ctx.workspace, policy, workspace_root=ctx.workspace_root)
+        async with self.db.transaction() as owner_check_before:     # `ids_before` runs project code: only the write owner
+            await self.locks.assert_owner(owner_check_before, task)
+        ids_before = await self.tests.collect_ids(ctx.workspace, policy, workspace_root=ctx.workspace_root,
+                                                  tracked=self._tracked(ctx, task, "ids_before"))
 
         async def evaluate(handle: StepHandle, ex: StepExecution, data: dict) -> StepDecision:
             try:
@@ -761,8 +955,10 @@ class WorkflowService:
             async with self.db.transaction() as owner_check:           # only the write owner runs commands here
                 await self.locks.assert_owner(owner_check, task)
             result = await self.tests.run(ctx.workspace, policy,       # authoritative: exit codes + JUnit
-                                          workspace_root=ctx.workspace_root)
-            ids_after = await self.tests.collect_ids(ctx.workspace, policy, workspace_root=ctx.workspace_root)
+                                          workspace_root=ctx.workspace_root,
+                                          tracked=self._tracked(ctx, task, "test_run", handle.step_id))
+            ids_after = await self.tests.collect_ids(ctx.workspace, policy, workspace_root=ctx.workspace_root,
+                                                     tracked=self._tracked(ctx, task, "ids_after", handle.step_id))
             baseline = await self._previous_test_ids(task) or ids_before
             signals = compute_test_signals(baseline, ids_after, result, [p for p in changed if is_test_path(p, preset)])
             final = await asyncio.to_thread(take_snapshot, ctx.workspace)
@@ -777,12 +973,18 @@ class WorkflowService:
                                 provider="LOCAL", outcome="SUCCESS" if result.passed else "ERROR",
                                 exit_code=next((c for c in result.exit_codes if c), 0), finished_at=datetime.now(UTC),
                                 stdout_tail=result.output_tail[-4000:], runner_id=ctx.lease.runner_id,
-                                detail={"orchestrator_test_run": True, "reason": result.reason}))
+                                detail={"orchestrator_test_run": True, "reason": result.reason,
+                                        **({"tracking": result.tracking} if result.tracking else {})}))
                 await self._test_transition(s, t, output, ctx.project_proof)
             return StepDecision(output=output, mutate=mutate)
 
         await self._agent_step(ctx, task, step_key=STEP_TEST, input_hash=input_hash, prompt=prompt,
                                schema=A.TEST_AGENT_SCHEMA, mutating=True, allow_resume=True, evaluate=evaluate)
+
+    def _tracked(self, ctx: RunContext, task: Task, what: str, step_id: uuid.UUID | None = None) -> TrackedCommandSession:
+        """The tracked-run factory of one command group of the TESTING state (7.1): one cancel scope per group."""
+        return TrackedCommandSession(self.steps, ctx.lease, task.id, scope_id=f"{what}:{uuid.uuid4().hex}",
+                                     checkpoint_step_key=STEP_TEST, step_id=step_id, owner_check=self.locks.assert_owner)
 
     async def _after_test(self, ctx: RunContext, task: Task, output: dict) -> None:
         async def work(s: AsyncSession, locked: Task, proof) -> None:

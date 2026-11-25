@@ -27,5 +27,8 @@ class RecoveryEffects:
     def register(self, reason_code: str, effect) -> None:
         self._handlers[reason_code] = effect
 
+    def all(self) -> list:
+        return list(self._handlers.values())
+
     def get(self, reason_code: str | None):
         return self._handlers.get(reason_code) if reason_code else None

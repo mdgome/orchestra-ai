@@ -20,7 +20,8 @@ async def create_decision(approval_id: uuid.UUID, body: DecisionCreate, response
                           idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
                           c: Container = Depends(get_container)):
     outcome = await c.gates.decide(approval_id, decision=body.decision, selected_option=body.selected_option,
-                                   rationale=body.rationale, idempotency_key=idempotency_key)
+                                   rationale=body.rationale, idempotency_key=idempotency_key,
+                                   requested_by=body.requested_by)
     if not outcome.created:
         response.status_code = status.HTTP_200_OK
     else:

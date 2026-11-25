@@ -278,7 +278,7 @@ async def test_cancellation_request_stops_the_cli_and_cancels_only_after_termina
     assert any(k.startswith(run_id) for k in h.claude.cancelled)
     assert (await h.steps_of(task.id))[-1].status == "CANCELLED"
     assert [r.status for r in await h.runs(task.id)] == ["FINISHED"]
-    ex = [e for e in await h.executions(task.id) if e.role == "TESTER"][0]
+    ex = [e for e in await h.executions(task.id) if e.role == "TESTER" and e.provider == "CLAUDE"][0]   # the agent CLI row
     assert ex.finished_at is not None and ex.terminated_at is not None
 
 
@@ -293,7 +293,7 @@ async def test_cancellation_with_unconfirmed_termination_does_not_cancel(db, tmp
     assert t.status == "WAITING_APPROVAL"                                    # NOT CANCELLED
     assert [a.type for a in await h.approvals(task.id)] == ["RECOVERY"]
     assert [r.status for r in await h.runs(task.id)] == ["RUNNING"]
-    ex = [e for e in await h.executions(task.id) if e.role == "TESTER"][0]
+    ex = [e for e in await h.executions(task.id) if e.role == "TESTER" and e.provider == "CLAUDE"][0]   # the agent CLI row
     assert ex.finished_at is None                                            # still considered possibly running
 
 

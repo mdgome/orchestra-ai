@@ -9,8 +9,13 @@ from app.services.runtime_status import runtime_snapshot, snapshot_of
 def test_a_running_runner_with_a_clean_recovery_is_ready():
     snap = runtime_snapshot(L.RUNNING, S.STARTED, recovery_unsettled=False)
     assert snap.runner_active and snap.ready and snap.blockers == ()
-    assert snap.as_dict() == {"status": "ok", "runner_active": True, "ready": True,
-                              "runner": {"lifecycle": "RUNNING", "startup_outcome": "STARTED", "blockers": []}}
+    # exact key set kept: the schema is an EXTENSION (design 14.2): top-level `warnings`, `runner.background_degraded` and
+    # `runner.sweeper` (the default SweeperStatusOut object) are added, nothing is removed or renamed
+    assert snap.as_dict() == {"status": "ok", "runner_active": True, "ready": True, "warnings": [],
+                              "runner": {"lifecycle": "RUNNING", "startup_outcome": "STARTED", "blockers": [],
+                                         "background_degraded": False,
+                                         "sweeper": {"stalled": False, "consecutive_failures": 0, "last_failure_code": None, "last_failure_at": None,
+                                          "next_retry_at": None, "config_invalid_active": False, "clearance_pending": False}}}
 
 
 @pytest.mark.parametrize("outcome,blocker", [

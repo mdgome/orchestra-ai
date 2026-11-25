@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.db import Database
 from app.infra import changes_manifest as CM
@@ -32,8 +33,11 @@ from app.repositories.approval_repository import ApprovalRepository
 from app.repositories.baseline_repository import BaselineConflict, TaskBaselineRepository
 from app.repositories.project_repository import ProjectRepository
 from app.repositories.task_repository import TaskRepository
+from app.services.approval_lineage import GateLineage, is_lineage_violation, lineage_keys_from
 from app.services.lease_service import Lease, LeaseService
-from app.services.project_terminal import UNMEASURED, FingerprintProof, FingerprintProofStale, proof_matches
+from app.services.project_terminal import (
+    UNMEASURED, FingerprintProof, FingerprintProofStale, has_unresolved_or_anomalous_for_project, proof_matches,
+)
 from app.validation import policies as P
 from app.validation.exceptions import FailClosed
 
@@ -203,9 +207,11 @@ class ProjectLockService:
         await repo.bump_epoch(project.id)
 
     # --- pre-step gate (T3a) ---------------------------------------------------------------------------------------
-    async def ensure_for_step(self, lease: Lease, task_id: uuid.UUID, step_key: str, gates) -> StepGate:
+    async def ensure_for_step(self, lease: Lease, task_id: uuid.UUID, step_key: str, gates,
+                              lineage: GateLineage | None = None) -> StepGate:
         """Acquire-or-verify the project write lock before a workspace-changing step. `gates` is the
-        HumanGateService used to open the PROJECT_DIRTY recovery gate."""
+        HumanGateService used to open the PROJECT_DIRTY recovery gate. `lineage` (optional, design 7.5 item 11 C-b) links a
+        gate this call opens to the approval the run resumed from; without it the path is the legacy one."""
         for _ in range(P.PROOF_MAX_ATTEMPTS):
             async with self.db.transaction() as s:
                 task = await TaskRepository(s).get(task_id)
@@ -221,7 +227,17 @@ class ProjectLockService:
                     if measurement.proof is UNMEASURED:
                         await self._mark_dirty_unmeasured(project.id)    # cannot prove a baseline: fail closed
                 try:
-                    return await self._acquire_once(lease, task_id, step_key, gates, measurement)
+                    try:
+                        return await self._acquire_once(lease, task_id, step_key, gates, measurement, lineage)
+                    except IntegrityError as exc:
+                        if lineage is None or not is_lineage_violation(exc):
+                            raise                                   # never every IntegrityError is idempotent success (C-7)
+                        raced = await self._after_lineage_race(lease, task_id, lineage)
+                        if raced is StepGate.GATE_OPENED:
+                            return raced                            # a PENDING successor exists: parked on it
+                        if raced is None:
+                            lineage = None                          # consumed by another pass: the legacy path
+                        continue                                    # no successor visible: retry with the lineage (bounded)
                 except _BaselineRecoveryNeeded:
                     # the owner has no baseline row yet and changed nothing: measure (outside any transaction), then record
                     return await self._recover_once(lease, task_id, await self._measure_acquisition(project.id))
@@ -236,7 +252,7 @@ class ProjectLockService:
                 await ProjectRepository(s).mark_dirty(project_id)
 
     async def _acquire_once(self, lease: Lease, task_id: uuid.UUID, step_key: str, gates,
-                            measurement: LockMeasurement | None) -> StepGate:
+                            measurement: LockMeasurement | None, lineage: GateLineage | None = None) -> StepGate:
         async with self.db.transaction() as s:
             task = await TaskRepository(s).lock(task_id)
             await self.leases.verify(s, lease)
@@ -248,7 +264,16 @@ class ProjectLockService:
             if project.write_owner_task_id is not None:
                 return StepGate.BLOCKED
             if project.workspace_state != "CLEAN":
-                await self._open_dirty_gate(s, gates, lease, task, project, step_key)
+                await self._open_dirty_gate(s, gates, lease, task, project, step_key, lineage)
+                return StepGate.GATE_OPENED
+            # C5: an ownerless CLEAN project can still carry an old unresolved or anomalous tracked execution. The
+            # project-wide rule is applied AFTER the owned / not-CLEAN branches and BEFORE the proof check and set_owner:
+            # no owner and no baseline row, the project becomes DIRTY_UNRESOLVED (the gate must show the NEW epoch, or its
+            # `continue` would be offered on a CLEAN project and loop), and the ordinary PROJECT_DIRTY gate opens.
+            if (await has_unresolved_or_anomalous_for_project(s, project.id)).blocked:
+                await repo.mark_dirty(project.id)
+                await s.refresh(project)
+                await self._open_dirty_gate(s, gates, lease, task, project, step_key, lineage)
                 return StepGate.GATE_OPENED
             proof = measurement.proof if measurement is not None else None
             if not isinstance(proof, FingerprintProof) or not proof_matches(project, proof):
@@ -339,17 +364,41 @@ class ProjectLockService:
                 supplemental=measurement.supplemental))
             return StepGate.READY
 
-    async def _open_dirty_gate(self, s, gates, lease: Lease, task: Task, project: Project, step_key: str) -> None:
-        """T8: PROJECT_DIRTY recovery gate (idempotent), task WAITING_APPROVAL, lease returned. No step attempt."""
+    async def _after_lineage_race(self, lease: Lease, task_id: uuid.UUID, lineage: GateLineage):
+        """C-7: the unique lineage index fired (the failed transaction is already rolled back). A new short transaction under the Task
+        lock re-reads the successor (T9). Returns GATE_OPENED when a PENDING successor exists (the lease is released in that
+        transaction), None when the lineage was consumed (the caller drops it) and StepGate.READY when no successor is visible."""
+        async with self.db.transaction() as s:
+            task = await TaskRepository(s).lock(task_id)
+            await self.leases.verify(s, lease)
+            found = await ApprovalRepository(s).successors_of(lineage.supersedes_approval_id)
+            if not found:
+                return StepGate.READY
+            if any(a.status == "PENDING" and a.task_id == task.id for a in found):
+                await self.leases.release(lease, "WAITING_APPROVAL", session=s)
+                return StepGate.GATE_OPENED
+            return None
+
+    async def _open_dirty_gate(self, s, gates, lease: Lease, task: Task, project: Project, step_key: str,
+                               lineage: GateLineage | None = None) -> None:
+        """T8: PROJECT_DIRTY recovery gate (idempotent), task WAITING_APPROVAL, lease returned. No step attempt. `lineage` (optional):
+        the NEW gate's target also carries the four lineage keys, written once in the INSERT; absent, `target_extra` and `detail`
+        are byte-identical to the legacy path. A reused PENDING gate is never updated."""
         pending = [a for a in await ApprovalRepository(s).pending_for_task(task.id)
                    if (a.target or {}).get("reason_code") == P.RECOVERY_REASON_PROJECT_DIRTY]
+        if pending and lineage is not None and (pending[0].target or {}).get("supersedes_approval_id") != str(
+                lineage.supersedes_approval_id):
+            log.warning("LINEAGE_REUSE_MISMATCH: task=%s reused gate=%s", task.id, pending[0].id)
         if not pending:
+            extra = {"project_id": str(project.id), "dirty_epoch": project.write_epoch,
+                     "baseline_ref": (project.baseline_fingerprint or "")[-16:]}
+            if lineage is not None:
+                extra.update(lineage_keys_from(lineage, project.write_epoch))
             await gates.open_recovery(
                 s, task, None, reason="the project workspace has unresolved changes from an earlier task",
                 checkpoint_step_key=step_key, reason_code=P.RECOVERY_REASON_PROJECT_DIRTY,
                 options=P.PROJECT_DIRTY_OPTIONS,
-                target_extra={"project_id": str(project.id), "dirty_epoch": project.write_epoch,
-                              "baseline_ref": (project.baseline_fingerprint or "")[-16:]},
+                target_extra=extra,
                 detail={"project": project.name, "baseline_version_ok": is_current_version(project.baseline_fingerprint)})
         await self.leases.release(lease, "WAITING_APPROVAL", session=s)
 
@@ -377,6 +426,9 @@ class ProjectLockService:
             project = await repo.lock(project_id)
             if project.write_owner_task_id != owner:
                 return True                                              # somebody else already released it
+            if (await has_unresolved_or_anomalous_for_project(s, project_id)).blocked:
+                await repo.release(project_id, state="DIRTY_UNRESOLVED", baseline=None)      # H7: whatever the proof is
+                return True
             if isinstance(proof, FingerprintProof):
                 if not proof_matches(project, proof):
                     return False                                         # stale proof: caller re-measures

@@ -12,7 +12,7 @@ import uuid
 from collections.abc import Callable
 from datetime import datetime
 
-from pydantic import BaseModel, JsonValue, ValidationError
+from pydantic import BaseModel, Field, JsonValue, ValidationError
 
 from app.infra.response_sanitizer import Sanitizer, SanitizeReason
 from app.validation import policies as P
@@ -158,6 +158,7 @@ class GateOut(_Out):
     decision: str | None = None
     selected_option: str | None = None
     rationale: str | None = None
+    request_label: str = "SNAPSHOT_AT_OPENING"     # `request` is the stored payload as it was when the gate opened, never the options selectable now
     request: SanitizedJsonOut | None = None
 
 
@@ -199,10 +200,25 @@ class NextActionOut(_Out):
     text: str
 
 
+class SweeperStatusOut(_Out):
+    """The abbreviated sweeper status (14.2): no cursor position, no position kind. Its key set is also the `/health`
+    `runner.sweeper` object; the default is the 'nothing stalled' object."""
+    stalled: bool = False
+    consecutive_failures: int = 0
+    last_failure_code: str | None = None
+    last_failure_at: datetime | None = None
+    next_retry_at: datetime | None = None
+    config_invalid_active: bool = False
+    clearance_pending: bool = False
+
+
 class RuntimeOut(_Out):
     state: str                   # KNOWN | UNKNOWN
     ready: bool | None = None
     blockers: list[str] = []
+    warnings: list[str] = Field(default_factory=list)
+    sweeper: SweeperStatusOut = Field(default_factory=SweeperStatusOut)
+    background_degraded: bool = False
 
 
 class ReportOut(_Out):
