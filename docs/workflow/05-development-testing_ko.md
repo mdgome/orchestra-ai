@@ -133,8 +133,22 @@ flowchart TD
 
 Task의 Profile snapshot이 `completion_criteria`를 정의하면 코드 리뷰 schema에 필수 `profile_criteria`(criterion마다 `{id, met, evidence}`)가 추가되고 저장된 리뷰에 `profile_hash`가 담깁니다. 그러면 `check_definition_of_done`이 **조건 하나를 더**(`profile_criteria_met`) 저장된 평가에 대해 결정적으로 검사합니다. 평가는 현재 Profile의 것이고, 현재 id들을 정확히 한 번씩 담아야 하며, 모든 항목이 `met`이고 `evidence`가 비어 있지 않아야 합니다. 아니면 리뷰는 `FAIL`로 처리되어(`Definition of Done: ...`) 일반 개선 루프가 적용됩니다. criterion이 실제로 충족되었는지는 리뷰어의 판단이며 오케스트레이터는 검증하지 않습니다. 다른 어떤 조건도 약화되지 않습니다.
 
+## Tracked 테스트 명령 (Windows Job Object)
+
+Orchestrator가 `TESTING`에서 직접 실행하는 명령(전후 pytest `--collect-only`와 테스트 실행. `WorkflowService._tracked`가 명령 그룹마다 `TrackedCommandSession`을 만듭니다)은 **tracked command**로 실행됩니다. Planner, Developer, Tester, Reviewer의 Agent CLI 호출은 tracked가 아니며 `(pid, create_time)` 식별을 그대로 사용합니다.
+
+- **Capability gate**(`TrackedCommandSession.check_capability`, 프로세스 실행 전): `SUPPORTED`는 tracked로 실행합니다. `UNSUPPORTED_PLATFORM`(Windows가 아닌 모든 호스트)은 untracked 실행으로 degrade하며 Orchestrator 테스트 Execution에 `tracking = UNTRACKED_PLATFORM`을 기록합니다. `UNKNOWN`과 `UNAVAILABLE`은 `ProcessTrackingUnavailable`을 발생시켜 Task가 `PROCESS_TRACKING_UNAVAILABLE`로 `FAILED`가 되며 명령은 실행되지 않습니다. capability는 Runner 시작 self-test에서 옵니다([03](03-task-runner_ko.md), [11](11-task-lifecycle_ko.md)).
+- **등록**: 트랜잭션(Task row lock, Lease 확인, Task가 terminal이 아님, 프로젝트 write lock owner 확인)이 `executions` 행(`outcome=STARTING`, `tracked=true`·`v`·`checkpoint_step_key`·`runner_process`가 든 `detail`)을 삽입합니다. 실행 사실은 새 컬럼이 아니라 `executions.detail`에 둡니다.
+- **Spawn 절차**(`TrackedRun`을 쓰는 `CommandExecutor`, `app/infra/windows_job.py`의 `TreeJob`): suspended 상태로 spawn(`CREATE_SUSPENDED`) → kill-on-close가 걸리고 breakaway가 없는 익명·상속 불가 Job Object에 할당 → 식별 캡처 → fenced update로 `pid`와 `process_create_time` 저장(행이 닫혔거나 Lease를 잃으면 `IdentityFenced`: suspended 프로세스를 종료하고 아무것도 실행하지 않음) → primary thread resume. resume 이전의 실패는 `SPAWN_FAILED`이며 명령은 실행되지 않은 것입니다. 인프라 사유(`JOB_CREATE_FAILED`, `JOB_ASSIGN_FAILED`, `IDENTITY_UNAVAILABLE`, `IDENTITY_PERSIST_FAILED`, `IDENTITY_FENCED`, `RESUME_FAILED`)는 Task를 `PROCESS_TRACKING_UNAVAILABLE`로 fail-closed 시키며 테스트 실패로 보고하지 않습니다. resume 전의 취소는 취소이지 테스트 실패가 아닙니다.
+- **트리 정리**: 정상 종료 후에는 짧은 시간 동안 Job을 폴링해 일시적 helper를 survivor로 오인하지 않습니다. survivor와 취소·타임아웃된 명령은 pipe drain 전에 `TerminateJobObject`(고정 exit code)로 종료합니다. 트리가 비었다는 증명은 grace 시간 안에 `ActiveProcesses`가 0이 될 때만 성립합니다. 그렇지 않으면 결과는 `TERMINATION_UNCONFIRMED`입니다. Job handle은 이 프로세스에 유지되고, `TerminationUnconfirmed`가 발생하며, Task는 RECOVERY 경로로 갑니다([09](09-recovery_ko.md)). 통과로 해석하지 않습니다.
+- **행 닫기**(`TrackedCommandSession`, 보호된 `finally`, Lease에 의존하지 않는 하나의 UPDATE, proof는 `detail`에 JSONB merge): 정상 종료 또는 종료된 명령에 트리가 비었으면 proof `JOB_EMPTY`, `SPAWN_FAILED` 또는 미시작이면 `NEVER_RAN`을 기록합니다. `TERMINATION_UNCONFIRMED`, 결과 누락(`RESULT_MISSING`), lifecycle 누락(`LIFECYCLE_MISSING`)은 행을 **열린 채**(unresolved)로 둡니다. 닫는 쓰기가 실패해도 행은 열린 채로 남고, sweeper와 terminal 규칙이 처리합니다([09](09-recovery_ko.md)).
+- `ProcessLifecycle`(`NOT_STARTED`, `STARTING`, `RUNNING`, `EXITED`, `CANCEL_REQUESTED`, `TERMINATING`, `TERMINATED`, `TERMINATION_UNCONFIRMED`, `SPAWN_FAILED`)과 `TreeProof`(`EMPTY`, `NOT_EMPTY`, `UNKNOWN`)는 서술용이며, 해제 결정은 `TreeProof`가 아니라 `detail.proof`를 읽습니다.
+
 ## 현재 구현 제한
 
+- tracked command 동작의 검증 범위: Windows에서 실제 Job Object, 실제 자식·손자 프로세스로 **검증됨**(`tests/unit/test_windows_job.py`, `tests/integration_pg/test_never_ran_crash_points.py`, `tests/integration_pg/test_tracked_services.py`). POSIX 정책은 코드에만 존재하며(`UNSUPPORTED_PLATFORM`은 untracked로 degrade, `UNKNOWN`/`UNAVAILABLE`은 fail-closed) POSIX 런타임 동작은 **검증하지 않았습니다**. **검증하지 않은 것**: POSIX 런타임, 실제 Gradle/Maven 빌드, 실제 CLI E2E, 무작위 race stress, EXPLAIN/generic plan, 실제 deadlock 테스트.
+- CP2 잔여 위험: 프로세스가 (suspended로) spawn된 뒤 Job에 할당되기 전, 그리고 식별이 기록되기 전에 Runner가 죽으면 행에는 `pid`가 없고 `NEVER_RAN`으로 닫히며, suspended 프로세스는 그 종료 처리 뒤에도 살아남을 수 있습니다. 설계상 수용된 한계입니다(`SUSPENDED_ORPHAN_POSSIBLE`).
+- Windows가 아닌 호스트에서는 Orchestrator 테스트 명령이 untracked로 실행되며, 위의 추적 보장은 적용되지 않습니다.
 - Maven·Gradle preset은 JUnit 파싱, wrapper 해석(Windows `mvnw.cmd` 포함), 권한·환경 규칙을 단위 테스트로만 검증했습니다. 이 환경에는 JDK/Maven/Gradle이 없어 **실제 Maven·Gradle 빌드는 실행하지 못했습니다.**
 - pytest가 아닌 preset에서는 테스트 ID 수집(`collect_ids`)을 하지 않으므로 "테스트 개수 감소" 신호(`removed_test_ids`)가 없습니다. 테스트 파일 변경은 Snapshot 차이로만 보고됩니다.
 - 기본 pytest preset의 JUnit 파일(`reports/junit.xml`)은 외부 Workspace에도 남습니다(삭제하지 않는 정책의 결과).

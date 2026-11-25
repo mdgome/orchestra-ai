@@ -168,11 +168,14 @@ HEAD (`COMMIT` or `UNBORN`) and the paths that were already dirty. **Only hashes
 
 ## Health and Diagnostics
 
-`GET /health` answers 200 while the API process is alive. The original keys keep their meaning; `ready` and `runner` are new:
+`GET /health` answers 200 while the API process is alive. The original keys keep their meaning; `ready`, `warnings` and `runner` are new:
 
 ```json
-{"status": "ok", "runner_active": false, "ready": false,
- "runner": {"lifecycle": "STOPPED", "startup_outcome": "PREFLIGHT_BLOCKED", "blockers": ["PREFLIGHT_FAILED"]}}
+{"status": "ok", "runner_active": false, "ready": false, "warnings": [],
+ "runner": {"lifecycle": "STOPPED", "startup_outcome": "PREFLIGHT_BLOCKED", "blockers": ["PREFLIGHT_FAILED"],
+            "background_degraded": false,
+            "sweeper": {"stalled": false, "consecutive_failures": 0, "last_failure_code": null, "last_failure_at": null,
+                        "next_retry_at": null, "config_invalid_active": false, "clearance_pending": false}}}
 ```
 
 * `status` is API liveness only. `runner_active` and `ready` are **derived from `Runner.lifecycle`** (nothing sets them by
@@ -180,8 +183,13 @@ HEAD (`COMMIT` or `UNBORN`) and the paths that were already dirty. **Only hashes
   (for example an unsettled recovery).
 * While the Runner is not ready, `POST /tasks/{id}/execution-requests` still answers 202 and the request stays `PENDING`
   until a Runner is ready. `runner.blockers` explains why: `PREFLIGHT_FAILED`, `ADVISORY_LOCK_HELD`, `STOPPED`,
-  `STARTING`, `SHUTTING_DOWN`, `STOP_INCOMPLETE`, `RECOVERY_UNSETTLED`. `START_FAILED` is **reserved**: a general
-  exception from `Runner.start` still aborts API startup (decision D6), so a running API never reports it.
+  `STARTING`, `SHUTTING_DOWN`, `STOP_INCOMPLETE`, `RECOVERY_UNSETTLED`, `SUPERVISOR_DEGRADED` (the background supervisor
+  ended; the Runner claims no new work). `START_FAILED` is **reserved**: a general exception from `Runner.start` still
+  aborts API startup (decision D6), so a running API never reports it.
+* `warnings` is a sorted list of `SWEEPER_STALLED`, `SWEEPER_CONFIG_INVALID` and `BACKGROUND_COMPONENT_DEGRADED`.
+  `runner.background_degraded` is true only while the supervisor or a required background unit (orphan sweeper, risk
+  worker, capability refresh) is really degraded; a degraded unit other than the supervisor does not block dispatch.
+  `runner.sweeper` reports the orphan sweeper's stall and configuration state.
 
 `GET /projects/{id}/diagnostics` is a **read-only quick check**. It never runs an agent, the login probe, an installer or
 the project's tests; it only runs tool version probes (`git --version`, `java -version`) and reads files. Every item has
@@ -197,6 +205,13 @@ will succeed. Notes:
 * One diagnosis per project runs at a time and concurrent requests share it. File inspection runs in a worker thread
   with a best-effort timeout: a stalled filesystem cannot be interrupted, so the overall deadline is **not** a hard
   deadline. Such a worker keeps its slot until it really ends, and while it lives the file-derived items are `UNKNOWN`.
+* `PROCESS_TRACKING` reports the process-tracking capability of the Runner (`PASS` supported; `WARN` on an unsupported
+  platform, where tracked commands degrade to untracked; `FAIL` with `blocks_execution` when the self-test failed;
+  `UNKNOWN` when it cannot be confirmed). When it is not supported, the item carries `blocks_features: ["TEST_RUN"]`.
+  `TRACKED_EXECUTIONS` lists the unresolved or anomalous tracked executions of the project as `causes` (each with
+  `reason_code`, severity, `blocks_execution`, `recommendation`, related execution/request ids, and for anomalies a bounded
+  list); the item status is the highest severity of its causes. The checks changed, so `DIAGNOSTICS_POLICY_VERSION` is 2
+  (part of the cache key).
 
 ## Project Profiles
 
@@ -250,8 +265,35 @@ curl -X POST localhost:8000/tasks/{task_id}/execution-requests
   with 422. Test results (JUnit XML) are not deleted, and only files **newly created or changed by this run** are
   used for the verdict.
 * If a previous Task left a Project with unresolved changes (`workspace_state: DIRTY_UNRESOLVED`), the
-  `PROJECT_DIRTY` RECOVERY Gate opens when the next Task starts a change Step. `continue` accepts the current state
-  as the new baseline, and `abort` fails the Task (without touching any files).
+  `PROJECT_DIRTY` RECOVERY Gate opens when the next Task starts a change Step. `abort` fails the Task (without touching
+  any files). `continue` accepts the current state as the new baseline, but **only while the Project has no unresolved
+  and no anomalous tracked test execution**; otherwise it is hidden (`options_hidden`, reason `UNRESOLVED_ROWS_PRESENT`
+  or `TRACKED_ANOMALY_PRESENT`). For a Project with unresolved tracked executions the gate offers instead
+  `accept_unproven_risk` (risk HIGH; an operator accepts the risk of a process that could not be proven gone; it needs a
+  `rationale`), `recheck_processes` (only after a live process was observed) or, for a stale gate, `refresh_gate`. Neither
+  risk option makes the Project `CLEAN`; only `continue` does.
+* **Tracked test commands.** On Windows the Orchestrator's own test commands run as tracked executions: the process is
+  spawned suspended, assigned to a Windows Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`), its identity is persisted
+  with a fence on the `executions` row (`detail.tracked`), and only then resumed, so a row without a `pid` never ran user
+  code. The tree is terminated through the Job. If the tree cannot be proven empty, the Job stays retained in the Runner
+  process and the row stays unresolved. After a Runner restart the Job's processes are ended by the OS when the owning
+  process ends (a conditional OS guarantee that the recovery verdict treats as an assumption, switchable). A background
+  orphan sweeper and a risk worker settle such rows. Migration `0005` adds `runtime_capabilities`,
+  `process_risk_requests`, the partial indexes `ix_executions_tracked_unresolved` and `ix_executions_tracked_anomaly`, and
+  `uq_approvals_lineage_successor`.
+* **Verification scope.** Verified by tests on Windows: the real Job Object behaviour (tree kill, owner-process death,
+  crash points of the spawn protocol). POSIX has a policy only: an unsupported platform degrades tracked commands to
+  untracked execution, and an unknown or unavailable capability fails closed (`PROCESS_TRACKING_UNAVAILABLE`); its runtime
+  behaviour is not verified. Not verified: POSIX runtime, real Gradle/Maven builds, real CLI end-to-end runs, random race
+  stress, EXPLAIN/generic plans, real deadlock tests.
+* **Known limits of tracked executions.** A process spawned but not yet assigned to the Job (the CP2 window) leaves a row
+  indistinguishable from "nothing spawned": user code cannot have run, but a Job-less suspended process may survive a close
+  as `NEVER_RAN`; this is accepted by design. A pid-less row recorded as `SPAWNED_PROCESS_UNPROVEN` is not resolved by a
+  restart and has **no supported resolution path**: a valid acceptance record needs a `pid`, so the gate hides
+  `accept_unproven_risk` (`TARGET_WITHOUT_PID`) and a direct submit is rejected with 409 `OPTION_NOT_AVAILABLE`, nothing
+  written. `abort` only terminates the Task and does not clear `DIRTY_UNRESOLVED`; the row can only be settled by cleaning up
+  the process and editing the database by hand (a restart Windows test is a separate, unverified follow-up; details in
+  `docs/workflow/08-human-gate.md` and `09-recovery.md`).
 
 Settings (`.env`): `MAX_CONCURRENT_TASKS` (default 2), `MAX_TASKS_PER_PROJECT` (default 1),
 `MAX_CONCURRENT_CLI_PROCESSES` (default 4), `RUNNER_SHUTDOWN_GRACE_SECONDS` (default 30), `PROJECT_CLONE_ROOT`

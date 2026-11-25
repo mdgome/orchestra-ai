@@ -212,7 +212,21 @@ flowchart TD
     F --> D
 ```
 
+### 프로세스 추적, 백그라운드, tracked execution 진단
+
+아래는 모두 읽기 전용이며, 조회는 아무것도 시작하거나 재시작하거나 쓰지 않습니다.
+
+- **`/health` 본문**: `status`, `runner_active`, `ready`, `warnings`, `runner`(`lifecycle`, `startup_outcome`, `blockers`, `background_degraded`, `sweeper`). `warnings`에는 고정 code(`SWEEPER_STALLED`, `SWEEPER_CONFIG_INVALID`, `BACKGROUND_COMPONENT_DEGRADED`, 정렬됨)만 들어갑니다. `runner.sweeper`는 `stalled`, `consecutive_failures`, `last_failure_code`, `last_failure_at`, `next_retry_at`, `config_invalid_active`, `clearance_pending`을 가집니다. supervisor가 degraded이면 blocker `SUPERVISOR_DEGRADED`가 추가되어 `ready=false`가 되고, sweeper·risk worker·capability unit이 degraded이면 `background_degraded`와 warning만 설정됩니다. [03](03-task-runner_ko.md)의 파생 표시 상태는 `/health`에 나타나지 않습니다.
+- **보고서**: `GET /tasks/{id}/report`는 `state`(`KNOWN` 또는 `UNKNOWN`), `ready`, `blockers`, `warnings`, `sweeper`, `background_degraded`(같은 고정 값)를 가진 `runtime` 객체를 포함합니다.
+- `GET /projects/{id}/diagnostics`의 **`PROCESS_TRACKING` 항목**: Runner의 추적 capability입니다. 이 프로세스에서 `RUNNING`인 Runner는 자신의 메모리를 보고하고, 지원되지 않는 플랫폼은 로컬에서 결정하며, 그 밖에는 저장된 `runtime_capabilities` 행을 상태가 `UNKNOWN`이 아니고, 최신(`CAPABILITY_TTL_SECONDS`)이며, Runner advisory lock을 행이 지목한 backend가 잡고 있을 때만 신뢰합니다. 그 외, 읽기 실패 포함, 는 fail-closed unknown입니다. `SUPPORTED`는 `PASS`, `UNSUPPORTED_PLATFORM`은 `WARN`(`PROCESS_TRACKING_UNSUPPORTED_PLATFORM`: Task는 계속 실행되며 untracked), `UNAVAILABLE`은 `FAIL`(`PROCESS_TRACKING_UNAVAILABLE`: self-test 실패, tracked 테스트 명령은 fail-closed), 읽을 수 없으면 `UNKNOWN`(`PROCESS_TRACKING_STATUS_UNKNOWN`)입니다. `SUPPORTED`를 제외한 모든 상태에 `blocks_features: ["TEST_RUN"]`가 붙으며, `SUPPORTED`에서는 이 키가 없습니다.
+- **`TRACKED_EXECUTIONS` 항목**: `causes` 목록(각각 `reason_code`, `severity`, `blocks_execution`, `cause`, `recommendation`, 제한된 관련 execution·request id)이며, 항목 상태는 가장 높은 severity이고 정상 진행은 본문의 정보일 뿐입니다. 행 원인은 프로젝트의 U·A 행([09](09-recovery_ko.md))에서 옵니다. `TRACKED_EXECUTION_ANOMALY`(`FAIL`), `TASK_TERMINAL_WITH_UNRESOLVED`, `NO_OWNING_RUN`, `TASK_NOT_EXECUTING`, `LEASE_EXPIRED`, `RUNNER_MISMATCH`, `EXECUTION_TOO_OLD`, `CLOSED_UNPROVEN`(`WARN`). 요청 원인은 열려 있는 `process_risk_requests`와 capability에서 옵니다. `REQUEST_WITHOUT_WORKER`, `REQUEST_CLAIM_TIMEOUT`, `REQUEST_RETRY_STUCK`, `CAPABILITY_MISMATCH`(`WARN`).
+- **`RUNNER_STATE` 원인**: `BACKGROUND_COMPONENT_DEGRADED`(supervisor일 때만 `FAIL`이며 차단, 그 외 `WARN`), `BACKGROUND_COMPONENT_DERIVED`(`WARN`, 표시 전용, lifecycle이 `RUNNING`일 때만), `SWEEPER_STALLED`와 `SWEEPER_CONFIG_INVALID`(`WARN`). 항목은 기본 상태와 원인 중 가장 높은 severity를 유지합니다.
+- `DIAGNOSTICS_POLICY_VERSION`은 2이며 진단 cache key에 포함되므로, 검사 집합이 바뀌어도 이전 cache 응답이 제공되지 않습니다.
+
 ## 현재 구현 제한
+
+- 프로세스 추적 진단의 검증 범위: reader는 단위 테스트와 내장 PostgreSQL 테스트(`tests/unit/test_tracked_causes.py`, `tests/integration_pg/test_tracked_diagnostics.py`)로 **검증됨**이며, capability 자체는 Windows에서만 실제 Job Object self-test에서 옵니다. POSIX 정책은 코드에만 존재하고(`UNSUPPORTED_PLATFORM`, `WARN`, untracked) POSIX 런타임 동작은 **검증하지 않았습니다**. **검증하지 않은 것**: POSIX 런타임, 실제 Gradle/Maven 빌드, 실제 CLI E2E, 무작위 race stress, EXPLAIN/generic plan, 실제 deadlock 테스트.
+- `COMPONENT_EXCEPTION`과 `EXTERNAL_OR_UNKNOWN`은 내부 `last_failure` code(와 로그 문구)이며 API code가 아닙니다. 진단의 unit reason code는 [03](03-task-runner_ko.md)의 `DEGRADED` 값입니다.
 
 - Completion Checker는 미종료 Execution을 별도 쿼리로 검사하지 않습니다. 위 세 묶음의 검사가 전부입니다.
 - Event Bus는 단일 프로세스 in-memory입니다. Runner와 다른 프로세스에서 발행된 이벤트는 전달되지 않을 수 있으며 REST 조회로 확인해야 합니다.

@@ -18,12 +18,14 @@
 - Project·write lock·terminal 정리: `project_service.py`, `project_lock_service.py`, `project_terminal.py`, `task_finalizer.py`, `recovery_effects.py`, `project_recovery_effect.py`, `app/infra/workspace_fingerprint.py`
 - 테스트·완료: `test_policy_service.py`, `test_policy_resolver.py`, `completion_checker.py`
 - Provider: `app/providers/`, 프로세스·이벤트: `app/infra/process_control.py`, `app/infra/event_bus.py`
+- tracked 실행(Windows Job Object): `app/infra/command_executor.py`, `app/infra/windows_job.py`, `app/services/tracked_classifier.py`, `lease_service.py`(`retained_job_verdict`)
+- 백그라운드·위험 옵션: `background_supervisor.py`, `orphan_sweeper.py`, `process_risk_worker.py`, `dirty_gate_options.py`
 
 ## 현재 불변 조건
 아래는 2026-11 시점에 코드와 `docs/workflow`에서 확인한 사실이다. 개수는 맞춰야 할 목표가 아니다.
 - Workflow는 `app/services/runner.py`의 `Runner`가 `execution_requests`를 처리해 실행한다. `TaskService`는 Task 생성과 Execution Request 저장만 한다(`create_task`와 `request_execution`이 분리되어 있다).
 - PostgreSQL이 Task, Session, Approval, Checkpoint의 Source of Truth다. Redis는 구현되어 있지 않다.
-- 별도의 `RecoveryService`와 `InvalidationService` 클래스는 없다. Recovery 책임은 `Runner`, `WorkflowService`, `HumanGateService`, `LeaseService`, `StepRunner`에 분산되어 있다. 무효화는 각 `_do_*` Step 진입 시 hash 비교로 이루어진다.
+- 별도의 `RecoveryService`와 `InvalidationService` 클래스는 없다. Recovery 책임은 `Runner`, `WorkflowService`, `HumanGateService`, `LeaseService`, `StepRunner`, 백그라운드 `OrphanSweeper`와 `ProcessRiskWorker`(`BackgroundSupervisor`가 소유)에 분산되어 있다. 무효화는 각 `_do_*` Step 진입 시 hash 비교로 이루어진다.
 - Design Review PASS 뒤에는 일반 Human Gate 판정 없이 Development로 진행한다. Gate는 명시적 요청, 권한 요청 또는 Recovery 불확실 조건에서만 열린다.
 - `ApprovalType`은 `DESIGN`, `PERMISSION`, `RECOVERY`로 구분되며 처리 경로가 다르다.
 - Tester Agent 단계(`TaskState.TESTING`의 Tester 실행)와 Orchestrator 독립 테스트(`TestPolicyService.run`)는 별도다.
@@ -41,7 +43,11 @@
 - Advisory Lock 연결 상실을 지속 감시하지 않는다.
 - Runner 수명 상태(`STOPPED/STARTING/RUNNING/STOPPING/STOP_INCOMPLETE`)는 프로세스 내부 값이며, recovery는 STARTING(startup)/RUNNING(주기)에서만 허용된다. lifecycle 허용 검사와 recovery task의 등록·회수는 `_lifecycle_lock` 아래에서 수행하고, recovery DB I/O는 lifecycle lock 밖에서 수행한다. Runner별 recovery operation은 하나만 등록된다(등록 자체가 단일 실행 gate). unresolved recovery(live task, commit 결과 불명, connection 정리 미확인)는 `STOP_INCOMPLETE`와 advisory lock 유지의 원인이 된다. `STOP_INCOMPLETE`는 살아 있는 in-flight Task, 미해결 recovery 또는 정리가 확인되지 않은 runtime connection이 남은 상태이며 start·recovery를 거부하고 stop 재호출만 허용한다(advisory lock이 반드시 남는다고 단정하지 않는다). advisory connection close 등 bound를 두지 않은 구간이 있으므로 stop 전체가 bounded라고 쓰지 않는다.
 - Snapshot 실패는 이미 기록된 CLI 결과를 바꾸지 않고 `SNAPSHOT_FAILED`로 fail-closed 한다. Terminal 트랜잭션과 ExecutionRequest `DONE`은 별도 트랜잭션이다.
-- 프로세스 종료 신원이 `(pid, create_time)`에 한정된다.
+- untracked 프로세스(Agent CLI)의 종료 신원은 `(pid, create_time)`에 한정된다. tracked 행(`detail.tracked`)은 Job 증거(`JOB_EMPTY`) 또는 kill-on-close 가정으로 판정한다.
+- tracked 행의 pid 없는 열린 행은 takeover·`OrphanSweeper`·`ProcessRiskWorker`가 모두 `retained_job_verdict`로 먼저 판정한다. 같은 프로세스의 보유 Job이 비었다고 입증되지 않았으면 `NEVER_RAN`이 아니라 `SPAWNED_PROCESS_UNPROVEN`이다(이전 잔여 위험은 같은 프로세스 보유 Job에 한해 해소됨).
+- CP2(spawn 직후, Job 할당 전)는 행으로 구별할 수 없어 suspended 프로세스가 `NEVER_RAN` 종료 뒤 살아남을 수 있다. 설계상 수용이며 보유 Job 경우로 확장하지 않는다. Runner 재시작 뒤에는 레지스트리가 비어 있고 `KILL_ON_JOB_CLOSE`(가정 스위치)에 의존한다.
+- `SPAWNED_PROCESS_UNPROVEN` pid 없는 행은 지원되는 해소 경로가 없다. 유효한 수용 기록에는 pid가 필요하므로(`risk_acceptance_pid_valid`, classifier와 공유) 대상 집합에 pid 없는 행이 하나라도 있으면 gate가 `accept_unproven_risk`를 `TARGET_WITHOUT_PID`로 숨기고, 직접 제출은 409 `OPTION_NOT_AVAILABLE`이며 아무것도 기록하지 않는다. `abort`는 Task만 종료하고 `DIRTY_UNRESOLVED`는 `continue`(미해결·이상 행 없음)로만 해소된다.
+- 검증 범위: 실제 Job Object 동작은 Windows 테스트로만 검증했다. POSIX는 정책(`UNSUPPORTED_PLATFORM`은 untracked, `UNKNOWN`/`UNAVAILABLE`은 fail-closed)만 있고 런타임은 미검증이다. 테스트 개수는 문서에 쓰지 않는다.
 - Codex 역할의 PERMISSION 승인은 `enforceable=false`이면 RESUME이 생성되지 않아 Task가 `WAITING_APPROVAL`에 남고 자동 복구 경로가 없다.
 - `SessionConflict` 이후의 복구 경로는 테스트로 검증되지 않았다.
 - 외부 부수 효과 판단이 stdout/stderr tail의 정규식에 의존한다.

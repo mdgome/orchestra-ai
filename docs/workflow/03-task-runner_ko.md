@@ -116,8 +116,24 @@ sequenceDiagram
 - 전역 advisory lock은 이번 단계에서도 유지되며 다중 프로세스 singleton 보장용입니다(OS lock 등으로의 전환은 배포 토폴로지를 확인한 뒤 별도로 결정). 그대로 "Runner(Coordinator) 프로세스는 하나"라는 보호입니다. Task 단위 배제는 Lease, Project 단위 배제는 `projects.write_owner_task_id`입니다 ([07](07-lease_ko.md)).
 - `app.infra.process_control` 모듈은 만료된 Lease 인계 중 이전 프로세스 확인이 필요한 경로에서만 호출됩니다. 절차(Txn A → 트랜잭션 밖 프로세스 확인·종료 → Txn B)는 [07](07-lease_ko.md)에 있습니다.
 
+## 백그라운드 컴포넌트와 Runner 시작 순서
+
+요청 dispatch 외에, 하나의 `Runner`가 `BackgroundSupervisor`를 통해 백그라운드 컴포넌트를 소유합니다. 이는 프로세스 내부 상태이자 조회용 모델이며, [09](09-recovery_ko.md)의 PostgreSQL 상태를 대체하지 않습니다.
+
+- **시작 순서**(`Runner.start`): (1) `_lifecycle_lock` 아래의 진입 구간, (2) advisory lock 획득 후 `runtime_capabilities`에 프로세스 추적 capability `UNKNOWN` upsert, 추적 self-test(스레드에서 실행), capability 결과 upsert, (3) supervisor와 필수 unit을 만드는 하나의 동기 구간, (4) 시작 복구를 `startup-recovery` task로 실행, (5) 모든 READY 이벤트·복구·시작 실패에 대한 한 번의 제한된 대기(`BACKGROUND_READY_TIMEOUT_SECONDS`) 후 성공 경계(`RUNNING`). 어떤 실패든 `_fail_start`로 넘겨지며, 취소로부터 보호되는 settlement task 안에서 시작 task를 정리합니다.
+- **Unit**: `sweeper`(`OrphanSweeper`, [09](09-recovery_ko.md)), `risk-worker`(`ProcessRiskWorker`, [08](08-human-gate_ko.md)), `capability`(capability 행 주기 갱신, [11](11-task-lifecycle_ko.md)), 그리고 `supervisor` task 자체입니다. 정상 `stop`이나 시작 실패는 unit을 취소하기 전에 취소 사유(`STOP`, `FAILED_START`)를 기록하므로 정상 정리가 실패로 기록되지 않습니다.
+- **`startup_mutation_done`**: lifecycle이 아직 `STARTING`일 때 시작 복구가 요청 변경을 커밋했거나 정상 반환하면 설정되며, 다시 해제되지 않습니다. 첫 sweeper pass가 이를 기다리므로 sweeper는 요청 복구가 실행되기 전에 tracked execution을 판정하지 않습니다.
+- **재시작 예산**: unit의 비정상 종료는 지수 backoff(`BACKGROUND_RESTART_BACKOFF_BASE_SECONDS`에서 시작해 `BACKGROUND_RESTART_BACKOFF_CAP_SECONDS`까지) 후 재시작합니다. 연속 실패 횟수는 unit이 안정적으로 실행된 뒤(`BACKGROUND_STABLE_SECONDS`)에만 초기화됩니다. 연속 실패가 너무 많거나(`BACKGROUND_MAX_RESTARTS`) 윈도우 안 재시작이 너무 많으면(`BACKGROUND_RESTART_WINDOW_SECONDS` 동안 `BACKGROUND_RESTART_WINDOW_MAX`) unit은 `RESTART_BUDGET_EXHAUSTED`와 함께 `DEGRADED`가 됩니다(재시작 설정이 잘못되면 `RESTART_CONFIG_INVALID`). `DEGRADED` unit은 supervisor가 다시 재시작하지 않으며, Runner 재시작이 해결 경로입니다.
+- **Dispatch**: 새 요청 claim은 supervisor가 degraded일 때(`SUPERVISOR_DEGRADED` blocker)만 막힙니다. degraded인 sweeper, risk worker, capability unit은 dispatch를 막지 않으며 `background_degraded`로 표시됩니다([11](11-task-lifecycle_ko.md)).
+- **`last_failure`**: 각 unit은 감사 기록(code, unit, generation)을 가집니다. 그 code(`COMPONENT_EXCEPTION`, `EXTERNAL_OR_UNKNOWN`, `BACKGROUND_READY_TIMEOUT` 등)는 내부 값(`last_failure`와 로그)이며 API 코드가 아닙니다. API에 나가는 reason code는 `DEGRADED` unit의 값(`RESTART_BUDGET_EXHAUSTED`, `RESTART_CONFIG_INVALID`, supervisor의 경우 `SUPERVISOR_EXITED`)입니다.
+- **파생 표시 상태**: `EXITED_UNSUPERVISED`, `BACKOFF_ORPHANED`, `BACKOFF_WAITER_DONE_UNSUPERVISED`는 supervisor가 정리하지 않은 unit을 나타냅니다. lifecycle이 `RUNNING`일 때만 존재하고 표시 전용이며, `background_degraded`를 설정하거나 blocker·warning을 추가하지 않습니다.
+- **Sweeper 정체**: 실패한 sweeper pass는 상한이 있는 backoff로 재시도하며 어떤 행도 건너뛰지 않습니다. 연속 실패 pass가 임계값(`ORPHAN_SWEEP_STALL_THRESHOLD`)에 이르면 sweeper를 정체(`SWEEPER_STALLED`)로 보고합니다. `next_recheck_at`은 sweeper가 설정 재평가를 위해 실제로 기다리는 시각이며, 그런 대기가 예약되지 않은 동안에는 `null`입니다.
+
 ## 현재 구현 제한
 
+- 이 문서의 프로세스 수명주기 동작에 대한 검증 범위: Windows에서 실제 Job Object로 **검증됨**(`tests/unit/test_windows_job.py`, `tests/integration_pg/test_never_ran_crash_points.py`, `tests/integration_pg/test_tracked_services.py`). POSIX 정책은 코드에만 존재하며(capability gate: `UNSUPPORTED_PLATFORM`은 untracked 실행으로 degrade, `UNKNOWN`/`UNAVAILABLE`은 fail-closed) 그 런타임은 **검증하지 않았습니다**. **검증하지 않은 것**: POSIX 런타임, 실제 Gradle/Maven 빌드, 실제 CLI E2E, 무작위 race stress, EXPLAIN/generic plan, 실제 deadlock 테스트.
+- 재시작 예산을 소진해 `DEGRADED`가 된 unit은 자동으로 다시 시작되지 않습니다.
+- 필수 unit의 최상위 task가 예기치 않게 취소되면 `EXTERNAL_OR_UNKNOWN` `last_failure` 하나로 기록되고 재시작 budget을 한 단계 소모합니다(테스트로 확인). 예상된 정리 취소(`stop` 또는 시작 실패 정리)는 아무것도 기록하지 않고 budget도 소모하지 않습니다. 예기치 않은 취소에 별도 code를 줄지는 미결정 사항입니다. 필수 task 여러 개가 동시에 끝났을 때는 supervisor가 먼저, 그다음 `BACKGROUND_COMPONENT_IDS`의 선언 순서(`sweeper`, `risk-worker`, `capability`)로 처리합니다.
 - Runner(Coordinator) 프로세스는 하나만 지원합니다. 두 번째 프로세스는 advisory lock 획득에 실패하면 Runner를 시작하지 않고 요청 저장만 수행합니다. 병렬성은 한 프로세스 안의 asyncio Task입니다.
 - 정확히 한 번 실행은 보장하지 않습니다(at-least-once + 변경 감지). 불확실한 실행은 자동 재실행하지 않고 RECOVERY Gate로 갑니다.
 - 병렬 실행 한도(`MAX_CONCURRENT_TASKS`, `MAX_TASKS_PER_PROJECT`, `MAX_CONCURRENT_CLI_PROCESSES`)는 설정값이며, DB pool은 기본값(10+10) 그대로입니다. 한도를 크게 올릴 때는 pool 크기를 함께 검토해야 합니다.

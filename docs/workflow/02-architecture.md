@@ -151,7 +151,10 @@ There is no separate `RecoveryService`. Recovery-related responsibilities are di
 | `HumanGateService` | `open_recovery` (transitions Task/Approval/Step within a single transaction, records `reason_code`), handling RECOVERY decisions (delegated to `RecoveryEffects`) |
 | `ProjectLockService` | Entering PROJECT_DIRTY Gate (`ensure_for_step`), `reconcile` of remaining Project locks |
 | `LeaseService` | Expired Lease handover and `UNCERTAIN` determination in `acquire` |
-| `StepRunner` | Raises unconfirmed-termination results as `TerminationUnconfirmed`, isolates results that lost their Lease as `discarded_result` |
+| `StepRunner` | Raises unconfirmed-termination results as `TerminationUnconfirmed`, isolates results that lost their Lease as `discarded_result`; `TrackedCommandSession` registers, identity-fences and closes the `executions` row of each tracked test command ([05](05-development-testing.md)) |
+| `OrphanSweeper` | Background pass that settles unresolved (U) and anomalous (A) tracked `executions` rows ([09](09-recovery.md)) |
+| `ProcessRiskWorker` | Background verification of `accept_unproven_risk` / `recheck_processes` requests and the follow-up gates ([08](08-human-gate.md)) |
+| `BackgroundSupervisor` | Owns the `sweeper`, `risk-worker` and `capability` units of one `Runner` (restart budget, degraded state); in-process state only ([03](03-task-runner.md)) |
 
 ## How to read this
 
@@ -159,5 +162,5 @@ There is no separate `RecoveryService`. Recovery-related responsibilities are di
 - `SessionService` is called by `StepRunner` (`prepare`, `record_result`) and by `WorkflowService`/`Runner` (`close_all_for_task`). Actual storage only happens through the `PostgresSessionStore` created by `StepRunner`.
 - `TaskService` does not start a Workflow. Once stored in `execution_requests`, `Runner` claims it from PostgreSQL ([03](03-task-runner.md)).
 - The Completion Checker is not a separate Agent or Service; it is the `check_definition_of_done` function that `WorkflowService` calls while processing a Code Review PASS ([11](11-task-lifecycle.md)).
-- `process_control` is not a class but the `app.infra.process_control` module (`ProcessIdentity`, `TerminationResult`, `capture_identity`, `check_alive`, `terminate_tree`).
+- `process_control` is not a class but the `app.infra.process_control` module (`ProcessIdentity`, `TerminationResult`, `capture_identity`, `check_alive`, `terminate_tree`, plus the `TreeJob` interface, the tracking capability self-test and `JobError`). The Windows Job Object implementation is the separate module `app.infra.windows_job` (`WindowsJob`), driven by `CommandExecutor`.
 - The Event Bus is in-memory and best-effort. The source of truth is PostgreSQL.

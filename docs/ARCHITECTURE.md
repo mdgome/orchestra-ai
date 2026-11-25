@@ -59,7 +59,10 @@ Abstractions exist only where a second implementation is real: `CliProvider` (Co
 
 ## Runtime status and diagnostics
 
-* `runtime_status.runtime_snapshot(lifecycle, startup_outcome, recovery_unsettled)` is the ONE judgement behind `/health`.
+* `runtime_status.runtime_snapshot(lifecycle, startup_outcome, recovery_unsettled, state=None, *, background_degraded=False,
+  supervisor_degraded=False, components=())` is the ONE judgement behind `/health`; `state` is the background input bundle
+  (`RunnerRuntimeState`: supervisor state, degraded components, sweeper stall and configuration state), and the snapshot
+  adds `warnings`, `runner.background_degraded`, `runner.sweeper` and the `SUPERVISOR_DEGRADED` blocker.
   `runner_active` and `ready` come from `Runner.lifecycle`. Why a Runner never started (preflight blocked, advisory lock
   held, `start()` failed) is invisible in the lifecycle, so the lifespan records a `StartupOutcome`. `START_FAILED` is
   reserved: a general `Runner.start` exception still aborts the lifespan (decision D6-a).
@@ -81,7 +84,25 @@ One RUNNING `task_runs` row per task (partial unique index). Takeover of an expi
 short txn that reads the old run, **no transaction** while the OS is inspected/terminated, short txn that re-locks
 the task, re-validates the same run/version and swaps the run. If the previous CLI cannot be proven gone (access
 denied, still alive, identity mismatch, or a `STARTING` execution with no known pid) the takeover is `UNCERTAIN`:
-nothing runs and the task parks in a `RECOVERY` gate. A process is identified by `(pid, creation time)`, never by pid.
+nothing runs and the task parks in a `RECOVERY` gate. An untracked process (an agent CLI call) is identified by
+`(pid, creation time)`, never by pid. A **tracked** execution row (a test command run through a Job Object) is judged
+differently: by the Job (`JOB_EMPTY`) or by the kill-on-close assumption (owner Runner process proven gone, root gone, no
+survivor). A tracked row without a pid is closed `NEVER_RAN` only when it carries no unproven-spawn evidence and no retained
+Job of the same Runner process is present (`retained_job_verdict`); otherwise it is `SPAWNED_PROCESS_UNPROVEN`. Details:
+`docs/workflow/07-lease.md`.
+
+## Tracked executions and background units
+
+* `TrackedCommandSession` (`step_runner`) registers a tracked `executions` row (`detail.tracked`) before a test command is
+  spawned and writes the fenced identity and the closing proof. `process_control.TreeJob` is the Job abstraction and `windows_job.WindowsJob` its Windows Job Object
+  (`KILL_ON_JOB_CLOSE`, the process is spawned suspended, assigned, identified, persisted, then resumed); `CommandExecutor`
+  retains the Job of a tree that was not proven empty.
+* `BackgroundSupervisor` owns the in-process units `OrphanSweeper` (settles unresolved and anomalous tracked rows),
+  `ProcessRiskWorker` (verifies the risk options of the `PROJECT_DIRTY` gate) and the capability refresh. Unit failures are
+  restarted within a budget; only a degraded supervisor blocks dispatch. PostgreSQL stays the source of truth.
+* Migration `0005` adds `runtime_capabilities`, `process_risk_requests`, the partial indexes `ix_executions_tracked_unresolved`
+  and `ix_executions_tracked_anomaly`, and `uq_approvals_lineage_successor` (at most one successor per approval).
+* Details: `docs/workflow/03`, `07`, `08`, `09`.
 
 ## Execution discipline (`step_runner`)
 
@@ -126,7 +147,9 @@ only when the CLI explicitly reports it does not exist; timeouts and transient e
   `projects.write_owner_task_id`. Order: `claim -> task lease -> project gate -> step attempt -> CLI`. At a terminal
   transition `project_terminal.release_on_terminal` clears the lock and write baseline in the SAME transaction, and
   `workspace_state` is `CLEAN` or `DIRTY_UNRESOLVED` (never `CLEAN` when it cannot be proven). The only way out of
-  `DIRTY_UNRESOLVED` is `continue` on the `PROJECT_DIRTY` RECOVERY gate.
+  `DIRTY_UNRESOLVED` is `continue` on the `PROJECT_DIRTY` RECOVERY gate, and `continue` is offered only while the project has
+  no unresolved and no anomalous tracked execution (otherwise the risk options of that gate apply, and an unresolvable row
+  leaves only `abort`).
 * Anything that needs the workspace measured measures a `FingerprintProof` (`WORKSPACE_FINGERPRINT_V1`) outside the
   transaction, then verifies owner and `write_epoch` under the project row lock in a short transaction. A stale proof
   rolls everything back and is measured again (max 3), then the `UNMEASURED` path runs once. No fingerprint is ever
@@ -179,7 +202,15 @@ CLIs, `--help` support for every flag used, Plan Mode and `-s read-only` refusin
   barrier was **not** verified; treat it as a CLI policy.
 * Claude path rules such as `Edit(tests/**)` are not relied upon: the Orchestrator re-checks the Tester's changes.
 * Process termination on Windows is verified for tree kill and identity mismatch in unit tests; behaviour under
-  `ACCESS_DENIED` is simulated, not reproduced.
+  `ACCESS_DENIED` is simulated, not reproduced. Tracked executions (Windows Job Object) are verified by real Job Object tests
+  on Windows (`tests/unit/test_windows_job.py`, `tests/integration_pg/test_never_ran_crash_points.py`,
+  `tests/integration_pg/test_tracked_services.py`). The POSIX policy exists in code only (an unsupported platform degrades to
+  untracked, an unknown or unavailable capability fails closed); POSIX runtime, real Gradle/Maven builds, real CLI end-to-end
+  runs, random race stress, EXPLAIN/generic plans and real deadlock tests are not verified.
+* Known limits of tracked executions: a Job-less suspended process (CP2) may survive a `NEVER_RAN` close (accepted by
+  design); a pid-less `SPAWNED_PROCESS_UNPROVEN` row has no supported resolution path (the gate hides
+  `accept_unproven_risk` with `TARGET_WITHOUT_PID` and a direct submit is 409 `OPTION_NOT_AVAILABLE`; `abort` only ends the
+  Task and does not clear `DIRTY_UNRESOLVED`; see `docs/workflow/08-human-gate.md`).
 * No load testing; one Runner (coordinator) process only, parallelism is per task inside it.
 * External edits to a project workspace while one of its tasks is active are not supported and are not fully
   detectable (`write_epoch` only counts orchestrator-controlled changes).

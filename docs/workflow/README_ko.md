@@ -45,5 +45,6 @@ Claude Plan Mode → Codex Design Review → (Design Review PASS이면 바로) C
 - Event Bus는 in-memory best-effort이며 복구 경로는 PostgreSQL REST 조회입니다 ([11](11-task-lifecycle_ko.md)).
 - 외부 부수 효과 판정은 실행 로그 stdout/stderr tail의 정규식 검사에 의존합니다 ([09](09-recovery_ko.md)).
 - 활성 Project Task가 있는 동안의 외부 프로세스 수정은 지원하지 않으며 fingerprint로도 완전 탐지가 보장되지 않습니다. `write_epoch`는 Orchestrator 내부 세대 번호일 뿐입니다 ([09](09-recovery_ko.md), [10](10-invalidation_ko.md)).
-- `DIRTY_UNRESOLVED` Project는 PROJECT_DIRTY Gate의 `continue`로만 해제됩니다 ([08](08-human-gate_ko.md)).
+- `DIRTY_UNRESOLVED` Project는 PROJECT_DIRTY Gate의 `continue`로만 해제되며, `continue`는 미해결 또는 이상 tracked execution이 남아 있지 않을 때만 제시됩니다 ([08](08-human-gate_ko.md), [09](09-recovery_ko.md)).
+- tracked 테스트 명령(Windows Job Object)은 Windows에서만 검증했습니다. POSIX 정책(`UNSUPPORTED_PLATFORM`은 untracked로 degrade, `UNKNOWN`/`UNAVAILABLE`은 fail-closed)은 코드에 있으나 런타임은 검증하지 않았습니다. 알려진 잔여 위험: Job에 할당되지 않은 suspended 프로세스가 `NEVER_RAN` 종료 뒤에도 살아남을 수 있고, `SPAWNED_PROCESS_UNPROVEN` 행은 Runner 재시작 뒤에도 미해결로 남습니다 ([05](05-development-testing_ko.md), [07](07-lease_ko.md), [09](09-recovery_ko.md)).
 - Maven·Gradle 실제 빌드, Windows의 파일 symlink 경로는 이 환경에서 실행·검증하지 못했습니다 ([05](05-development-testing_ko.md), [10](10-invalidation_ko.md)).

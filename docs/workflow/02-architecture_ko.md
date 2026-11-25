@@ -151,7 +151,10 @@ flowchart TB
 | `HumanGateService` | `open_recovery`(Task/Approval/Step을 한 트랜잭션에서 전환, `reason_code` 기록), RECOVERY 결정 처리(`RecoveryEffects`에 위임) |
 | `ProjectLockService` | PROJECT_DIRTY Gate 진입(`ensure_for_step`), 남은 Project lock `reconcile` |
 | `LeaseService` | `acquire`의 만료 Lease 인계 및 `UNCERTAIN` 판정 |
-| `StepRunner` | 종료 미확인 결과를 `TerminationUnconfirmed`로 올림, Lease 상실 결과를 `discarded_result`로 격리 |
+| `StepRunner` | 종료 미확인 결과를 `TerminationUnconfirmed`로 올림, Lease 상실 결과를 `discarded_result`로 격리. `TrackedCommandSession`이 tracked 테스트 명령마다 `executions` 행을 등록하고, 식별을 fence하고, 닫음([05](05-development-testing_ko.md)) |
+| `OrphanSweeper` | 미해결(U)·이상(A) tracked `executions` 행을 정리하는 백그라운드 pass([09](09-recovery_ko.md)) |
+| `ProcessRiskWorker` | `accept_unproven_risk` / `recheck_processes` 요청과 후속 gate의 백그라운드 검증([08](08-human-gate_ko.md)) |
+| `BackgroundSupervisor` | 한 `Runner`의 `sweeper`, `risk-worker`, `capability` unit을 소유(재시작 예산, degraded 상태). 프로세스 내부 상태일 뿐임([03](03-task-runner_ko.md)) |
 
 ## 읽는 방법
 
@@ -159,5 +162,5 @@ flowchart TB
 - `SessionService`는 `StepRunner`(`prepare`, `record_result`)와 `WorkflowService`·`Runner`(`close_all_for_task`)가 호출합니다. 실제 저장은 `StepRunner`가 만든 `PostgresSessionStore`를 통해서만 일어납니다.
 - `TaskService`는 Workflow를 시작하지 않습니다. `execution_requests`에 저장하면 `Runner`가 PostgreSQL에서 claim합니다 ([03](03-task-runner_ko.md)).
 - Completion Checker는 별도의 Agent나 Service가 아니라 `WorkflowService`가 Code Review PASS를 처리하는 중에 호출하는 `check_definition_of_done` 함수입니다 ([11](11-task-lifecycle_ko.md)).
-- `process_control`은 클래스가 아니라 `app.infra.process_control` 모듈입니다(`ProcessIdentity`, `TerminationResult`, `capture_identity`, `check_alive`, `terminate_tree`).
+- `process_control`은 클래스가 아니라 `app.infra.process_control` 모듈입니다(`ProcessIdentity`, `TerminationResult`, `capture_identity`, `check_alive`, `terminate_tree`, 그리고 `TreeJob` 인터페이스, 추적 capability self-test, `JobError`). Windows Job Object 구현은 별도 모듈 `app.infra.windows_job`(`WindowsJob`)이며 `CommandExecutor`가 구동합니다.
 - Event Bus는 in-memory이며 best-effort입니다. 진실 원천은 PostgreSQL입니다.

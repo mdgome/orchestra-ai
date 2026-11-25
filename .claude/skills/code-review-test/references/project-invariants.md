@@ -18,7 +18,7 @@
 - Project terminal 처리: `app/services/project_terminal.py`
 - Session: `app/services/session_service.py`
 - Snapshot과 fingerprint: `app/infra/workspace_snapshot.py`, `app/infra/workspace_fingerprint.py`
-- Process 실행과 취소: `app/infra/command_executor.py`, `app/infra/process_control.py`
+- Process 실행과 취소: `app/infra/command_executor.py`, `app/infra/process_control.py`, `app/infra/windows_job.py`(Windows Job Object)
 - 기존 테스트: `tests/unit`, `tests/architecture`, `tests/api`, `tests/integration_pg`, `tests/e2e_cli`
 
 ## 실제 코드에서 재확인할 불변 조건

@@ -157,19 +157,27 @@ live workspace를 이 baseline과 비교합니다.
 
 ## Health와 진단
 
-`GET /health`는 API 프로세스가 살아 있으면 200으로 응답합니다. 기존 키의 의미는 그대로이고 `ready`와 `runner`가 추가되었습니다.
+`GET /health`는 API 프로세스가 살아 있으면 200으로 응답합니다. 기존 키의 의미는 그대로이고 `ready`, `warnings`, `runner`가 추가되었습니다.
 
 ```json
-{"status": "ok", "runner_active": false, "ready": false,
- "runner": {"lifecycle": "STOPPED", "startup_outcome": "PREFLIGHT_BLOCKED", "blockers": ["PREFLIGHT_FAILED"]}}
+{"status": "ok", "runner_active": false, "ready": false, "warnings": [],
+ "runner": {"lifecycle": "STOPPED", "startup_outcome": "PREFLIGHT_BLOCKED", "blockers": ["PREFLIGHT_FAILED"],
+            "background_degraded": false,
+            "sweeper": {"stalled": false, "consecutive_failures": 0, "last_failure_code": null, "last_failure_at": null,
+                        "next_retry_at": null, "config_invalid_active": false, "clearance_pending": false}}}
 ```
 
 * `status`는 API 생존 여부만 뜻합니다. `runner_active`와 `ready`는 **`Runner.lifecycle`에서 계산**하며(직접 대입하지 않음),
   `runner_active`는 Runner 루프가 도는 동안만 true이고 `ready`는 추가로 막는 요인이 없어야 합니다(예: 미확정 복구).
 * Runner가 준비되지 않았어도 `POST /tasks/{id}/execution-requests`는 202로 응답하고, 요청은 Runner가 준비될 때까지
   `PENDING`으로 남습니다. `runner.blockers`가 이유를 설명합니다: `PREFLIGHT_FAILED`, `ADVISORY_LOCK_HELD`, `STOPPED`,
-  `STARTING`, `SHUTTING_DOWN`, `STOP_INCOMPLETE`, `RECOVERY_UNSETTLED`. `START_FAILED`는 **예약 상태**입니다. `Runner.start`의
-  일반 예외는 지금도 API 기동을 중단시키므로(결정 D6), 실행 중인 API가 이를 보고하는 일은 없습니다.
+  `STARTING`, `SHUTTING_DOWN`, `STOP_INCOMPLETE`, `RECOVERY_UNSETTLED`, `SUPERVISOR_DEGRADED`(백그라운드 supervisor가
+  종료됨, Runner는 새 작업을 claim하지 않음). `START_FAILED`는 **예약 상태**입니다. `Runner.start`의 일반 예외는 지금도 API
+  기동을 중단시키므로(결정 D6), 실행 중인 API가 이를 보고하는 일은 없습니다.
+* `warnings`는 `SWEEPER_STALLED`, `SWEEPER_CONFIG_INVALID`, `BACKGROUND_COMPONENT_DEGRADED`를 정렬한 목록입니다.
+  `runner.background_degraded`는 supervisor 또는 필수 백그라운드 unit(orphan sweeper, risk worker, capability 갱신)이 실제로
+  degraded인 동안에만 true이며, supervisor가 아닌 unit의 degraded는 dispatch를 막지 않습니다. `runner.sweeper`는 orphan
+  sweeper의 stall과 설정 상태를 보고합니다.
 
 `GET /projects/{id}/diagnostics`는 **읽기 전용 빠른 점검**입니다. 에이전트, 로그인 프로브, 설치 프로그램, 프로젝트 테스트를
 실행하지 않으며, 도구 버전 확인(`git --version`, `java -version`)과 파일 읽기만 수행합니다. 각 항목은 `code`,
@@ -184,6 +192,12 @@ live workspace를 이 baseline과 비교합니다.
 * Project당 진단은 한 번에 하나만 실행되고 동시 요청은 그 결과를 공유합니다. 파일 점검은 worker thread에서 best-effort
   timeout으로 실행되며, 멈춘 파일시스템은 중단시킬 수 없으므로 전체 deadline은 hard deadline이 **아닙니다**. 그런
   worker는 실제로 끝날 때까지 슬롯을 유지하고, 살아 있는 동안 파일 기반 항목은 `UNKNOWN`입니다.
+* `PROCESS_TRACKING`은 Runner의 프로세스 추적 capability를 보고합니다(`PASS` 지원됨, 지원하지 않는 플랫폼은 `WARN`이며
+  tracked 명령이 untracked로 degrade, self-test 실패는 `blocks_execution`과 함께 `FAIL`, 확인할 수 없으면 `UNKNOWN`).
+  지원되지 않으면 항목은 `blocks_features: ["TEST_RUN"]`을 가집니다. `TRACKED_EXECUTIONS`는 Project의 미해결 또는 anomaly
+  tracked execution을 `causes`로 나열합니다(각각 `reason_code`, severity, `blocks_execution`, `recommendation`, 관련
+  execution/request id, anomaly는 제한된 목록). 항목 status는 cause 중 가장 높은 severity입니다. 점검 항목이 바뀌었으므로
+  `DIAGNOSTICS_POLICY_VERSION`은 2입니다(cache key의 일부).
 
 ## Project Profile
 
@@ -234,8 +248,32 @@ curl -X POST localhost:8000/tasks/{task_id}/execution-requests
   하나로 해석되며, 도구가 없으면 Task 생성이 422로 거부됩니다. 테스트 결과(JUnit XML)는 삭제하지 않고 **이번 실행이
   새로 만들었거나 바꾼 파일만** 판정에 사용합니다.
 * 이전 Task가 미해결 변경을 남긴 Project(`workspace_state: DIRTY_UNRESOLVED`)에서 다음 Task가 변경 Step을 시작하면
-  `PROJECT_DIRTY` RECOVERY Gate가 열립니다. `continue`는 현재 상태를 새 baseline으로 수용하고, `abort`는 Task를
-  실패시킵니다(파일은 건드리지 않음).
+  `PROJECT_DIRTY` RECOVERY Gate가 열립니다. `abort`는 Task를 실패시킵니다(파일은 건드리지 않음). `continue`는 현재
+  상태를 새 baseline으로 수용하지만, **Project에 미해결 tracked 테스트 execution도 anomaly tracked 테스트 execution도
+  없을 때에만** 가능하며, 그렇지 않으면 숨겨집니다(`options_hidden`, 이유 `UNRESOLVED_ROWS_PRESENT` 또는
+  `TRACKED_ANOMALY_PRESENT`). 미해결 tracked execution이 있는 Project에서는 대신 `accept_unproven_risk`(위험 HIGH, 사라졌음이
+  입증되지 않은 프로세스의 위험을 운영자가 수용, `rationale` 필요), `recheck_processes`(살아 있는 프로세스가 관찰된 뒤에만),
+  오래된 gate에는 `refresh_gate`를 제공합니다. 두 위험 옵션 모두 Project를 `CLEAN`으로 만들지 않으며 `continue`만 만듭니다.
+* **Tracked 테스트 명령.** Windows에서 오케스트레이터 자신의 테스트 명령은 tracked execution으로 실행됩니다. 프로세스는
+  suspended로 spawn되어 Windows Job Object(`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`)에 할당되고, 식별이 `executions` 행에
+  fence와 함께 저장(`detail.tracked`)된 뒤에야 resume되므로, `pid`가 없는 행은 사용자 코드를 실행한 적이 없습니다. 트리는
+  Job으로 종료합니다. 트리가 비었음을 입증하지 못하면 Job은 Runner 프로세스에 보유되고 행은 미해결로 남습니다. Runner
+  재시작 뒤에는 소유 프로세스가 끝날 때 OS가 Job의 프로세스를 종료합니다(복구 판정이 가정으로 취급하며 끌 수 있는 조건부
+  OS 보장). 백그라운드 orphan sweeper와 risk worker가 그런 행을 정리합니다. migration `0005`는 `runtime_capabilities`,
+  `process_risk_requests`, 부분 index `ix_executions_tracked_unresolved`와 `ix_executions_tracked_anomaly`,
+  `uq_approvals_lineage_successor`를 추가합니다.
+* **검증 범위.** Windows에서 테스트로 검증됨: 실제 Job Object 동작(트리 종료, 소유 프로세스 사망, spawn 프로토콜의 crash
+  지점). POSIX는 정책만 있습니다. 지원하지 않는 플랫폼은 tracked 명령을 untracked 실행으로 degrade하고, 알 수 없거나 사용할
+  수 없는 capability는 fail-closed입니다(`PROCESS_TRACKING_UNAVAILABLE`). 그 런타임 동작은 검증하지 않았습니다. 검증하지
+  않은 것: POSIX 런타임, 실제 Gradle/Maven 빌드, 실제 CLI end-to-end 실행, 무작위 race stress, EXPLAIN/generic plan, 실제
+  deadlock 테스트.
+* **Tracked execution의 알려진 제한.** spawn되었지만 아직 Job에 할당되지 않은 프로세스(CP2 구간)는 행이 "아무것도 spawn되지
+  않음"과 구별되지 않습니다. 사용자 코드는 실행될 수 없었지만, Job이 없는 suspended 프로세스는 `NEVER_RAN` 종료 뒤에도 살아남을
+  수 있으며, 이는 설계상 수용된 한계입니다. `SPAWNED_PROCESS_UNPROVEN`으로 기록된 pid 없는 행은 재시작으로 해소되지 않으며
+  **지원되는 해소 경로가 없습니다**. 유효한 수용 기록에는 `pid`가 필요하므로 gate는 `accept_unproven_risk`를
+  숨기고(`TARGET_WITHOUT_PID`) 직접 제출은 409 `OPTION_NOT_AVAILABLE`로 거부되며 아무것도 기록되지 않습니다. `abort`는
+  Task만 종료하며 `DIRTY_UNRESOLVED`를 해소하지 않습니다. 행은 프로세스를 정리하고 데이터베이스를 직접 수정해야만
+  정리할 수 있습니다(재시작 Windows 테스트는 별도의 미검증 후속 항목, 세부 내용은 `docs/workflow/08-human-gate_ko.md`와 `09-recovery_ko.md`).
 
 설정(`.env`): `MAX_CONCURRENT_TASKS`(기본 2), `MAX_TASKS_PER_PROJECT`(기본 1), `MAX_CONCURRENT_CLI_PROCESSES`(기본 4),
 `RUNNER_SHUTDOWN_GRACE_SECONDS`(기본 30), `PROJECT_CLONE_ROOT`(기본 `./project-clones`).

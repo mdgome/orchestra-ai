@@ -59,7 +59,10 @@ infra/         명령 실행기, 프로세스 제어, 작업공간 보호/스냅
 
 ## 런타임 상태와 진단
 
-* `runtime_status.runtime_snapshot(lifecycle, startup_outcome, recovery_unsettled)`가 `/health`의 유일한 판정입니다.
+* `runtime_status.runtime_snapshot(lifecycle, startup_outcome, recovery_unsettled, state=None, *, background_degraded=False,
+  supervisor_degraded=False, components=())`가 `/health`의 유일한 판정입니다. `state`는 백그라운드 입력 묶음
+  (`RunnerRuntimeState`: supervisor 상태, degraded component, sweeper stall과 설정 상태)이며, snapshot은 `warnings`,
+  `runner.background_degraded`, `runner.sweeper`, `SUPERVISOR_DEGRADED` blocker를 추가합니다.
   `runner_active`와 `ready`는 `Runner.lifecycle`에서 계산합니다. Runner가 시작되지 않은 이유(preflight 차단, advisory lock
   점유, `start()` 실패)는 lifecycle에 보이지 않으므로 lifespan이 `StartupOutcome`을 기록합니다. `START_FAILED`는 예약
   상태입니다. `Runner.start`의 일반 예외는 지금도 lifespan을 중단시킵니다(결정 D6-a).
@@ -81,8 +84,25 @@ Task마다 하나의 RUNNING `task_runs` 행만 허용하며 부분 Unique Index
 수행합니다. 짧은 트랜잭션에서 이전 Run을 읽고, **트랜잭션 없이** OS 프로세스를 검사·종료한 다음, 다시 짧은
 트랜잭션에서 Task를 잠그고 동일한 Run과 버전인지 재검증한 뒤 Run을 교체합니다. 이전 CLI가 종료되었음을 입증할 수
 없는 경우(접근 거부, 여전히 실행 중, 신원 불일치 또는 PID를 알 수 없는 `STARTING` Execution) 인계 결과는
-`UNCERTAIN`이 됩니다. 이 경우 아무 작업도 실행하지 않고 Task를 `RECOVERY` Gate에 대기시킵니다. 프로세스는 PID
-단독이 아니라 `(pid, 생성 시각)`으로 식별합니다.
+`UNCERTAIN`이 됩니다. 이 경우 아무 작업도 실행하지 않고 Task를 `RECOVERY` Gate에 대기시킵니다. untracked 프로세스
+(에이전트 CLI 호출)는 PID 단독이 아니라 `(pid, 생성 시각)`으로 식별합니다. **tracked** execution 행(Job Object로 실행한
+테스트 명령)은 다르게 판정합니다. Job(`JOB_EMPTY`) 또는 kill-on-close 가정(소유 Runner 프로세스가 사라졌음이 입증되고, root가
+사라졌고, 생존 프로세스가 없음)으로 판정합니다. pid가 없는 tracked 행은 입증되지 않은 spawn 증거가 없고 같은 Runner
+프로세스에 보유된 Job도 없을 때에만(`retained_job_verdict`) `NEVER_RAN`으로 닫히며, 그렇지 않으면
+`SPAWNED_PROCESS_UNPROVEN`입니다. 세부 내용: `docs/workflow/07-lease_ko.md`.
+
+## Tracked execution과 백그라운드 unit
+
+* `TrackedCommandSession`(`step_runner`)은 테스트 명령을 spawn하기 전에 tracked `executions` 행(`detail.tracked`)을 등록하고
+  fence된 식별과 닫는 proof를 기록합니다. `process_control.TreeJob`은 Job 추상화이고 `windows_job.WindowsJob`은 그 Windows
+  Job Object 구현입니다(`KILL_ON_JOB_CLOSE`, 프로세스를 suspended로 spawn하고, 할당하고, 식별하고, 저장한 뒤 resume).
+  `CommandExecutor`는 비었음이 입증되지 않은 트리의 Job을 보유합니다.
+* `BackgroundSupervisor`는 프로세스 내부 unit인 `OrphanSweeper`(미해결·anomaly tracked 행을 정리), `ProcessRiskWorker`
+  (`PROJECT_DIRTY` gate의 위험 옵션을 검증), capability 갱신을 소유합니다. unit 실패는 budget 안에서 재시작하며, degraded된
+  supervisor만 dispatch를 막습니다. PostgreSQL이 계속 Source of Truth입니다.
+* migration `0005`는 `runtime_capabilities`, `process_risk_requests`, 부분 index `ix_executions_tracked_unresolved`와
+  `ix_executions_tracked_anomaly`, `uq_approvals_lineage_successor`(approval당 후속 gate는 최대 하나)를 추가합니다.
+* 세부 내용: `docs/workflow/03`, `07`, `08`, `09`.
 
 ## 실행 원칙(`step_runner`)
 
@@ -128,7 +148,8 @@ CLI가 세션이 존재하지 않는다고 명시적으로 보고한 경우에�
   실행합니다. 순서는 `claim → Task Lease → Project gate → Step attempt → CLI`이며 terminal 전이와 같은 트랜잭션에서
   `project_terminal.release_on_terminal`이 lock과 write baseline을 정리합니다. `workspace_state`는 `CLEAN` 또는
   `DIRTY_UNRESOLVED`이고, 증명할 수 없으면 절대 `CLEAN`이 되지 않습니다. 해결 경로는 `PROJECT_DIRTY` RECOVERY Gate의
-  `continue`입니다.
+  `continue`이며, `continue`는 Project에 미해결 tracked execution도 anomaly tracked execution도 없을 때에만 제공됩니다(그
+  외에는 그 gate의 위험 옵션이 적용되고, 해소할 수 없는 행이 있으면 `abort`만 남습니다).
 * 측정이 필요한 전이는 트랜잭션 밖에서 `FingerprintProof`(`WORKSPACE_FINGERPRINT_V1`)를 측정하고, 짧은 트랜잭션에서
   Project 행 잠금 아래 owner·`write_epoch`를 검증합니다. stale이면 롤백 후 재측정(최대 3회), 이후 `UNMEASURED` 종료입니다.
   행 잠금을 잡은 채 fingerprint를 계산하지 않습니다.
@@ -177,7 +198,15 @@ CLI가 세션이 존재하지 않는다고 명시적으로 보고한 경우에�
   여부는 **검증하지 않았으므로** CLI 정책으로 취급해야 합니다.
 * `Edit(tests/**)`와 같은 Claude 경로 규칙에 의존하지 않습니다. Orchestrator가 Tester의 변경사항을 다시 검사합니다.
 * Windows의 프로세스 종료는 단위 테스트에서 프로세스 트리 종료와 신원 불일치를 검증했습니다. `ACCESS_DENIED` 동작은
-  실제 재현이 아니라 시뮬레이션으로 검증했습니다.
+  실제 재현이 아니라 시뮬레이션으로 검증했습니다. tracked execution(Windows Job Object)은 Windows에서 실제 Job Object
+  테스트로 검증했습니다(`tests/unit/test_windows_job.py`, `tests/integration_pg/test_never_ran_crash_points.py`,
+  `tests/integration_pg/test_tracked_services.py`). POSIX 정책은 코드에만 있습니다(지원하지 않는 플랫폼은 untracked로
+  degrade, 알 수 없거나 사용할 수 없는 capability는 fail-closed). POSIX 런타임, 실제 Gradle/Maven 빌드, 실제 CLI
+  end-to-end 실행, 무작위 race stress, EXPLAIN/generic plan, 실제 deadlock 테스트는 검증하지 않았습니다.
+* tracked execution의 알려진 제한: Job이 없는 suspended 프로세스(CP2)는 `NEVER_RAN` 종료 뒤에도 살아남을 수 있습니다(설계상
+  수용). pid 없는 `SPAWNED_PROCESS_UNPROVEN` 행에는 지원되는 해소 경로가 없습니다(gate는 `accept_unproven_risk`를
+  `TARGET_WITHOUT_PID`로 숨기고 직접 제출은 409 `OPTION_NOT_AVAILABLE`이며, `abort`는 Task만 종료하고 `DIRTY_UNRESOLVED`를
+  해소하지 않음. `docs/workflow/08-human-gate_ko.md` 참조).
 * 부하 테스트는 수행하지 않았으며 Runner(Coordinator) 프로세스는 하나만 지원합니다(병렬성은 한 프로세스 안의 Task 단위).
 * 활성 Project Task가 있는 동안의 외부 프로세스 수정은 지원하지 않으며 fingerprint로도 완전 탐지되지 않습니다.
 * Maven·Gradle 실제 빌드는 이 환경에 JDK/Maven/Gradle이 없어 **실행하지 못했습니다**(JUnit 해석, wrapper 해석, 권한,

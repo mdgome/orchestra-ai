@@ -212,7 +212,21 @@ flowchart TD
     F --> D
 ```
 
+### Process Tracking, Background and Tracked-Execution Diagnostics
+
+All of this is read-only; a lookup starts, restarts or writes nothing.
+
+- **`/health` body**: `status`, `runner_active`, `ready`, `warnings`, and `runner` (`lifecycle`, `startup_outcome`, `blockers`, `background_degraded`, `sweeper`). `warnings` holds fixed codes only (`SWEEPER_STALLED`, `SWEEPER_CONFIG_INVALID`, `BACKGROUND_COMPONENT_DEGRADED`, sorted). `runner.sweeper` holds `stalled`, `consecutive_failures`, `last_failure_code`, `last_failure_at`, `next_retry_at`, `config_invalid_active`, `clearance_pending`. A degraded supervisor adds the blocker `SUPERVISOR_DEGRADED` (and so `ready=false`); a degraded sweeper, risk worker or capability unit only sets `background_degraded` and the warning. The derived display states of [03](03-task-runner.md) never appear in `/health`.
+- **Report**: `GET /tasks/{id}/report` carries a `runtime` object with `state` (`KNOWN` or `UNKNOWN`), `ready`, `blockers`, `warnings`, `sweeper` and `background_degraded` (the same fixed values).
+- **`PROCESS_TRACKING` item** of `GET /projects/{id}/diagnostics`: the tracking capability of the Runner. A Runner that is `RUNNING` in this process reports its own memory; an unsupported platform is decided locally; otherwise the stored `runtime_capabilities` row is trusted only if its state is not `UNKNOWN`, it is fresh (`CAPABILITY_TTL_SECONDS`) and the Runner advisory lock is held by the backend the row names. Anything else, including a failing read, is a fail-closed unknown. `SUPPORTED` is `PASS`; `UNSUPPORTED_PLATFORM` is `WARN` (`PROCESS_TRACKING_UNSUPPORTED_PLATFORM`: Tasks still run, untracked); `UNAVAILABLE` is `FAIL` (`PROCESS_TRACKING_UNAVAILABLE`: the self-test failed, tracked test commands fail closed); an unreadable capability is `UNKNOWN` (`PROCESS_TRACKING_STATUS_UNKNOWN`). Every state except `SUPPORTED` adds `blocks_features: ["TEST_RUN"]`; the key is absent for `SUPPORTED`.
+- **`TRACKED_EXECUTIONS` item**: a list of `causes` (each with `reason_code`, `severity`, `blocks_execution`, `cause`, `recommendation` and bounded related execution and request ids); the item status is the highest severity, and normal progress is only information in the text. Row causes come from the project's U and A rows ([09](09-recovery.md)): `TRACKED_EXECUTION_ANOMALY` (`FAIL`), `TASK_TERMINAL_WITH_UNRESOLVED`, `NO_OWNING_RUN`, `TASK_NOT_EXECUTING`, `LEASE_EXPIRED`, `RUNNER_MISMATCH`, `EXECUTION_TOO_OLD`, `CLOSED_UNPROVEN` (`WARN`). Request causes come from the open `process_risk_requests` and the capability: `REQUEST_WITHOUT_WORKER`, `REQUEST_CLAIM_TIMEOUT`, `REQUEST_RETRY_STUCK`, `CAPABILITY_MISMATCH` (`WARN`).
+- **`RUNNER_STATE` causes**: `BACKGROUND_COMPONENT_DEGRADED` (`FAIL` and blocking only for the supervisor, otherwise `WARN`), `BACKGROUND_COMPONENT_DERIVED` (`WARN`, display only, only while the lifecycle is `RUNNING`), `SWEEPER_STALLED` and `SWEEPER_CONFIG_INVALID` (`WARN`). The item keeps the highest severity of its base status and its causes.
+- `DIAGNOSTICS_POLICY_VERSION` is 2 and is part of the diagnostics cache key, so a change of the set of checks never serves an older cached answer.
+
 ## Current Implementation Limitations
+
+- Verification scope of the process-tracking diagnostics: the readers are **verified** by unit and embedded-PostgreSQL tests (`tests/unit/test_tracked_causes.py`, `tests/integration_pg/test_tracked_diagnostics.py`); the capability itself comes from a real Windows Job Object self-test only on Windows. The POSIX policy exists in code only (`UNSUPPORTED_PLATFORM`, `WARN`, untracked) and POSIX runtime behaviour is **not verified**. **Not verified**: POSIX runtime, real Gradle/Maven builds, real CLI E2E, random race stress, EXPLAIN/generic plan, real deadlock tests.
+- `COMPONENT_EXCEPTION` and `EXTERNAL_OR_UNKNOWN` are internal `last_failure` codes (and log text), not API codes; the unit reason codes in the diagnostics are the `DEGRADED` ones of [03](03-task-runner.md).
 
 - The Completion Checker does not check for unterminated Executions via a separate query. The three groups of checks above are all there is.
 - The Event Bus is single-process in-memory. Events published by the Runner or by a different process may not be delivered and must be confirmed via REST query.
