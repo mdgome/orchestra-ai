@@ -200,7 +200,7 @@ the project's tests; it only runs tool version probes (`git --version`, `java -v
 will succeed. Notes:
 
 * `CLI_AUTH` is always `UNKNOWN`. `PYTHON_INTERPRETER` reports a discovered project `.venv`, but the orchestrator's own
-  interpreter is what runs the tests. `JUNIT_COLLECTION` warns that Gradle may skip an UP-TO-DATE test task.
+  interpreter is what runs the tests. `JUNIT_COLLECTION` warns about a Gradle test command that could be skipped as UP-TO-DATE / FROM-CACHE; the `gradle` preset (`cleanTest`, build cache off) passes.
 * Project paths are re-validated from the registered root; only `.claude/settings.json` and `.claude/settings.local.json`
   inside it are read, and a link or junction there is a blocking finding. Replacing the real directory at the same
   canonical path with another one is **not** detected.

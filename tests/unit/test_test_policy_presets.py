@@ -12,6 +12,7 @@ from app.providers.base import ProviderRequest
 from app.providers.claude_cli import ClaudeCliProvider
 from app.providers.permissions import ROLE_PERMISSIONS, is_test_path, permissions_for
 from app.services import test_policy_resolver as resolver
+from app.services.hashing import stable_hash
 from app.services.test_policy_resolver import resolve_test_policy
 from app.services.test_policy_service import (
     TestPolicyService, fresh_results, parse_junit, parse_junit_files, result_snapshot,
@@ -339,3 +340,18 @@ def test_the_preset_reaches_the_claude_command_line(preset):
     assert "Edit(src/test/**)" in allowed and "python -m pytest" not in allowed
     default = provider.build_argv(ProviderRequest(role="TESTER", prompt="p", cwd=Path(".")), None)
     assert "Edit(tests/**)" in default[default.index("--allowedTools") + 1]
+
+
+def test_the_gradle_preset_forces_a_fresh_test_run_and_the_other_presets_are_unchanged():
+    assert P.TEST_PRESETS["gradle"]["args"] == ["cleanTest", "test", "--console=plain", "--no-build-cache"]
+    assert P.TEST_PRESETS["maven"]["args"] == ["-B", "-q", "test"]
+    assert P.TEST_PRESETS["pytest"]["args"] == ["-m", "pytest", "-q", "--junitxml=reports/junit.xml"]
+    assert P.TEST_PRESETS["gradle"]["junit_path"] == "**/build/test-results/test/TEST-*.xml"      # same results, same freshness rule
+
+
+def test_the_gradle_command_change_changes_the_policy_hash_but_not_other_presets(ws, monkeypatch):
+    monkeypatch.setattr(resolver.shutil, "which", lambda name: f"/opt/{name}")
+    gradle = resolve_test_policy({"preset": "gradle"}, ws)
+    old = {**gradle, "commands": [[gradle["commands"][0][0], "test", "--console=plain"]]}
+    assert stable_hash(gradle) != stable_hash(old)                       # new Tasks hash differently; existing Tasks keep their copy
+    assert resolve_test_policy({"preset": "maven"}, ws)["commands"][0][1:] == ["-B", "-q", "test"]

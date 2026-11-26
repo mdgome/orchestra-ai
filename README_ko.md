@@ -186,7 +186,7 @@ live workspace를 이 baseline과 비교합니다.
 `can_start`는 실행을 막는 항목이 FAIL일 때만 false입니다. Task 실행 가능이나 성공을 **보장하지 않습니다**. 참고:
 
 * `CLI_AUTH`는 항상 `UNKNOWN`입니다. `PYTHON_INTERPRETER`는 발견된 프로젝트 `.venv`를 보고하지만 테스트는 오케스트레이터
-  자신의 인터프리터로 실행됩니다. `JUNIT_COLLECTION`은 Gradle이 UP-TO-DATE 테스트 태스크를 건너뛸 수 있음을 경고합니다.
+  자신의 인터프리터로 실행됩니다. `JUNIT_COLLECTION`은 UP-TO-DATE / FROM-CACHE로 건너뛰어질 수 있는 Gradle 테스트 명령을 경고하며, `gradle` preset(`cleanTest`, 빌드 캐시 끔)은 통과합니다.
 * Project 경로는 등록된 root부터 다시 검증하며, 그 안의 `.claude/settings.json`과 `.claude/settings.local.json`만 읽습니다.
   거기에 링크나 junction이 있으면 차단 대상 발견입니다. 같은 canonical path의 실제 디렉터리가 다른 디렉터리로 교체된
   경우는 탐지하지 **않습니다**.

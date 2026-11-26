@@ -205,7 +205,7 @@ async def test_a_discovered_project_interpreter_is_reported_but_not_selected(tmp
     assert item.status is Status.WARN and "NOT used" in item.cause and "orchestrator's interpreter" in item.cause
 
 
-async def test_a_gradle_project_warns_about_up_to_date_results_and_checks_java(tmp_path):
+async def test_a_gradle_project_passes_the_junit_check_with_the_fresh_run_preset_and_checks_java(tmp_path):
     ws = workspace(tmp_path)
     wrapper = "gradlew.bat" if os.name == "nt" else "gradlew"
     (ws / wrapper).write_text("", "utf-8")
@@ -214,8 +214,20 @@ async def test_a_gradle_project_warns_about_up_to_date_results_and_checks_java(t
     svc, projects, ex, _ = make(tmp_path)
     items = by_code(await svc.diagnose(projects.add(ws, {"preset": "gradle"}).id))
     assert items["TEST_WRAPPER"].status is Status.PASS and items["JAVA_RUNTIME"].status is Status.PASS
-    assert items["JUNIT_COLLECTION"].status is Status.WARN and "UP-TO-DATE" in items["JUNIT_COLLECTION"].cause
+    junit = items["JUNIT_COLLECTION"]
+    assert junit.status is Status.PASS and "cleanTest" in junit.cause and "build cache off" in junit.cause
     assert sorted(c[0] for c in ex.calls) == ["git", "java"]
+
+
+async def test_a_gradle_command_that_can_be_skipped_as_up_to_date_still_warns(tmp_path):
+    svc, *_ = make(tmp_path)
+    base = {"preset": "gradle", "junit_path": "**/build/test-results/test/TEST-*.xml", "min_tests_executed": 1}
+    for argv in (["gradlew", "test", "--console=plain"], ["gradlew", "cleanTest", "test"],
+                 ["gradlew", "test", "--no-build-cache"]):                      # one of the two protections is not enough
+        item = svc._junit_item({**base, "commands": [argv]})
+        assert item.status is Status.WARN and "UP-TO-DATE" in item.cause
+    item = svc._junit_item({**base, "commands": [["gradlew", "cleanTest", "test", "--no-build-cache"]]})
+    assert item.status is Status.PASS
 
 
 async def test_a_missing_jdk_blocks_a_gradle_project(tmp_path):

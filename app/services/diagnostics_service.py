@@ -464,6 +464,10 @@ class DiagnosticsService:
         detail = (f"results are read from {policy['junit_path']}; at least {policy['min_tests_executed']} executed "
                   f"test(s) and a result newer than the run are required")
         if policy.get("preset") == "gradle":
+            if any("cleanTest" in c and "--no-build-cache" in c for c in policy.get("commands") or []):
+                return self._item("JUNIT_COLLECTION", Status.PASS,
+                                  detail + "; the Gradle command runs cleanTest with the build cache off, so the test task "
+                                  "is not skipped as UP-TO-DATE / FROM-CACHE")
             return self._item("JUNIT_COLLECTION", Status.WARN,
                               detail + "; Gradle may skip the test task (UP-TO-DATE / FROM-CACHE), which leaves the XML "
                               "unchanged and is reported as 'no new result'",
