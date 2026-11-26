@@ -323,12 +323,15 @@ def test_jvm_presets_move_the_tester_to_src_test_and_its_own_test_goal(preset):
 
 @pytest.mark.parametrize("preset", ["maven", "gradle"])
 def test_jvm_test_paths_exclude_build_files_and_wrappers(preset):
-    for ok in ("src/test/java/com/x/FooTest.java", "mod/src/test/kotlin/A.kt", "src/main/java/com/x/FooTest.java",
-               "src/main/java/TestHelper.java", "mod/FooIT.java"):
+    for ok in ("src/test/java/com/x/FooTest.java", "mod/src/test/kotlin/A.kt", "mod/FooIT.java", "src/test/java/Helper.java",
+               "src/test/resources/application.yml", "src/test/java/x/src/main/A.java"):
         assert is_test_path(ok, preset), ok
     for bad in ("pom.xml", "mvnw", "mvnw.cmd", "gradlew", "gradlew.bat", "build.gradle", "build.gradle.kts",
                 "settings.gradle", ".mvn/wrapper/maven-wrapper.properties", "gradle/wrapper/gradle-wrapper.properties",
-                "src/main/java/com/x/Foo.java", "tests/test_a.py"):
+                "src/main/java/com/x/Foo.java", "tests/test_a.py",
+                # production sources are not test paths, however the file is named
+                "src/main/java/com/x/FooTest.java", "src/main/java/TestHelper.java", "mod/src/main/java/FooIT.java",
+                "src/main/resources/application.yml", "src/main/java/x/src/test/A.java"):
         assert not is_test_path(bad, preset), bad
 
 

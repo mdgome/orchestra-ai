@@ -67,7 +67,7 @@ Test Policy는 Orchestrator가 소유하며 Agent가 바꿀 수 없습니다(해
 - `gradle` preset은 먼저 `cleanTest`를 실행하고 빌드 캐시를 끄므로 `test` 태스크가 UP-TO-DATE나 FROM-CACHE가 되지 않고 매 실행마다 XML을 다시 씁니다. `cleanTest`는 Gradle 자신의 테스트 결과 디렉터리만 지우며, 아래 신선도 규칙은 그대로이고 완화되지 않습니다. 해석된 명령이 `test_policy_hash`에 포함되므로, 이 변경 이후 만든 Task는 같은 `gradle` preset이어도 이전과 다른 hash를 가집니다. 이미 만든 Task는 자신에게 복사된 명령을 유지하므로 영향이 없습니다.
 - 결과 파일은 **삭제하지 않습니다**(`target/`, `build/`, `reports/`는 사용자 영역). 실행 전 `(경로, size, mtime_ns, sha256)`을 기록하고, 실행 뒤 새로 생기거나 바뀐 파일만 이번 실행의 결과로 합산합니다. 이전 실행의 XML만 있으면 실패합니다.
 - 테스트 프로세스에는 CLI 인증 변수(`ANTHROPIC_API_KEY` 등)가 전달되지 않으며, preset이 이름으로 명시한 툴체인 변수(`JAVA_HOME`, `MAVEN_HOME`, `M2_HOME`, `GRADLE_HOME`, `GRADLE_USER_HOME` 중 일부)만 추가됩니다. wildcard는 허용되지 않습니다.
-- Tester의 변경 허용 범위(`is_test_path`)와 CLI 도구 권한(`permissions_for`)이 preset에 따라 달라집니다. 빌드 파일과 wrapper(`pom.xml`, `mvnw`, `build.gradle`, `gradlew` ...)는 Tester가 바꿀 수 없습니다(`TESTER_MODIFIED_NON_TEST_FILES`).
+- Tester의 변경 허용 범위(`is_test_path`)와 CLI 도구 권한(`permissions_for`)이 preset에 따라 달라집니다. 빌드 파일과 wrapper(`pom.xml`, `mvnw`, `build.gradle`, `gradlew` ...)는 Tester가 바꿀 수 없습니다(`TESTER_MODIFIED_NON_TEST_FILES`). `maven`/`gradle`에서 `src/main` 아래 경로는 이름이 테스트처럼 보여도(`FooTest.java`) 테스트 경로가 아니며, 경로의 첫 `src/test` 또는 `src/main` 구간이 판정하고 테스트 이름 패턴은 둘 다 없는 경로에만 적용됩니다.
 - 이전 SUCCEEDED 테스트 결과의 `requirements_hash`, `test_policy_hash`, `code_fingerprint`가 현재와 모두 같으면 Tester를 다시 실행하지 않고 결과를 재사용합니다 ([10](10-invalidation_ko.md)).
 - 테스트 약화 신호(필수 테스트 ID 감소 등)는 `test_signals`로 Code Reviewer에게 전달됩니다.
 - Gate에서 재개되는 경로는 [08](08-human-gate_ko.md)을 참고하십시오.

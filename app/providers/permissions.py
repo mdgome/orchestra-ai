@@ -118,5 +118,11 @@ def is_test_path(rel_path: str, test_preset: str | None = None) -> bool:
     rel = rel_path.replace("\\", "/")
     name = rel.rsplit("/", 1)[-1]
     if test_preset in ("maven", "gradle"):
-        return rel.startswith("src/test/") or "/src/test/" in rel or bool(_JVM_TEST_NAME.match(name))
+        # the FIRST `src/test` or `src/main` segment decides: production sources are never test paths whatever the file is
+        # called (a `FooTest.java` under src/main is a production file); the name pattern only applies outside both
+        rooted = "/" + rel
+        test_at, main_at = rooted.find("/src/test/"), rooted.find("/src/main/")
+        if test_at >= 0 or main_at >= 0:
+            return test_at >= 0 and (main_at < 0 or test_at < main_at)
+        return bool(_JVM_TEST_NAME.match(name))
     return rel.startswith("tests/") or name.startswith("test_") or name == "conftest.py"
