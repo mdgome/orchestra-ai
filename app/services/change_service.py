@@ -27,7 +27,7 @@ from pathlib import Path
 from app.db import Database
 from app.infra import changes_manifest as CM
 from app.infra.deadline import Deadline, DeadlineExceeded
-from app.infra.response_sanitizer import Sanitizer
+from app.infra.response_sanitizer import LOSSY, Sanitizer, SanitizeReason
 from app.infra.workspace_fingerprint import GitInventoryError, git_read_only
 from app.infra.workspace_guard import resolve_project_root
 from app.models.states import TERMINAL_TASK_STATES
@@ -100,6 +100,27 @@ class _Ctx:
     workspace_path: str | None
     baseline: object | None
     known_ids: tuple[str, ...]
+
+
+class _Collector:
+    """The Sanitizer of ONE /changes answer plus the reasons it returned, in first-seen order and once each. `text` has the
+    signature of `Sanitizer.text`; the top-level `sanitization` is made from what the sanitizer reported, never from a
+    guess about the resulting string. A body that policy withholds is never read here, so it adds no reason."""
+
+    def __init__(self, sanitizer: Sanitizer):
+        self._sanitizer = sanitizer
+        self._reasons: dict[str, None] = {}
+
+    def text(self, value: str | None, *, max_chars: int | None = None) -> tuple[str, tuple[str, ...]]:
+        out, reasons = self._sanitizer.text(value, max_chars=max_chars)
+        for reason in reasons:
+            self._reasons[reason] = None
+        return out, reasons
+
+    def sanitization(self) -> dict:
+        reasons = list(self._reasons)
+        return {"truncated": any(SanitizeReason(r) in LOSSY for r in reasons), "reasons": reasons,
+                "omitted_items": 0, "omitted_sections": []}
 
 
 def _matches(path: str, prefix: str | None) -> bool:
@@ -194,7 +215,7 @@ class ChangeService:
         dirty = frozenset(b.dirty_paths or [])
         found = [c for c in CM.compute_changes(base, now.entries, dirty) if _matches(c.path, prefix)]
         page = found[offset:offset + limit]
-        sanitizer = Sanitizer(ctx.known_ids)
+        sanitizer = _Collector(Sanitizer(ctx.known_ids))
         out: dict = {"total": len(found), "items": [], "truncated": False, "workspace": "UNVERIFIED", "workspace_reason": None}
         budget = {"files": 0, "bytes": 0}
         expired = False
@@ -209,6 +230,7 @@ class ChangeService:
                 expired = True
                 out["truncated"] = True
                 out["items"].append(self._item(change, {"diff_status": "TRUNCATED", "diff_reason": "DEADLINE"}))
+        out["sanitization"] = sanitizer.sanitization()
         if verify:
             try:
                 second = CM.measure(root, deadline=deadline, mode=b.mode)
@@ -230,7 +252,7 @@ class ChangeService:
                 "diff_reason": body.get("diff_reason"), "diff": body.get("diff"), "base_target": body.get("base_target"),
                 "target": body.get("target")}
 
-    def _body(self, c: CM.Change, ctx: _Ctx, root: Path, deadline: Deadline, budget: dict, sanitizer: Sanitizer,
+    def _body(self, c: CM.Change, ctx: _Ctx, root: Path, deadline: Deadline, budget: dict, sanitizer: _Collector,
               allow: bool, dirty: frozenset) -> dict:
         b = ctx.baseline
         out: dict = {"diff_status": "UNAVAILABLE", "diff_reason": None}
@@ -345,7 +367,7 @@ class ChangeService:
             "supported_scope": SUPPORTED_SCOPE[b.mode], "limitations": [*LIMITATIONS_ALL, *LIMITATIONS[b.mode]],
             "changes": items, "total_changes": total, "returned": len(items), "has_more": end < total,
             "next_offset": end if end < total else None, "limit": limit, "offset": offset,
-            "truncated": bool(outcome["truncated"]), "sanitization": self._empty_sanitization()}
+            "truncated": bool(outcome["truncated"]), "sanitization": outcome["sanitization"]}
 
 
 class _Skip(Exception):

@@ -104,7 +104,7 @@ Runner 시작 시 작업이 재개됩니다.
 * `GET /tasks/{id}/artifacts/{artifact_id}`는 정화된 저장 출력과 함께 산출물 하나를 반환합니다. 다른 Task의 id는 `404`입니다.
 * `GET /tasks/{id}/report`는 결과와 `outcome_note`, 계획, 설계 검토, 구현, 테스트(저장된 테스트 결과와 오케스트레이터가 직접 실행한 run을
   기록된 범위에서만: `orchestrator_run.recorded`, `run_by`는 기록된 run이면 `ORCHESTRATOR`, 아니면 `UNKNOWN`. 정책 명령은
-  `policy_command`이며 실행되었다는 증거가 아님), 코드 검토, 회차별 지적 사항, Human Gate 이력, 마지막 전이, `next_actions`를 반환합니다.
+  `policy_command`이며 실행되었다는 증거가 아니고, `command`는 step이 바로 그 정책의 hash를 기록한 경우에만 이를 그대로 보여 줌), 코드 검토, 회차별 지적 사항, Human Gate 이력, 마지막 전이, `next_actions`를 반환합니다.
 * `COMPLETED`는 오케스트레이터의 완료 조건을 충족했다는 뜻입니다. 사용자가 결과를 인수하거나 merge·배포했다는 뜻이
   **아닙니다**.
 * `historical_completion`은 저장된 COMPLETED 전이만 보여 줍니다. 그 시점의 Definition-of-Done 상세는 저장된 적이 없으므로

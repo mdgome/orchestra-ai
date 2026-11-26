@@ -14,6 +14,7 @@ from app.config import Settings
 from app.container import Container
 from app.infra import changes_manifest as CM
 from app.infra import workspace_fingerprint as WF
+from app.infra.response_sanitizer import TRUNCATION_MARK
 from app.infra.workspace_fingerprint import compute_fingerprint
 from app.main import create_app
 from app.models.tables import TaskBaseline
@@ -536,3 +537,68 @@ async def test_the_real_response_body_respects_its_size_limit_by_dropping_bodies
     body = capped.json()
     assert len(capped.content) <= cap and body["truncated"] is True and "SIZE_LIMIT" in body["sanitization"]["reasons"]
     assert any(c["diff_status"] == "TRUNCATED" and c["diff_reason"] == "SIZE_LIMIT" for c in body["changes"])
+
+
+# --- the top-level `sanitization` reports what the sanitizer really did --------------------------------------------------------------------
+SECRET = "s3cretT0ken"
+LEAKY = f"push to https://user:{SECRET}@host/x.git\n"
+NO_SANITIZATION = {"truncated": False, "reasons": [], "omitted_items": 0, "omitted_sections": []}
+
+
+def _cut_file(root: Path, name: str) -> None:
+    (root / name).write_bytes(b"a\n" * 50)               # 100 bytes (no CRLF): at the file limit, but its diff text is over twice it
+
+
+async def _sanitization_of(db, tmp_path, *edits, monkeypatch=None, file_limit=None):
+    if file_limit is not None:
+        monkeypatch.setattr(P, "CHANGES_FILE_DIFF_MAX_BYTES", file_limit)
+    h, project, root, task = await completed(db, tmp_path, *edits)
+    client, _ = build(db, h)
+    assert await h.start(task.id) == ["COMPLETED"]
+    async with client:
+        response = await client.get(f"/tasks/{task.id}/changes")
+    assert response.status_code == 200, response.text
+    return response, response.json()
+
+
+async def test_nothing_sanitised_gives_the_empty_sanitization(db, tmp_path):
+    response, body = await _sanitization_of(db, tmp_path, lambda r: (r / "plain.txt").write_text("nothing secret here\n"))
+    assert by_path(body)["plain.txt"]["diff_status"] == "AVAILABLE"
+    assert body["sanitization"] == NO_SANITIZATION
+
+
+async def test_masking_alone_names_its_reason_once_and_is_not_a_truncation(db, tmp_path):
+    response, body = await _sanitization_of(db, tmp_path, lambda r: (r / "a_one.txt").write_text(LEAKY),
+                                            lambda r: (r / "b_two.txt").write_text(LEAKY))
+    assert "***" in by_path(body)["a_one.txt"]["diff"] and "***" in by_path(body)["b_two.txt"]["diff"]
+    assert body["sanitization"] == {**NO_SANITIZATION, "reasons": ["SECRET_REDACTED"]}      # two files, one reason, truncated=false
+    assert SECRET not in response.text
+
+
+async def test_a_real_cut_names_its_reason_and_is_a_truncation(db, tmp_path, monkeypatch):
+    response, body = await _sanitization_of(db, tmp_path, lambda r: _cut_file(r, "b_truncated_file.txt"),
+                                            monkeypatch=monkeypatch, file_limit=100)
+    cut = by_path(body)["b_truncated_file.txt"]
+    assert cut["diff_status"] == "AVAILABLE" and cut["diff"].endswith(TRUNCATION_MARK)
+    assert body["sanitization"] == {**NO_SANITIZATION, "truncated": True, "reasons": ["STRING_TRUNCATED"]}
+    assert body["truncated"] is False                                                        # the answer's own flag is another thing
+
+
+@pytest.mark.parametrize("first, expected", [("mask", ["SECRET_REDACTED", "STRING_TRUNCATED"]),
+                                             ("cut", ["STRING_TRUNCATED", "SECRET_REDACTED"])])
+async def test_masking_and_cutting_together_list_both_once_in_the_order_first_met(db, tmp_path, monkeypatch, first, expected):
+    mask = lambda r, n: (r / n).write_text(LEAKY)                                           # noqa: E731
+    names = {"mask": ["a_mask.txt", "c_mask.txt"], "cut": ["b_mask.txt", "d_mask.txt"]}[first]
+    cut_name = "b_truncated_file.txt" if first == "mask" else "a_truncated_file.txt"
+    response, body = await _sanitization_of(
+        db, tmp_path, lambda r: mask(r, names[0]), lambda r: _cut_file(r, cut_name), lambda r: mask(r, names[1]),
+        monkeypatch=monkeypatch, file_limit=100)
+    assert body["sanitization"] == {**NO_SANITIZATION, "truncated": True, "reasons": expected}
+    assert SECRET not in response.text
+
+
+async def test_a_withheld_body_adds_no_reason_and_is_not_read_for_one(db, tmp_path):
+    response, body = await _sanitization_of(db, tmp_path, lambda r: (r / ".env").write_text(f"TOKEN=ghp_abcdefghijklmnop1234 {SECRET}\n"))
+    assert (by_path(body)[".env"]["diff_status"], by_path(body)[".env"]["diff_reason"]) == ("WITHHELD", "SENSITIVE_PATH")
+    assert body["sanitization"] == NO_SANITIZATION
+    assert SECRET not in response.text and "ghp_abcdefghijklmnop1234" not in response.text
