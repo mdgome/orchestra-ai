@@ -312,7 +312,9 @@ def test_pytest_keeps_the_original_permissions_exactly():
 @pytest.mark.parametrize("preset", ["maven", "gradle"])
 def test_jvm_presets_move_the_tester_to_src_test_and_its_own_test_goal(preset):
     tester = permissions_for("TESTER", preset)
-    assert "Edit(src/test/**)" in tester.allowed and "Write(src/test/**)" in tester.allowed
+    # the glob matches src/test at any depth, so multi-module paths (mod/src/test/...) are writable, not just the root one
+    assert "Edit(**/src/test/**)" in tester.allowed and "Write(**/src/test/**)" in tester.allowed
+    assert "Edit(src/test/**)" not in tester.allowed and "Write(src/test/**)" not in tester.allowed
     assert "Edit(tests/**)" not in tester.allowed and "Bash(python -m pytest:*)" not in tester.allowed
     assert set(P.TEST_PRESETS[preset]["tester_bash"]) <= set(tester.allowed)
     developer = permissions_for("DEVELOPER", preset)
@@ -340,7 +342,7 @@ def test_the_preset_reaches_the_claude_command_line(preset):
     provider = ClaudeCliProvider(None, "claude")
     argv = provider.build_argv(ProviderRequest(role="TESTER", prompt="p", cwd=Path("."), test_preset=preset), None)
     allowed = argv[argv.index("--allowedTools") + 1]
-    assert "Edit(src/test/**)" in allowed and "python -m pytest" not in allowed
+    assert "Edit(**/src/test/**)" in allowed and "python -m pytest" not in allowed
     default = provider.build_argv(ProviderRequest(role="TESTER", prompt="p", cwd=Path(".")), None)
     assert "Edit(tests/**)" in default[default.index("--allowedTools") + 1]
 

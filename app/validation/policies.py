@@ -128,14 +128,14 @@ TEST_PRESETS: dict[str, dict] = {
     "maven": {
         "tool": "mvn", "args": ["-B", "-q", "test"], "junit_path": "**/target/surefire-reports/TEST-*.xml",
         "env_allow": ["JAVA_HOME", "MAVEN_HOME", "M2_HOME"], "wrappers": ("mvnw.cmd", "mvnw"),
-        "tester_edit": ("src/test/**",),
+        "tester_edit": ("**/src/test/**",),
         "tester_bash": ("Bash(mvn test:*)", "Bash(./mvnw test:*)", "Bash(mvnw test:*)", "Bash(mvnw.cmd test:*)"),
         "developer_bash": ("Bash(mvn:*)", "Bash(./mvnw:*)", "Bash(mvnw:*)", "Bash(mvnw.cmd:*)"),
     },
     "gradle": {
         "tool": "gradle", "args": ["cleanTest", "test", "--console=plain", "--no-build-cache"], "junit_path": "**/build/test-results/test/TEST-*.xml",
         "env_allow": ["JAVA_HOME", "GRADLE_HOME", "GRADLE_USER_HOME"], "wrappers": ("gradlew.bat", "gradlew"),
-        "tester_edit": ("src/test/**",),
+        "tester_edit": ("**/src/test/**",),
         "tester_bash": ("Bash(gradle test:*)", "Bash(./gradlew test:*)", "Bash(gradlew test:*)",
                         "Bash(gradlew.bat test:*)"),
         "developer_bash": ("Bash(gradle:*)", "Bash(./gradlew:*)", "Bash(gradlew:*)", "Bash(gradlew.bat:*)"),
