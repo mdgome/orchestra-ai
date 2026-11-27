@@ -51,8 +51,6 @@ ROLE_PERMISSIONS: dict[str, RolePermissions] = {
     "CODE_REVIEWER": RolePermissions("CODEX", sandbox="read-only", approval_policy="never"),
 }
 
-TESTER_WRITABLE_PREFIXES = ("tests/", "test_", "conftest.py")
-
 
 def permissions_for(role: str, test_preset: str | None = None) -> RolePermissions:
     """Role permissions, specialised for the task's test preset (pytest is the baseline and stays as written).
