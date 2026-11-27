@@ -67,7 +67,7 @@ stateDiagram-v2
 - 새 edge `PENDING → TESTING`, `TESTING → COMPLETED`는 **`mode = TEST_ONLY`에서만** 유효하다. `check_task_transition`에 mode 인지 변형을 두며, 기존 `TASK_TRANSITIONS` 표와 그 테스트는 `WORKFLOW`에 대해 그대로 참이다(표에 edge를 추가하지 않는다).
 - gate는 `PENDING → TESTING` **이후**에 열린다. `open_recovery`가 Task를 `WAITING_APPROVAL`로 옮기는데 `PENDING`에서는 허용되지 않기 때문이다(`TASK_TRANSITIONS[PENDING]` = `PLANNING, FAILED, CANCELLED`).
 - handler dispatch: `WorkflowService._handlers`는 상태 키다. TEST_ONLY는 자체 handler 둘(`PENDING`, `TESTING`)이 필요하고 `run_task`의 dispatch 줄(`self._handlers[state]`)이 `(mode, state)`로 고른다. `run_task`의 나머지 동작(lease 상실, `ProjectBusy`, `TaskCancelled`, `TerminationUnconfirmed`, `FailClosed`)은 그대로 재사용한다.
-- **Step key (G10).** 제안: test-only step은 **기존 key `TEST`**를 쓰고 두 흐름은 `Task.mode`로 구분한다. `STEP_TASK_STATE[TEST] = TESTING`, `STEP_ROLE[TEST] = TESTER`가 이미 있으므로 gate 재개(`_proceed_resume`), `_finalize_cancel`, `_recovery_unsafe`, `ReportService.KINDS`, 리포트의 `tests` 섹션에 새 key가 필요 없다. workflow 재사용 로직(`_do_test`, `_reusable`, `_previous_test_ids`)은 TEST_ONLY가 자체 handler를 쓰므로 닿지 않으며, `input_hash = stable_hash("test_only", task.id, task.test_policy_hash)`에 구분자가 들어 있다. 대안: `STEP_TASK_STATE`/`STEP_ROLE`/`KINDS`에 새 key `TEST_ONLY`(32자 이하)를 추가. grep이 쉽고 workflow 테스트와 혼동되지 않지만 아래 소비자 모두가 새 key를 알아야 한다.
+- **Step key (G10).** **결정:** test-only step은 **기존 key `TEST`**를 쓰고 두 흐름은 `Task.mode`로 구분한다. `STEP_TASK_STATE[TEST] = TESTING`, `STEP_ROLE[TEST] = TESTER`가 이미 있으므로 gate 재개(`_proceed_resume`), `_finalize_cancel`, `_recovery_unsafe`, `ReportService.KINDS`, 리포트의 `tests` 섹션에 새 key가 필요 없다. workflow 재사용 로직(`_do_test`, `_reusable`, `_previous_test_ids`)은 TEST_ONLY가 자체 handler를 쓰므로 닿지 않으며, `input_hash = stable_hash("test_only", task.id, task.test_policy_hash)`에 구분자가 들어 있다. 대안: `STEP_TASK_STATE`/`STEP_ROLE`/`KINDS`에 새 key `TEST_ONLY`(32자 이하)를 추가. grep이 쉽고 workflow 테스트와 혼동되지 않지만 아래 소비자 모두가 새 key를 알아야 한다.
 - step key 소비자(코드에서 읽음): `workflow_service.py`는 `STEP_ROLE.values()`를 role 필터로(`_finalize_cancel`, `_recovery_unsafe`), `STEP_TASK_STATE[approval.checkpoint_step_key]`를 재개 상태로, `_agent_step`에서 `STEP_ROLE[step_key]`를 쓴다. `report_service.py`에는 `KINDS`(그 밖의 key는 artifact 목록에서 빠지고 `validity.of`가 `NOT_APPLICABLE`을 반환)가 있고 `tests`와 `orchestrator_test_run`에 `STEP_TEST`를 읽는다. 기존 key를 쓰면 모두 test-only step에 대해 이미 동작한다. 리포트의 `validity.of(TEST)`는 요구사항·policy hash와 workflow iteration에만 의존하며(읽음) plan이나 developer step에는 의존하지 않는다.
 
 ### 4.1 `_do_test_only` 개요
@@ -250,14 +250,16 @@ migration 번호는 잠정이다(HEAD는 B2의 `0005`이며 E1은 다른 변경�
 | G1 | 컬럼 이름과 값: `tasks.mode`(`WORKFLOW`/`TEST_ONLY`) 대 `task_kind`/`execution_mode`; 후속 계획/검토/전체 "모드" 설계와의 겹침 | `tasks.mode`, 이후 scope mode는 같은 값 집합을 확장 |
 | G2 | Task 목록 정책(§9) | 옵션 2: 기본 제외, `?mode=` 필터 |
 | G3 | 바쁜 project에 대한 대기 상한(`TEST_RUN_MAX_DEFERS`, `FAILED(PROJECT_BUSY)`) 대 Task처럼 무제한 defer | 상한 |
-| G4 | 실패한 test run이 Task를 `FAILED`로 끝냄(제안) 대 `passed=false`인 `COMPLETED` | 이유 코드를 가진 `FAILED` |
+| G4 | 실패한 test run이 Task를 `FAILED`로 끝냄(제안) 대 `passed=false`인 `COMPLETED` | **결정:** 이유 코드를 가진 `FAILED` |
 | G5 | TEST_ONLY recovery 옵션: `abort`/`retry`, `retry`의 snapshot-diff 검사 완화 | §7.3대로 |
 | G6 | TEST_ONLY에 한정한 gate 만료 sweep(WORKFLOW 불변) | 예 |
 | G7 | 테스트 execution 행의 role: `TESTER`/`LOCAL`(`STEP_ROLE` 필터 재사용) 대 새 role | `TESTER`/`LOCAL` |
-| G8 | CONTENT mode(비 git) workspace 허용 여부. fingerprint 기반 CLEAN/DIRTY는 빌드 산출물과 사용자 변경을 구분할 수 없어 더 약함 | 권장: 허용하고 문서화하며 diagnostics에서 경고(생성은 DB만 쓰므로 거기서는 거부할 수 없음). 또는 acquisition에서 거부(더 엄격) — 결정 필요 |
-| G10 | test-only step의 step key: `TEST` 재사용(§4) 대 새 key `TEST_ONLY` | `TEST` 재사용, 흐름 구분은 `Task.mode` |
+| G8 | CONTENT mode(비 git) workspace 허용 여부. fingerprint 기반 CLEAN/DIRTY는 빌드 산출물과 사용자 변경을 구분할 수 없어 더 약함 | **결정:** 허용하고 문서화하며 diagnostics에서 경고한다(생성은 DB만 쓰므로 거기서는 거부할 수 없음). acquisition에서 거부(더 엄격)는 채택하지 않는다 |
+| G10 | test-only step의 step key: `TEST` 재사용(§4) 대 새 key `TEST_ONLY` | **결정:** `TEST` 재사용, 흐름 구분은 `Task.mode` |
 | G9 | 후속 확장 가능성: 폐기한 `NONE/TASK/TEST_RUN` owner 모델. TEST_ONLY Task로 감당할 수 없을 때만(예: Task로 보이면 안 되는 test run) | 추진하지 않음 |
 | B2-H1…H6 | B2 문서 참조 | B2 §12 참조 |
+
+> **기록한 결정(G4, G8, G10).** 이 세 결정을 진행하라는 지시에 따라 각각의 권장안을 채택했다: G4 실패한 test run은 이유 코드를 가진 `FAILED`로 끝낸다. G8 CONTENT mode workspace는 허용하고 문서화하며 diagnostics 경고로 알린다(E2의 diagnostics 항목, 생성은 DB만 쓴다). G10 test-only step은 key `TEST`를 재사용한다. G1–G3, G5–G7, G9는 결정 전까지 제안으로 남는다.
 
 ## 15. 알려진 한계
 
