@@ -18,6 +18,13 @@ class TaskState(StrEnum):
     CANCELLED = "CANCELLED"
 
 
+class TaskMode(StrEnum):
+    """What a Task is for. WORKFLOW is every ordinary Task; TEST_ONLY is a Project Test Run (D4): it only runs the
+    project's test policy, so it needs two edges the workflow never has."""
+    WORKFLOW = "WORKFLOW"
+    TEST_ONLY = "TEST_ONLY"
+
+
 class StepState(StrEnum):
     PENDING = "PENDING"
     RUNNING = "RUNNING"
@@ -135,6 +142,13 @@ TASK_TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
 }
 TERMINAL_TASK_STATES = frozenset({TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELLED})
 
+# Extra edges that exist ONLY for a TEST_ONLY Task. They are deliberately not in TASK_TRANSITIONS, so that table (and the
+# tests pinning it) stays exactly true for every WORKFLOW Task.
+TEST_ONLY_EXTRA_TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
+    TaskState.PENDING: frozenset({TaskState.TESTING}),
+    TaskState.TESTING: frozenset({TaskState.COMPLETED}),
+}
+
 STEP_TRANSITIONS: dict[StepState, frozenset[StepState]] = {
     StepState.PENDING: frozenset({StepState.RUNNING, StepState.CANCELLED}),
     StepState.RUNNING: frozenset({
@@ -149,8 +163,11 @@ STEP_TRANSITIONS: dict[StepState, frozenset[StepState]] = {
 }
 
 
-def check_task_transition(current: TaskState, target: TaskState) -> None:
-    if target not in TASK_TRANSITIONS[current]:
+def check_task_transition(current: TaskState, target: TaskState, mode: TaskMode | str = TaskMode.WORKFLOW) -> None:
+    allowed = TASK_TRANSITIONS[current]
+    if TaskMode(mode) is TaskMode.TEST_ONLY:
+        allowed = allowed | TEST_ONLY_EXTRA_TRANSITIONS.get(current, frozenset())
+    if target not in allowed:
         raise InvalidStateTransition(
             f"task transition {current} -> {target} is not allowed",
             {"from": str(current), "to": str(target)})

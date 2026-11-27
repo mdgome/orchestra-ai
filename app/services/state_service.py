@@ -18,7 +18,7 @@ async def change_task_state(session: AsyncSession, task: Task, to_state: TaskSta
     A terminal state also releases the task's project write lock (project_terminal.release_on_terminal) in this
     same transaction. `project_proof` is only supplied by task_finalizer / the step-completion wrapper."""
     current = TaskState(task.status)
-    check_task_transition(current, to_state)
+    check_task_transition(current, to_state, task.mode)
     if to_state in TERMINAL_TASK_STATES:
         await release_on_terminal(session, task, to_state, project_proof)
     values = {"status": str(to_state), "updated_at": func.now(), "row_version": Task.row_version + 1}

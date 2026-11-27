@@ -1,7 +1,7 @@
 import pytest
 
 from app.models.states import (
-    STEP_TRANSITIONS, TASK_TRANSITIONS, StepState, TaskState, check_step_transition, check_task_transition,
+    STEP_TRANSITIONS, TASK_TRANSITIONS, StepState, TaskMode, TaskState, check_step_transition, check_task_transition,
 )
 from app.validation import validators as V
 from app.validation.exceptions import FailClosed, InvalidStateTransition, ValidationFailed
@@ -70,3 +70,37 @@ def test_session_binding_rules():
         V.validate_session_binding(role="DEVELOPER", provider="CLAUDE", task_conversation_id=c1, session_conversation_id=c2)
     with pytest.raises(FailClosed):  # provider change must not reuse a native id
         V.validate_session_binding(role="DEVELOPER", provider="CLAUDE", task_conversation_id=c1, existing_provider="CODEX")
+
+
+def _allowed(mode):
+    pairs = set()
+    for current in TaskState:
+        for target in TaskState:
+            try:
+                check_task_transition(current, target, mode)
+            except InvalidStateTransition:
+                continue
+            pairs.add((current, target))
+    return pairs
+
+
+def test_a_workflow_task_has_exactly_the_edges_of_the_transition_table():
+    assert _allowed(TaskMode.WORKFLOW) == {(c, t) for c, ts in TASK_TRANSITIONS.items() for t in ts}
+    assert _allowed("WORKFLOW") == _allowed(TaskMode.WORKFLOW)                           # a plain string works too
+    with pytest.raises(InvalidStateTransition):
+        check_task_transition(TaskState.PENDING, TaskState.TESTING)                      # the default mode is WORKFLOW
+    with pytest.raises(InvalidStateTransition):
+        check_task_transition(TaskState.TESTING, TaskState.COMPLETED)
+
+
+def test_a_test_only_task_has_two_more_edges_and_nothing_else():
+    extra = _allowed(TaskMode.TEST_ONLY) - _allowed(TaskMode.WORKFLOW)
+    assert extra == {(TaskState.PENDING, TaskState.TESTING), (TaskState.TESTING, TaskState.COMPLETED)}
+    assert _allowed(TaskMode.WORKFLOW) <= _allowed(TaskMode.TEST_ONLY)
+    for terminal in (TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELLED):       # terminal states still have no exit
+        assert not [t for c, t in _allowed(TaskMode.TEST_ONLY) if c is terminal]
+
+
+def test_an_unknown_mode_is_rejected():
+    with pytest.raises(ValueError):
+        check_task_transition(TaskState.PENDING, TaskState.TESTING, "SOMETHING_ELSE")

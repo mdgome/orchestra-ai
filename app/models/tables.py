@@ -111,10 +111,20 @@ class Task(Base):
     profile_hash: Mapped[str | None] = mapped_column(String(64))
     # none_as_null: Python None must be SQL NULL (not the JSON value null), or the all-or-none CHECK would reject it
     profile_snapshot: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True))
+    # WORKFLOW (every ordinary Task) or TEST_ONLY (a Project Test Run, D4). Only TaskService.create_test_run writes TEST_ONLY.
+    mode: Mapped[str] = mapped_column(String(16), default="WORKFLOW", server_default="WORKFLOW", nullable=False)
+    # TEST_ONLY only: the client's idempotency key and a hash of what the request meant (project + test policy).
+    idempotency_key: Mapped[str | None] = mapped_column(String(128))
+    request_fingerprint: Mapped[str | None] = mapped_column(String(64))
     row_version: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     created_at: Mapped[datetime] = _now()
     updated_at: Mapped[datetime] = _now()
     __table_args__ = (
+        CheckConstraint("mode IN ('WORKFLOW','TEST_ONLY')", name="ck_tasks_mode"),
+        CheckConstraint("(mode <> 'TEST_ONLY' OR project_id IS NOT NULL) IS TRUE", name="ck_tasks_test_only_project"),
+        CheckConstraint("(idempotency_key IS NULL OR mode = 'TEST_ONLY') IS TRUE", name="ck_tasks_idempotency_test_only"),
+        Index("uq_tasks_project_idempotency_key", "project_id", "idempotency_key", unique=True,
+              postgresql_where=text("idempotency_key IS NOT NULL")),
         CheckConstraint(
             "(profile_version IS NULL AND profile_hash IS NULL AND profile_snapshot IS NULL) OR "
             "(project_id IS NOT NULL AND profile_version IS NOT NULL AND profile_hash IS NOT NULL "

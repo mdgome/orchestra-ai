@@ -37,12 +37,13 @@ def check_texts(table) -> dict:
     return {c.name: str(c.sqltext) for c in table.constraints if c.name and c.name.startswith("ck_")}
 
 
-def test_migration_chain_is_0004_to_0005(migration):
+def test_migration_chain_is_0004_to_0005_and_a_later_migration_follows_it(migration):
     assert (migration.revision, migration.down_revision) == ("0005", "0004")
     from alembic.config import Config
     from alembic.script import ScriptDirectory
     scripts = ScriptDirectory.from_config(Config(str(MIGRATION.parents[2] / "alembic.ini")))
-    assert scripts.get_heads() == ["0005"]
+    assert scripts.get_heads() == ["0006"]                                   # 0006 (test-only tasks) is the head now
+    assert scripts.get_revision("0006").down_revision == "0005"             # and it follows this migration directly
 
 
 @pytest.mark.parametrize("name", FROZEN)
