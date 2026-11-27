@@ -12,7 +12,7 @@ import uuid
 from dataclasses import dataclass
 
 from app.infra.workspace_fingerprint import is_current_version
-from app.models.states import TaskState
+from app.models.states import TaskMode, TaskState
 from app.models.tables import Task
 from app.repositories.project_repository import ProjectRepository
 from app.repositories.task_repository import TaskRepository
@@ -142,6 +142,9 @@ async def release_on_terminal(session, task: Task, to_state: TaskState, proof) -
       * a task that is not the owner (legacy task, never acquired, lock already gone) -> nothing to do;
       * valid proof + COMPLETED -> CLEAN, the final fingerprint becomes the accepted baseline;
       * valid proof + FAILED/CANCELLED -> CLEAN only if nothing differs from the write baseline, else DIRTY;
+      * a TEST_ONLY task (a Project Test Run) never moves the accepted baseline, whatever its terminal state: CLEAN only
+        if nothing differs from the write baseline (so build by-products or edited tracked files are never adopted
+        silently), else DIRTY;
       * no proof / UNMEASURED / stale version -> never CLEAN: DIRTY_UNRESOLVED;
       * any unresolved or anomalous tracked execution of the project (any Task of it) -> DIRTY_UNRESOLVED whatever the proof
         is (H7); a valid proof is then not consulted and cannot cause FingerprintProofStale.
@@ -163,7 +166,7 @@ async def release_on_terminal(session, task: Task, to_state: TaskState, proof) -
     write_baseline = project.write_baseline_fingerprint
     if fingerprint is None:
         state, baseline = "DIRTY_UNRESOLVED", None
-    elif to_state is TaskState.COMPLETED:
+    elif to_state is TaskState.COMPLETED and TaskMode(task.mode) is TaskMode.WORKFLOW:
         state, baseline = "CLEAN", fingerprint
     elif is_current_version(write_baseline) and fingerprint == write_baseline:
         state, baseline = "CLEAN", None

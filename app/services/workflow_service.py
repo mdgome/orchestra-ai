@@ -11,6 +11,7 @@ Rules enforced here
 import asyncio
 import logging
 import re
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -26,7 +27,7 @@ from app.infra.workspace_guard import WorkspaceGuard, resolve_project_root
 from app.infra.workspace_snapshot import SnapshotError, diff_snapshots, is_current_snapshot_version, take_snapshot
 from app.models.states import (
     STEP_CODE_REVIEW, STEP_DESIGN_REVIEW, STEP_DEVELOP, STEP_PLAN, STEP_ROLE, STEP_TASK_STATE, STEP_TEST,
-    TERMINAL_TASK_STATES, ApprovalType, CliOutcome, StepState, TaskState,
+    TERMINAL_TASK_STATES, ApprovalType, CliOutcome, StepState, TaskMode, TaskState,
 )
 from app.models.tables import Approval, Execution, Project, Task, TaskStep
 from app.providers.permissions import authorize_one_off, is_test_path, permissions_for
@@ -37,7 +38,9 @@ from app.repositories.task_repository import TaskRepository
 from app.services import artifacts as A
 from app.services import context_service as C
 from app.services import prompts as PR
-from app.services.completion_checker import DoDInput, check_definition_of_done
+from app.services.completion_checker import (
+    DoDInput, TestOnlyInput, check_definition_of_done, evaluate_test_only_completion, failure_reason_of_test_only,
+)
 from app.services.fingerprints import design_review_basis, profile_criteria_of, profile_part
 from app.services.hashing import stable_hash
 from app.services.human_gate_service import HumanGateService
@@ -171,15 +174,23 @@ class WorkflowService:
                     return str(state)
                 if state is TaskState.WAITING_APPROVAL:
                     return str(state)
-                await self._handlers[state](self, ctx, task)
+                handlers = self._test_only_handlers if task.mode == str(TaskMode.TEST_ONLY) else self._handlers
+                handler = handlers.get(state)
+                if handler is None:
+                    raise FailClosed(f"a {task.mode} task has no handler for the state {state}")
+                await handler(self, ctx, task)
             return str(TaskState.WAITING_APPROVAL)
         except LeaseLost:
             log.warning("lease lost for task %s; stopping without recording results", task_id)
             return "LEASE_LOST"
         except ProjectBusy as busy:
-            log.info("task %s deferred: %s", task_id, busy)
-            await self._guarded(self._release_for_defer(ctx))
-            return "BLOCKED"
+            if await self._busy_wait_exhausted(ctx, task_id):
+                log.info("test run %s gave up waiting for a busy project: %s", task_id, busy)
+                await self._guarded(self._fail(ctx, task_id, P.TEST_RUN_PROJECT_BUSY, str(busy)))
+            else:
+                log.info("task %s deferred: %s", task_id, busy)
+                await self._guarded(self._release_for_defer(ctx))
+                return "BLOCKED"
         except TaskCancelled:
             await self._guarded(self._finalize_cancel(ctx, task_id))
         except (LimitExceeded, PolicyViolation) as exc:
@@ -218,6 +229,17 @@ class WorkflowService:
             await self.leases.release(ctx.lease, reason, session=s)
         self.events.publish(task.id, {"event": "task.finished", "status": task.status})
 
+    async def _busy_wait_exhausted(self, ctx: RunContext, task_id: uuid.UUID) -> bool:
+        """A test run does not queue behind a busy project for hours: once its request was deferred TEST_RUN_MAX_DEFERS times
+        the next busy answer fails it. An ordinary Task keeps deferring without a limit."""
+        if ctx.request_id is None:
+            return False
+        async with self.db.transaction() as s:
+            task = await TaskRepository(s).get(task_id)
+            request = await ExecutionRequestRepository(s).get(ctx.request_id)
+        return (task is not None and task.mode == str(TaskMode.TEST_ONLY) and request is not None
+                and request.defer_count >= P.TEST_RUN_MAX_DEFERS)
+
     async def _release_for_defer(self, ctx: RunContext) -> None:
         """The task could not start a step now (project busy): hand the lease back so the request can be retried."""
         await self.leases.release(ctx.lease, "project_busy")
@@ -248,7 +270,8 @@ class WorkflowService:
                              if StepState(st.status) is StepState.RUNNING), None)
                 await self.gates.open_recovery(
                     s, task, step, reason="cancellation requested but CLI termination is unconfirmed",
-                    checkpoint_step_key=STEP_PLAN, detail={"unterminated_executions": len(open_exec)})
+                    checkpoint_step_key=STEP_TEST if task.mode == str(TaskMode.TEST_ONLY) else STEP_PLAN,
+                    detail={"unterminated_executions": len(open_exec)})
                 ctx.parked = True
                 return
             for step in await TaskRepository(s).steps_for_task(task_id):
@@ -273,7 +296,8 @@ class WorkflowService:
             await self.leases.verify(s, ctx.lease)
             step = next((st for st in reversed(await TaskRepository(s).steps_for_task(task_id))
                          if StepState(st.status) in (StepState.RUNNING, StepState.INTERRUPTED)), None)
-            key = step.step_key if step else (checkpoint_step_key or STEP_PLAN)
+            fallback = STEP_TEST if task.mode == str(TaskMode.TEST_ONLY) else STEP_PLAN
+            key = step.step_key if step else (checkpoint_step_key or fallback)
             await self.gates.open_recovery(s, task, step, reason=reason, checkpoint_step_key=key)
         ctx.parked = True
 
@@ -478,7 +502,7 @@ class WorkflowService:
         if option == "retry":
             step_id = approval.target.get("step_id")
             step = await TaskRepository(s).get_step(uuid.UUID(step_id)) if step_id else None
-            if step is not None and step.snapshot_before is not None:
+            if step is not None and step.snapshot_before is not None and task.mode != str(TaskMode.TEST_ONLY):
                 now = await asyncio.to_thread(take_snapshot, workspace)
                 if diff_snapshots(step.snapshot_before, now).changed:
                     return "retry requested but the workspace differs from the step's starting snapshot"
@@ -689,7 +713,9 @@ class WorkflowService:
             if not mutating:
                 return False                                    # read-only roles can always be re-run
             problem = None
-            if latest.snapshot_before is None:
+            if task.mode == str(TaskMode.TEST_ONLY):
+                pass    # a partly run build changes files by design; the project fingerprint at the end is the safety net
+            elif latest.snapshot_before is None:
                 problem = "interrupted step has no starting snapshot"
             else:
                 now = await asyncio.to_thread(take_snapshot, ctx.workspace)
@@ -989,6 +1015,69 @@ class WorkflowService:
                          detail={"orchestrator_test_run": True, "reason": result.reason,
                                  **({"tracking": result.tracking} if result.tracking else {})})
 
+    # ================================================================================================
+    # TEST_ONLY (a Project Test Run, D4): no plan, review, developer or tester agent
+    # ================================================================================================
+    async def _do_pending_test_only(self, ctx: RunContext, task: Task) -> None:
+        await self._transition(ctx, task.id, TaskState.TESTING, "execution_started")
+
+    async def _do_test_only(self, ctx: RunContext, task: Task) -> None:
+        """Runs only the project's own test policy, tracked, under the project write lock. No agent CLI, session, prompt
+        or provider is involved. The step key is the ordinary TEST (G10); the Task mode tells the flows apart."""
+        if await self._interrupted_needs_human(ctx, task, STEP_TEST, True):
+            return
+        if ctx.resumed_from_approval_id is not None:
+            lineage = GateLineage(ctx.resumed_from_approval_id, ctx.lineage_root_id or ctx.resumed_from_approval_id)
+            gate = await self.locks.ensure_for_step(ctx.lease, task.id, STEP_TEST, self.gates, lineage=lineage)
+        else:
+            gate = await self.locks.ensure_for_step(ctx.lease, task.id, STEP_TEST, self.gates)
+        if gate is StepGate.GATE_OPENED:
+            ctx.parked = True
+            return
+        if gate is StepGate.BLOCKED:
+            raise ProjectBusy("another task holds the project write lock")
+        await self._reset_defer_once(ctx)
+        policy = task.test_policy
+        input_hash = stable_hash("test_only", str(task.id), task.test_policy_hash)
+        handle = await self.steps.begin(ctx.lease, task.id, STEP_TEST, STEP_ROLE[STEP_TEST], input_hash, ctx.workspace,
+                                        workspace_root=ctx.workspace_root, on_begin=self.locks.on_mutating_begin)
+        started = time.monotonic()
+        try:
+            result = await self._run_orchestrator_tests(ctx, task, handle, policy)
+        except TaskCancelled:
+            await self._mark_step(ctx, handle, StepState.CANCELLED, "cancelled")
+            raise
+        elapsed = time.monotonic() - started
+        snapshot_after = await asyncio.to_thread(take_snapshot, ctx.workspace)
+        output = {"mode": str(TaskMode.TEST_ONLY), "agent_summary": "", "test_result": result.to_dict(),
+                  "code_fingerprint": snapshot_after["code_fingerprint"], "requirements_hash": task.requirements_hash,
+                  "test_policy_hash": task.test_policy_hash}
+
+        async def mutate(s, t, st):
+            # runs inside StepRunner.complete: the Task row is locked and the lease verified, so the cancel request and the
+            # tracked executions are read in the same transaction that decides COMPLETED or FAILED
+            repo = TaskRepository(s)
+            tree_confirmed = not [e for e in await repo.unterminated_executions(t.id) if e.role in STEP_ROLE.values()]
+            conditions = evaluate_test_only_completion(TestOnlyInput(
+                test_policy_unchanged=output["test_policy_hash"] == t.test_policy_hash,
+                cancel_requested=t.cancel_requested_at is not None, test_result=output["test_result"],
+                min_tests_executed=int((t.test_policy or {}).get("min_tests_executed") or 1),
+                process_tree_confirmed=tree_confirmed))
+            if not tree_confirmed:
+                raise FailClosed("a tracked test command is not proven to have stopped")
+            s.add(self._orchestrator_run_row(ctx, t, st, result))
+            await s.execute(update(Task).where(Task.id == t.id).values(run_seconds=Task.run_seconds + elapsed))
+            reason = failure_reason_of_test_only(conditions)
+            event = {"conditions": [{"id": c.id, "met": c.met} for c in conditions]}
+            if reason is None:
+                await change_task_state(s, t, TaskState.COMPLETED, reason="test_run_passed", event=event,
+                                        project_proof=ctx.project_proof)
+            else:
+                await change_task_state(s, t, TaskState.FAILED, reason=reason, failure_reason=reason, event=event,
+                                        project_proof=ctx.project_proof)
+
+        await self._complete_succeeded(ctx, handle, StepDecision(output=output, mutate=mutate), snapshot_after)
+
     def _tracked(self, ctx: RunContext, task: Task, what: str, step_id: uuid.UUID | None = None) -> TrackedCommandSession:
         """The tracked-run factory of one command group of the TESTING state (7.1): one cancel scope per group."""
         return TrackedCommandSession(self.steps, ctx.lease, task.id, scope_id=f"{what}:{uuid.uuid4().hex}",
@@ -1167,4 +1256,9 @@ WorkflowService._handlers = {
     TaskState.TESTING: WorkflowService._do_test,
     TaskState.REVIEWING: WorkflowService._do_code_review,
     TaskState.RETRYING: WorkflowService._do_retrying,
+}
+# A TEST_ONLY task only ever pends, tests, and waits at a gate (WAITING_APPROVAL is handled by run_task itself).
+WorkflowService._test_only_handlers = {
+    TaskState.PENDING: WorkflowService._do_pending_test_only,
+    TaskState.TESTING: WorkflowService._do_test_only,
 }
