@@ -556,11 +556,11 @@ class WorkflowService:
                 await self.steps.complete(ctx.lease, handle, StepState.WAITING_APPROVAL, output=decision.output,
                                           snapshot_after=ex.snapshot_after, mutate=mutate)
                 return
-            await self._complete_succeeded(ctx, handle, decision, ex)
+            await self._complete_succeeded(ctx, handle, decision, ex.snapshot_after)
             return
 
     async def _complete_succeeded(self, ctx: RunContext, handle: StepHandle, decision: StepDecision,
-                                  ex: StepExecution) -> None:
+                                  snapshot_after: dict) -> None:
         """Step result + the transition it causes (possibly terminal) in one transaction, with the same optimistic
         proof retry as task_finalizer: measure outside, verify under the project lock, roll back and re-measure on
         FingerprintProofStale, UNMEASURED once after PROOF_MAX_ATTEMPTS."""
@@ -568,13 +568,13 @@ class WorkflowService:
             ctx.project_proof = await self.locks.measure_for_task(handle.task_id)
             try:
                 await self.steps.complete(ctx.lease, handle, StepState.SUCCEEDED, output=decision.output,
-                                          snapshot_after=ex.snapshot_after, mutate=decision.mutate)
+                                          snapshot_after=snapshot_after, mutate=decision.mutate)
                 return
             except FingerprintProofStale:
                 log.info("fingerprint proof went stale while completing %s; measuring again", handle.step_key)
         ctx.project_proof = UNMEASURED
         await self.steps.complete(ctx.lease, handle, StepState.SUCCEEDED, output=decision.output,
-                                  snapshot_after=ex.snapshot_after, mutate=decision.mutate)
+                                  snapshot_after=snapshot_after, mutate=decision.mutate)
 
     # --- project coordination for the steps ---------------------------------------------------------------
     async def _reset_defer_once(self, ctx: RunContext) -> None:
@@ -952,11 +952,7 @@ class WorkflowService:
             if req is not None:
                 return StepDecision(output={"gate_request": req}, gate=GateSpec(
                     ApprovalType.DESIGN, req, {"decision": req["problem"]}, "STEP", STEP_TEST))
-            async with self.db.transaction() as owner_check:           # only the write owner runs commands here
-                await self.locks.assert_owner(owner_check, task)
-            result = await self.tests.run(ctx.workspace, policy,       # authoritative: exit codes + JUnit
-                                          workspace_root=ctx.workspace_root,
-                                          tracked=self._tracked(ctx, task, "test_run", handle.step_id))
+            result = await self._run_orchestrator_tests(ctx, task, handle, policy)     # authoritative: exit codes + JUnit
             ids_after = await self.tests.collect_ids(ctx.workspace, policy, workspace_root=ctx.workspace_root,
                                                      tracked=self._tracked(ctx, task, "ids_after", handle.step_id))
             baseline = await self._previous_test_ids(task) or ids_before
@@ -969,17 +965,29 @@ class WorkflowService:
                       "repeated_failure": await self._is_repeated_failure(task, result)}
 
             async def mutate(s, t, st):
-                s.add(Execution(id=uuid.uuid4(), task_id=t.id, step_id=st.id, run_id=ctx.lease.run_id, role="TESTER",
-                                provider="LOCAL", outcome="SUCCESS" if result.passed else "ERROR",
-                                exit_code=next((c for c in result.exit_codes if c), 0), finished_at=datetime.now(UTC),
-                                stdout_tail=result.output_tail[-4000:], runner_id=ctx.lease.runner_id,
-                                detail={"orchestrator_test_run": True, "reason": result.reason,
-                                        **({"tracking": result.tracking} if result.tracking else {})}))
+                s.add(self._orchestrator_run_row(ctx, t, st, result))
                 await self._test_transition(s, t, output, ctx.project_proof)
             return StepDecision(output=output, mutate=mutate)
 
         await self._agent_step(ctx, task, step_key=STEP_TEST, input_hash=input_hash, prompt=prompt,
                                schema=A.TEST_AGENT_SCHEMA, mutating=True, allow_resume=True, evaluate=evaluate)
+
+    async def _run_orchestrator_tests(self, ctx: RunContext, task: Task, handle: StepHandle, policy: dict):
+        """The Orchestrator's own run of the task's test policy: only the write owner runs commands, tracked (B2)."""
+        async with self.db.transaction() as owner_check:
+            await self.locks.assert_owner(owner_check, task)
+        return await self.tests.run(ctx.workspace, policy, workspace_root=ctx.workspace_root,
+                                    tracked=self._tracked(ctx, task, "test_run", handle.step_id))
+
+    @staticmethod
+    def _orchestrator_run_row(ctx: RunContext, task: Task, step: TaskStep, result) -> Execution:
+        """The LOCAL Execution row that records the Orchestrator's own test run next to its step (ReportService reads it)."""
+        return Execution(id=uuid.uuid4(), task_id=task.id, step_id=step.id, run_id=ctx.lease.run_id, role="TESTER",
+                         provider="LOCAL", outcome="SUCCESS" if result.passed else "ERROR",
+                         exit_code=next((c for c in result.exit_codes if c), 0), finished_at=datetime.now(UTC),
+                         stdout_tail=result.output_tail[-4000:], runner_id=ctx.lease.runner_id,
+                         detail={"orchestrator_test_run": True, "reason": result.reason,
+                                 **({"tracking": result.tracking} if result.tracking else {})})
 
     def _tracked(self, ctx: RunContext, task: Task, what: str, step_id: uuid.UUID | None = None) -> TrackedCommandSession:
         """The tracked-run factory of one command group of the TESTING state (7.1): one cancel scope per group."""
