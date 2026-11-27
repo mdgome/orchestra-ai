@@ -535,16 +535,18 @@ async def test_migration_0004_to_0005_down_and_up_again_and_alembic_check(pg):
         assert {"runtime_capabilities", "process_risk_requests"} <= after["tables"]
         assert set(PHASE1_INDEXES) <= after["indexes"]
         assert after["tables"] - {"runtime_capabilities", "process_risk_requests"} == before["tables"]
-        await asyncio.to_thread(command.check, cfg)                       # models and migration agree after the first upgrade
+        # `alembic check` compares the CURRENT models with the database, so it is only meaningful at head: a later migration
+        # (0006 adds tasks.mode) makes the models newer than 0005. The agreement is checked at head below.
 
         await asyncio.to_thread(command.downgrade, cfg, "0004")
         down = await schema_state(url)
         assert down == before                                             # tables, indexes and version: exactly as at 0004
 
-        await asyncio.to_thread(command.upgrade, cfg, "head")
+        await asyncio.to_thread(command.upgrade, cfg, "0005")
         again = await schema_state(url)
-        assert again == after
-        await asyncio.to_thread(command.check, cfg)                       # and after up/down/up
+        assert again == after                                             # 0005 up/down/up is exactly the same schema
+        await asyncio.to_thread(command.upgrade, cfg, "head")
+        await asyncio.to_thread(command.check, cfg)                       # and models and migrations agree at head
     finally:
         admin = await asyncpg.connect(pg.sync_uri)
         await admin.execute(f"DROP DATABASE IF EXISTS {name} WITH (FORCE)")
