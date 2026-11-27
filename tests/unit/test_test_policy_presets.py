@@ -225,6 +225,39 @@ async def test_a_failing_command_fails_even_with_a_fresh_passing_file(ws, svc):
     assert not result.passed and result.exit_codes == [3] and result.executed == 2
 
 
+# --- Gradle results (the real preset glob; the build is stood in for by a python command) --------------------------------------------
+GRADLE_GLOB = P.TEST_PRESETS["gradle"]["junit_path"]
+
+
+async def test_gradle_xml_left_by_an_earlier_run_does_not_count_when_the_test_task_is_skipped(ws, svc):
+    """What an UP-TO-DATE / FROM-CACHE `test` task looks like: the command succeeds, nothing is rewritten."""
+    stale = ws / "mod" / "build" / "test-results" / "test" / "TEST-a.B.xml"
+    stale.parent.mkdir(parents=True)
+    stale.write_text(PASSING, encoding="utf-8")
+    before = stale.read_bytes()
+    policy = validate_test_policy({"commands": [["python", "-c", "print('BUILD SUCCESSFUL')"]], "junit_path": GRADLE_GLOB})
+    result = await svc.run(ws, policy)
+    assert not result.passed and result.exit_codes == [0] and "no new or updated" in result.reason
+    assert stale.read_bytes() == before                                         # build/ is the user's area: nothing is deleted
+
+
+async def test_gradle_xml_rewritten_by_this_run_counts_even_with_identical_content(ws, svc):
+    path = "mod/build/test-results/test/TEST-a.B.xml"
+    policy = policy_writing({path: PASSING}, junit=GRADLE_GLOB)
+    assert (await svc.run(ws, policy)).passed
+    second = await svc.run(ws, policy)                                          # `cleanTest` + `test` rewrites the same bytes
+    assert second.passed and second.executed == 2
+
+
+async def test_gradle_modules_are_summed_and_a_stale_module_stays_out(ws, svc):
+    stale = ws / "old" / "build" / "test-results" / "test" / "TEST-old.xml"
+    stale.parent.mkdir(parents=True)
+    stale.write_text('<testsuite><testcase classname="x" name="broken"><failure/></testcase></testsuite>')
+    files = {f"m{i}/build/test-results/test/TEST-{i}.xml": PASSING for i in range(2)}
+    result = await svc.run(ws, policy_writing(files, junit=GRADLE_GLOB))
+    assert result.passed and result.executed == 4 and not result.failures
+
+
 def test_nested_suites_are_not_counted_twice(tmp_path):
     nested = tmp_path / "n.xml"
     nested.write_text('<testsuites><testsuite name="o"><testsuite name="i"><testcase classname="c" name="n"/></testsuite>'
@@ -321,6 +354,28 @@ def test_jvm_presets_move_the_tester_to_src_test_and_its_own_test_goal(preset):
     assert set(P.TEST_PRESETS[preset]["developer_bash"]) <= set(developer.allowed)
     assert set(ROLE_PERMISSIONS["DEVELOPER"].allowed) <= set(developer.allowed)
     assert not any(a.startswith("Edit(pom") or "wrapper" in a or a == "Edit" for a in tester.allowed)
+
+
+@pytest.mark.parametrize("preset", ["maven", "gradle"])
+@pytest.mark.parametrize("role", ["DEVELOPER", "TESTER"])
+def test_a_jvm_preset_never_changes_what_a_role_is_denied_or_its_tool_set(preset, role):
+    base, special = ROLE_PERMISSIONS[role], permissions_for(role, preset)
+    assert special.disallowed == base.disallowed and special.disallowed         # same deny list, and it is not empty
+    assert special.tools == base.tools and special.permission_mode == base.permission_mode
+    assert not set(special.allowed) & set(special.disallowed)                   # nothing denied is also allowed
+    for denied in ("Bash(rm:*)", "Bash(curl:*)", "Bash(git push:*)", "Bash(git reset:*)"):
+        assert denied in special.disallowed and denied not in special.allowed
+    argv = ClaudeCliProvider(None, "claude").build_argv(
+        ProviderRequest(role=role, prompt="p", cwd=Path("."), test_preset=preset), None)
+    assert set(base.disallowed) <= set(argv[argv.index("--disallowedTools") + 1].split(","))     # reaches the command line
+
+
+@pytest.mark.parametrize("preset", ["maven", "gradle"])
+def test_the_jvm_tester_bash_rights_stay_limited_to_the_test_goal(preset):
+    bash = {a for a in permissions_for("TESTER", preset).allowed if a.startswith("Bash(")}
+    assert bash == {"Bash(git status:*)", "Bash(git diff:*)", "Bash(ls:*)", *P.TEST_PRESETS[preset]["tester_bash"]}
+    assert all(" test:" in a for a in P.TEST_PRESETS[preset]["tester_bash"])    # `mvn test`, never a bare `mvn:*`
+    assert "Edit" not in permissions_for("TESTER", preset).allowed and "Write" not in permissions_for("TESTER", preset).allowed
 
 
 @pytest.mark.parametrize("preset", ["maven", "gradle"])
