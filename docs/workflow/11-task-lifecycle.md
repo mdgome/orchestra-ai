@@ -88,6 +88,7 @@ flowchart TD
 ```
 
 - `CLEAN` determination: if the measurement is valid and the outcome is `COMPLETED`, the final fingerprint becomes the new `baseline_fingerprint`. For `FAILED`/`CANCELLED`, it is `CLEAN` only when the current fingerprint matches the `write_baseline_fingerprint` (recorded at lock acquisition); otherwise it is `DIRTY_UNRESOLVED`. If there is no proof or it is `UNMEASURED`, even `COMPLETED` does not end as `CLEAN`, and if the fingerprint version of the write baseline differs from the current one, comparison is not possible for `FAILED`/`CANCELLED`, so it becomes `DIRTY_UNRESOLVED`.
+- A `TEST_ONLY` Task (a Project Test Run) never moves the accepted baseline, whatever its terminal state. With a valid proof it is `CLEAN` only if the current fingerprint matches the `write_baseline_fingerprint`; a changed tracked file, an untracked by-product, a missing proof or `UNMEASURED` make it `DIRTY_UNRESOLVED`, even when the Task is `COMPLETED`. A test run therefore never adopts build by-products silently; the next Task meets the `PROJECT_DIRTY` Gate.
 - A Task that is not the owner (a legacy Task, a project Task that never acquired the lock) passes through the same path without a proof and makes no changes to the Project.
 - In an `UNMEASURED` termination, if the owner has already changed to a different Task, that Project lock is not released; only the current Task is terminal-processed. Re-execution on an already-terminal Task does nothing.
 - Task terminal processing and Project cleanup are not split across different transactions, so no intermediate state in which only one side is visible can be observed by another session (confirmed by integration tests).
@@ -183,6 +184,17 @@ The check conditions are the items actually verified by `check_definition_of_don
 If anything is unmet, the Review outcome is changed to `FAIL`, moving to an improvement iteration (`RETRYING`); if it is a `plan_defect`, it moves to replanning. The only cases where this check results in FAILED are exceeding the iteration limit (`max_workflow_iterations`) or the replan limit (`max_replans`) ([05](05-development-testing.md)). (A project Task can also become FAILED for other reasons such as `PROJECT_WORKSPACE_UNSTABLE`, `PROJECT_DIRTY_ABORTED`/`PROJECT_DIRTY_REJECTED`, which are unrelated to the Completion check.)
 - Project cleanup at the moment of becoming COMPLETED (accepting the final fingerprint as the baseline) follows the "Terminal Transitions and Project Write Lock Cleanup" section above.
 
+### Test-only Task (Project Test Run)
+
+A Task with `mode = TEST_ONLY` does not use the Definition of Done above: no plan, Design Review, Code Review or profile criterion applies. `completion_checker.evaluate_test_only_completion` evaluates its conditions in the transaction that completes the test step (the Task row is locked and the Lease verified, so the cancel request and the tracked executions are read in the same transaction that decides the outcome):
+
+- the test policy hash is the one the Task was created with, and no cancellation was requested
+- no test command timed out and every command succeeded
+- a usable JUnit result exists, no test failed, and at least `min_tests_executed` tests actually ran
+- the Orchestrator's own verdict is `passed`, and no tracked execution of the Task is left unproven
+
+All met → `COMPLETED`. Otherwise the Task is `FAILED` and `failure_reason` is the first unmet condition, in this order: `TEST_POLICY_CHANGED`, `CANCEL_REQUESTED`, `TESTS_TIMEOUT`, `TESTS_FAILED` (a command that did not succeed, or a failed test), `NO_JUNIT`, `TOO_FEW_TESTS`. A run that waited too long for a busy project ends `FAILED` with `PROJECT_BUSY` ([03](03-task-runner.md)). An unproven process tree is not a failure reason: it fails closed. A failing test run is never retried by an improvement loop: nothing improves it, so it never enters `RETRYING`.
+
 ## Reading the Result: Artifacts and Report
 
 `GET /tasks/{id}/artifacts`, `GET /tasks/{id}/artifacts/{artifact_id}` and `GET /tasks/{id}/report` read what is already stored; they run no agent, command or LLM and write nothing. `COMPLETED` means the orchestrator's completion conditions were met, not that the result was accepted, merged or deployed. The stored COMPLETED transition is shown as `historical_completion` (its Definition-of-Done detail was never stored: `UNKNOWN`); `current_re_evaluation` evaluates the same conditions now (`evaluate_definition_of_done`, the function behind `check_definition_of_done`) and neither confirms nor cancels it. The three counters stay separate in every artifact: `plan_revision`, `workflow_iteration`, `step_attempt`.
@@ -230,3 +242,4 @@ All of this is read-only; a lookup starts, restarts or writes nothing.
 
 - The Completion Checker does not check for unterminated Executions via a separate query. The three groups of checks above are all there is.
 - The Event Bus is single-process in-memory. Events published by the Runner or by a different process may not be delivered and must be confirmed via REST query.
+- A `TEST_ONLY` Task (Project Test Run) exists only as an internal service path (`TaskService.create_test_run`). There is no public endpoint yet, and the report and the artifact list do not yet mark the plan, review and profile items as not applicable for it. It was verified on Windows only; the POSIX runtime of its tracked commands and real Maven/Gradle builds were not run.

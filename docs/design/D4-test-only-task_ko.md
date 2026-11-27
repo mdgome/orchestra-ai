@@ -7,6 +7,7 @@
 > **선행 조건:** [process-lifecycle-hardening_ko.md](process-lifecycle-hardening_ko.md)(B2). **B2의 구현·검증·재검토와 이 문서의 승인 전에는 E를 구현하지 않는다.**
 > D5(`sys.executable` 유지), D6(fail-fast 유지), F(미착수)는 변하지 않는다. 사실은 작업 트리에서 읽었으며 확인하지 못한 항목은 **(미확인)** 으로 표시한다.
 > **개정 3.1.** B2 반영 후 작업 트리(HEAD `2f7da7f`)를 다시 읽어 확인했다. 정정 사항과 추가 한 가지는 §16에 있다. 여전히 설계안이며 미승인, 미구현이다.
+> **구현 상태.** E1(내부 TEST_ONLY 경로, [E1-implementation-plan_ko.md](E1-implementation-plan_ko.md) 참조)은 구현되었고, E2(공개 endpoint, 리포트/artifact의 `NOT_APPLICABLE`, diagnostics 경고, gate 만료 sweep, 나머지 workflow 문서)는 구현되지 않았다.
 
 ## 1. 결정과 (d)를 택한 이유
 

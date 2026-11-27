@@ -1,8 +1,8 @@
 # E1 구현 계획 — test-only Task 실행 경로 (내부, API 미공개)
 
-> **상태: 계획안. 구현 승인 대기.** 이 문서는 코드·테스트·migration을 바꾸지 않았다. 기준 설계는 [D4-test-only-task.md](D4-test-only-task.md)(v3.1, G1~G10 결정 기록됨, **문서 전체는 아직 미승인**)이며, 이 계획은 그 §11의 E1 범위를 구현 단위로 나눈 것이다.
+> **상태: 구현됨(E1). 승인 후 구현했고 §7에 결과와 계획과의 차이를 적었다.** 이 문서는 코드·테스트·migration을 바꾸지 않았다. 기준 설계는 [D4-test-only-task.md](D4-test-only-task.md)(v3.1, G1~G10 결정 기록됨, **문서 전체는 아직 미승인**)이며, 이 계획은 그 §11의 E1 범위를 구현 단위로 나눈 것이다.
 > 사실은 HEAD `52afb9c`의 작업 트리에서 읽었다. 읽지 않았거나 실행하지 않은 것은 **(미확인)** 으로 표시한다.
-> **착수 조건:** D4 설계의 명시적 승인. 승인 전에는 아래 어떤 작업도 시작하지 않는다.
+> **착수 조건:** D4 설계의 명시적 승인(받음: 설계 승인, 사유 코드와 멱등성 범위는 제안대로).
 
 ## 1. 범위
 
@@ -120,3 +120,14 @@
 - `TASK_TRANSITIONS`, WORKFLOW의 `release_on_terminal`, `create_task`의 동작이 기존과 같음을 회귀 테스트가 증명한다.
 - 문서(WP9)가 코드와 일치한다.
 - **주장하지 않는 것:** 공개 API, 보고서의 `NOT_APPLICABLE` 표현, 진단 경고, 실제 JDK/CLI/POSIX 검증.
+
+## 7. 구현 결과와 계획과의 차이
+
+- **그대로 구현:** WP1(상태 모델), WP2(migration `0006`), WP3(정책 상수), WP4(`create_test_run`과 `update_task` 차단), WP5(handler, 리팩터링 먼저), WP6(완료 판정), WP7(`release_on_terminal`), WP8(통합 테스트), WP9(03·11번 문서 영한).
+- **`execute_local`은 만들지 않았다.** 예상대로 `TrackedCommandSession`과 추출한 헬퍼(`_run_orchestrator_tests`, `_orchestrator_run_row`)만으로 충분했다. `StepRunner`는 바뀌지 않았다.
+- **완료 조건이 계획보다 세분화되었다.** `COMMANDS_SUCCEEDED`, `NO_TIMEOUT`, `NO_FAILED_TESTS`를 추가해 사유 코드가 판정과 일치하게 했다(예: 명령이 JUnit 없이 죽으면 `NO_JUNIT`이 아니라 `TESTS_FAILED`). `LEASE_VALID`와 `CLAIM_FENCE_VALID`는 조건 목록에 넣지 않았다. 완료 트랜잭션이 구조적으로 강제하며 판정값을 만들지 않는다.
+- **상수 값:** `TEST_RUN_MAX_DEFERS = 10`(defer 백오프로 약 7분). 사유 코드는 계획의 이름 그대로다.
+- **계획에 없던 수정(발견):** (1) 취소·parked recovery가 `TEST_ONLY` Task를 `PLAN` 체크포인트로 보내면 재개 시 handler가 없는 상태로 들어가 버리므로 `TEST`로 바꾸고, handler가 없는 상태는 fail-closed로 막았다. (2) `PENDING → TESTING`은 잠금 확인보다 먼저 일어나므로, 바쁜 project에서 기다리는 test run의 상태는 `PENDING`이 아니라 `TESTING`이다.
+- **기존 테스트의 기대값 갱신 한 건:** `tests/unit/test_process_schema.py`의 migration head 단언(0005 → 0006). 다른 테스트는 약화하지 않았다.
+- **검증:** 새 테스트(단위·통합·아키텍처)와 변이 검증 6건(release 규칙, 대기 상한, update 차단, 멱등성 조회, 전이 edge, 취소 조건)이 모두 실패를 잡았다. 전체 스위트 결과와 실행하지 않은 검증은 최종 보고에 기록한다.
+- **E2로 남은 것:** 공개 endpoint, 리포트·artifact의 `NOT_APPLICABLE`, diagnostics 경고(G8), gate 만료 sweep(G6), `TaskOut.mode`와 `?mode=` 필터(G2), 나머지 영·한 workflow 문서.

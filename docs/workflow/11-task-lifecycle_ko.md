@@ -88,6 +88,7 @@ flowchart TD
 ```
 
 - `CLEAN` 판정: 측정이 유효하고 `COMPLETED`이면 최종 fingerprint가 새 `baseline_fingerprint`가 됩니다. `FAILED`/`CANCELLED`는 현재 fingerprint가 `write_baseline_fingerprint`(lock 획득 시 기록)와 같을 때만 `CLEAN`이고, 다르면 `DIRTY_UNRESOLVED`입니다. proof가 없거나 `UNMEASURED`이면 `COMPLETED`라도 `CLEAN`으로 끝나지 않고, write baseline의 fingerprint 버전이 현재와 다르면 `FAILED`/`CANCELLED`에서 비교할 수 없으므로 `DIRTY_UNRESOLVED`입니다.
+- `TEST_ONLY` Task(Project Test Run)는 terminal 상태와 관계없이 accepted baseline을 옮기지 않습니다. 유효한 proof가 있어도 현재 fingerprint가 `write_baseline_fingerprint`와 같을 때만 `CLEAN`이고, 추적 파일 변경, 추적되지 않는 부산물, proof 없음, `UNMEASURED`는 Task가 `COMPLETED`여도 `DIRTY_UNRESOLVED`입니다. 따라서 테스트 실행은 빌드 부산물을 조용히 채택하지 않으며, 다음 Task가 `PROJECT_DIRTY` Gate를 만납니다.
 - 소유자가 아닌 Task(legacy Task, lock을 얻은 적 없는 Project Task)는 proof 없이 같은 경로를 지나며 Project에는 아무 변경도 하지 않습니다.
 - `UNMEASURED` 종료에서 owner가 이미 다른 Task로 바뀌었다면 그 Project lock은 해제하지 않고 현재 Task만 terminal 처리합니다. 이미 terminal인 Task에 대한 재실행은 아무 것도 하지 않습니다.
 - Task terminal과 Project 정리는 서로 다른 트랜잭션으로 나뉘지 않으므로, 한 쪽만 보이는 중간 상태가 다른 세션에 관찰되지 않습니다(통합 테스트로 확인).
@@ -183,6 +184,17 @@ flowchart TD
 미충족이 있으면 Review 결과가 `FAIL`로 바뀌어 개선 반복(`RETRYING`)으로 이동하고, `plan_defect`면 재계획으로 이동합니다. 이 검사에서 FAILED가 되는 경우는 반복 한도(`max_workflow_iterations`) 또는 재계획 한도(`max_replans`) 초과뿐입니다 ([05](05-development-testing_ko.md)). (프로젝트 Task는 이 밖에 `PROJECT_WORKSPACE_UNSTABLE`, `PROJECT_DIRTY_ABORTED`/`PROJECT_DIRTY_REJECTED` 등으로도 FAILED가 될 수 있으며 Completion 검사와는 무관합니다.)
 - COMPLETED가 되는 순간의 Project 정리(최종 fingerprint를 baseline으로 수용)는 위 「Terminal 전이와 Project write lock 정리」를 따릅니다.
 
+### Test-only Task (Project Test Run)
+
+`mode = TEST_ONLY`인 Task는 위의 Definition of Done을 쓰지 않습니다. Plan, Design Review, Code Review, profile 기준은 적용되지 않습니다. `completion_checker.evaluate_test_only_completion`이 테스트 step을 완료하는 트랜잭션 안에서 조건을 평가합니다(Task 행이 잠기고 Lease가 검증되므로 취소 요청과 tracked 실행이 결과를 정하는 같은 트랜잭션에서 읽힙니다).
+
+- 테스트 정책 hash가 Task 생성 때의 값이고 취소 요청이 없음
+- 시간 초과된 테스트 명령이 없고 모든 명령이 성공함
+- 사용 가능한 JUnit 결과가 있고, 실패한 테스트가 없으며, 실제로 실행된 테스트가 `min_tests_executed` 이상임
+- Orchestrator 자신의 판정이 `passed`이고, Task의 tracked 실행 중 입증되지 않은 것이 없음
+
+모두 충족하면 `COMPLETED`입니다. 아니면 Task는 `FAILED`이고 `failure_reason`은 처음 충족하지 못한 조건이며 순서는 `TEST_POLICY_CHANGED`, `CANCEL_REQUESTED`, `TESTS_TIMEOUT`, `TESTS_FAILED`(성공하지 못한 명령 또는 실패한 테스트), `NO_JUNIT`, `TOO_FEW_TESTS`입니다. 바쁜 project를 너무 오래 기다린 run은 `PROJECT_BUSY`로 `FAILED`가 됩니다([03](03-task-runner_ko.md)). 입증되지 않은 프로세스 트리는 실패 사유가 아니라 fail-closed입니다. 실패한 테스트 실행은 개선 루프로 재시도되지 않습니다. 개선할 것이 없으므로 `RETRYING`에 들어가지 않습니다.
+
 ## 결과 읽기: 산출물과 보고서
 
 `GET /tasks/{id}/artifacts`, `GET /tasks/{id}/artifacts/{artifact_id}`, `GET /tasks/{id}/report`는 이미 저장된 데이터를 읽을 뿐이며 에이전트, 명령, LLM을 실행하지 않고 아무것도 쓰지 않습니다. `COMPLETED`는 오케스트레이터의 완료 조건을 충족했다는 뜻이지 결과가 인수·merge·배포되었다는 뜻이 아닙니다. 저장된 COMPLETED 전이는 `historical_completion`으로 보이며(그 시점의 Definition-of-Done 상세는 저장된 적이 없어 `UNKNOWN`), `current_re_evaluation`은 같은 조건을 지금 평가하고(`check_definition_of_done`의 근거 함수인 `evaluate_definition_of_done`) 과거 완료를 확인하거나 취소하지 않습니다. 모든 산출물에서 세 카운터(`plan_revision`, `workflow_iteration`, `step_attempt`)는 분리되어 있습니다.
@@ -230,3 +242,4 @@ flowchart TD
 
 - Completion Checker는 미종료 Execution을 별도 쿼리로 검사하지 않습니다. 위 세 묶음의 검사가 전부입니다.
 - Event Bus는 단일 프로세스 in-memory입니다. Runner와 다른 프로세스에서 발행된 이벤트는 전달되지 않을 수 있으며 REST 조회로 확인해야 합니다.
+- `TEST_ONLY` Task(Project Test Run)는 내부 서비스 경로(`TaskService.create_test_run`)로만 존재합니다. 공개 endpoint는 아직 없고, 보고서와 artifact 목록은 이 Task에서 plan, review, profile 항목을 아직 `해당 없음`으로 표시하지 않습니다. Windows에서만 검증했으며 tracked 명령의 POSIX 런타임과 실제 Maven/Gradle 빌드는 실행하지 않았습니다.

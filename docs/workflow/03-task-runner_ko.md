@@ -95,6 +95,15 @@ sequenceDiagram
 - **지연(backoff)**: `HELD`·`project_busy` requeue는 `execution_requests.defer_count`를 1 증가시키고 `not_before`를 `min(60s, 5s·2^이전_defer_count)`에 jitter(0.8~1.2)를 곱한 시각으로 저장합니다(jitter 제외 5s, 10s, 20s ...). `claim_next`는 `not_before`가 지난 요청만 claim하며, 값은 PostgreSQL에 있으므로 Runner 재시작 뒤에도 유지됩니다. 재시작 recover의 단순 requeue는 카운터를 올리지 않습니다.
 - `Runner.recover`는 매 loop 반복마다(슬롯 여부와 무관하게) 실행됩니다. `CLAIMED`이고 `claimed_at`이 유예 시간(`claim_timeout_seconds`)을 넘겼으며 **살아 있는(미만료 RUNNING) Lease가 없는** 요청만 stale로 보고 requeue합니다. claim과 Lease 획득 사이의 정상 구간과, Lease를 가진 긴 CLI 실행은 건드리지 않습니다. 이어서 idle 취소 요청(`_cancel_idle_tasks`)을 처리하고, 종료된 Task가 남긴 Project write lock을 정리(`ProjectLockService.reconcile`)합니다. Recovery Gate를 직접 만들지 않습니다.
 
+## Task mode: WORKFLOW와 TEST_ONLY
+
+- Project Test Run은 `mode = TEST_ONLY`인 일반 Task입니다(그 밖의 Task는 `WORKFLOW`). `TEST_ONLY`는 `TaskService.create_test_run`만 쓰며, 어떤 요청 스키마도 `mode`나 idempotency key를 받지 않고, DB 제약이 `TEST_ONLY` Task에는 project를 요구하고 idempotency key는 `TEST_ONLY`에만 허용합니다. `TEST_ONLY` Task의 수정(`PATCH`)은 거부됩니다.
+- `PENDING`, `TESTING`, `WAITING_APPROVAL`, `COMPLETED`, `FAILED`, `CANCELLED`만 씁니다. 이 Task에만 있는 edge 둘은 `PENDING → TESTING`과 `TESTING → COMPLETED`(`TEST_ONLY_EXTRA_TRANSITIONS`)이며 `WORKFLOW`의 `TASK_TRANSITIONS`는 그대로입니다.
+- `WorkflowService.run_task`는 `(mode, state)`로 handler를 고릅니다. `TEST_ONLY` Task의 handler는 `PENDING`과 `TESTING`뿐이며 다른 상태는 fail-closed입니다. `TESTING` handler는 에이전트 step과 똑같이 project write lock을 요청하고(dirty project는 시도 전에 `PROJECT_DIRTY` Gate를 열며 `continue`는 `TESTING`에서 재개), 일반 key `TEST`로 step을 시작하고, project의 테스트 정책을 tracked 명령으로 실행하며, terminal proof와 함께 한 트랜잭션에서 완료합니다([11](11-task-lifecycle_ko.md)). Planner, Reviewer, Developer, Tester 에이전트, session, prompt, provider는 관여하지 않습니다.
+- 생성은 project 행 lock 아래의 짧은 DB 전용 트랜잭션 하나이므로 두 호출이 모두 run을 만들 수 없습니다. idempotency key를 먼저 조회합니다. 같은 key와 같은 의미(project와 테스트 정책 hash)는 진행 중이든 끝났든 그 run을 다시 돌려주고, 같은 key에 다른 의미면 409 `IDEMPOTENCY_KEY_REUSED`입니다. 그 밖에 non-terminal run이 있는 project는 409 `TEST_RUN_ACTIVE`를 답합니다. 정책은 항상 project 자신의 것입니다.
+- 대기 상한: 이미 `TEST_RUN_MAX_DEFERS`(10)번 defer된 `TEST_ONLY` 요청은 다음 busy 응답에서 requeue되지 않고 `PROJECT_BUSY`로 `FAILED`가 됩니다. `WORKFLOW` Task는 상한 없이 계속 defer합니다.
+- Recovery는 두 곳이 다릅니다. `TEST_ONLY` Task의 취소나 parked recovery는 `PLAN`이 아니라 `TEST`로 재진입하고, 중단되거나 retry되는 step의 snapshot 비교는 건너뜁니다. 일부만 실행된 빌드가 파일을 바꾸는 것이 정상이기 때문입니다. 마지막 project fingerprint와 tracked 실행 증명이 안전망입니다([09](09-recovery_ko.md)).
+
 ## 병렬 dispatch
 
 한 애플리케이션 프로세스 안에서 `Runner._dispatch`가 여러 Task를 동시에 실행합니다(프로젝트마다 OS 프로세스를 만들지 않습니다).

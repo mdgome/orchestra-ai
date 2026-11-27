@@ -7,6 +7,7 @@ Korean translation: [D4-test-only-task_ko.md](D4-test-only-task_ko.md)
 > **Prerequisite:** [process-lifecycle-hardening.md](process-lifecycle-hardening.md) (B2). **E must not be implemented before B2 is implemented, verified and re-reviewed, and before this document is approved.**
 > D5 (`sys.executable` stays), D6 (fail-fast stays) and F (not started) are unchanged. Facts were read from the working tree; anything not verified is marked **(unverified)**.
 > **Revision 3.1.** Re-verified against the working tree after B2 landed (HEAD `2f7da7f`). The corrections and the one addition are listed in §16. Still a proposal: not approved, not implemented.
+> **Implementation status.** E1 (the internal TEST_ONLY path, see [E1-implementation-plan_ko.md](E1-implementation-plan_ko.md)) is implemented; E2 (public endpoints, report/artifact `NOT_APPLICABLE`, the diagnostics warning, the gate-expiry sweep, the remaining workflow docs) is not.
 
 ## 1. Decision and why (d)
 
