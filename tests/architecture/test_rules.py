@@ -189,3 +189,16 @@ def test_no_shell_execution_anywhere():
     for path in APP.rglob("*.py"):
         src = path.read_text(encoding="utf-8")
         assert "shell=True" not in src and "create_subprocess_shell" not in src and "os.system(" not in src, path.name
+
+
+def test_no_request_body_can_choose_a_task_mode_or_an_idempotency_key():
+    """Only TaskService.create_test_run writes mode TEST_ONLY (D4): no existing request schema may carry it."""
+    from app.schemas import api
+    for model in (api.TaskCreate, api.TaskPatch):
+        assert not {"mode", "idempotency_key", "request_fingerprint"} & set(model.model_fields), model.__name__
+
+
+def test_only_the_task_service_creates_a_test_only_task():
+    writers = [path.name for path in py_files("services") + py_files("routers")
+               if "TaskMode.TEST_ONLY" in path.read_text(encoding="utf-8") and "Task(" in path.read_text(encoding="utf-8")]
+    assert writers == ["task_service.py"]

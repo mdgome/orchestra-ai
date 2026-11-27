@@ -159,6 +159,16 @@ def validate_message(role: str, content: str) -> tuple[str, str]:
     return role, value
 
 
+def validate_idempotency_key(key: str | None) -> str | None:
+    """None (no key) or 1..TEST_RUN_IDEMPOTENCY_KEY_MAX_LENGTH printable ASCII characters without spaces at the ends."""
+    if key is None:
+        return None
+    if (not isinstance(key, str) or not 1 <= len(key) <= P.TEST_RUN_IDEMPOTENCY_KEY_MAX_LENGTH
+            or key != key.strip() or not key.isascii() or not key.isprintable()):
+        raise ValidationFailed("invalid idempotency key", {"max_length": P.TEST_RUN_IDEMPOTENCY_KEY_MAX_LENGTH})
+    return key
+
+
 def validate_limits(overrides: dict | None) -> P.ExecutionLimits:
     base = P.ExecutionLimits()
     values = {k: getattr(base, k) for k in P.LIMIT_BOUNDS}

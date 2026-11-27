@@ -70,3 +70,13 @@ class MeasurementBusy(AppError):
     """Another workspace measurement of this project (or too many overall) is still running: nothing new is started."""
     status_code = 503
     code = "CHANGES_MEASUREMENT_BUSY"
+
+
+class IdempotencyKeyReused(Conflict):
+    """The same idempotency key was sent with a request that means something different (another project policy)."""
+    code = "IDEMPOTENCY_KEY_REUSED"
+
+
+class ActiveTestRunExists(Conflict):
+    """A project runs at most one test run at a time: the id of the active one is in `details`."""
+    code = "TEST_RUN_ACTIVE"

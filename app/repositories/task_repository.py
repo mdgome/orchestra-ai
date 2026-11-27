@@ -109,6 +109,17 @@ class TaskRepository:
             stmt = stmt.where(Task.project_id == project_id)
         return list((await self.s.execute(stmt)).scalars())
 
+    async def test_run_by_key(self, project_id: uuid.UUID, key: str) -> Task | None:
+        """The TEST_ONLY Task a client's idempotency key already created in this project (unique index), if any."""
+        return (await self.s.execute(select(Task).where(
+            Task.project_id == project_id, Task.idempotency_key == key))).scalar_one_or_none()
+
+    async def active_test_run(self, project_id: uuid.UUID, terminal: tuple[str, ...]) -> Task | None:
+        """A non-terminal TEST_ONLY Task of the project (oldest first), if any."""
+        return (await self.s.execute(select(Task).where(
+            Task.project_id == project_id, Task.mode == "TEST_ONLY", Task.status.notin_(terminal))
+            .order_by(Task.created_at, Task.id).limit(1))).scalar_one_or_none()
+
     async def tasks_in_states(self, states: tuple[str, ...]) -> list[Task]:
         return list((await self.s.execute(select(Task).where(Task.status.in_(states)))).scalars())
 

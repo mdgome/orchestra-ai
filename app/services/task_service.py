@@ -8,7 +8,7 @@ from sqlalchemy import func, update
 
 from app.db import Database
 from app.infra.workspace_guard import WorkspaceGuard, resolve_project_root
-from app.models.states import TERMINAL_TASK_STATES, TaskState
+from app.models.states import TERMINAL_TASK_STATES, TaskMode, TaskState
 from app.models.tables import Approval, Conversation, Execution, ExecutionRequest, Message, StateTransition, Task
 from app.repositories.approval_repository import ApprovalRepository, ExecutionRequestRepository
 from app.repositories.conversation_repository import ConversationRepository
@@ -21,7 +21,7 @@ from app.services.test_policy_resolver import resolve_test_policy
 from app.services.test_policy_service import hash_test_policy
 from app.validation import policies as P
 from app.validation import validators as V
-from app.validation.exceptions import Conflict, NotFound
+from app.validation.exceptions import ActiveTestRunExists, Conflict, IdempotencyKeyReused, NotFound
 
 
 @dataclass(frozen=True)
@@ -118,46 +118,97 @@ class TaskService:
         requirements = V.validate_requirements(requirements)
         limit_values = V.validate_limits(limits)
         async with self.db.transaction() as s:
-            project = None
-            if project_id is not None:
-                # FOR UPDATE: serialises with ARCHIVE, so a task can never be added to a project being archived
-                project = await ProjectRepository(s).lock(project_id)
-                if project is None:
-                    raise NotFound("project not found")
-                if project.status != "ACTIVE":
-                    raise Conflict("project is not ACTIVE", {"status": project.status})
-            # precedence: task policy > project policy > default; a preset is resolved to ONE runnable command now
-            # and copied into the task, so test_policy_hash describes exactly what will run.
-            project_root = resolve_project_root(project.workspace_path) if project else None
-            policy = resolve_test_policy(test_policy if test_policy is not None else
-                                         (project.test_policy if project else None), project_root)
-            convs = ConversationRepository(s)
-            if conversation_id is None:
-                conversation_id = (await convs.create()).id
-            else:
-                conv = await convs.get(conversation_id)
-                if conv is None:
-                    raise NotFound("conversation not found")
-                if conv.status != "ACTIVE":
-                    raise Conflict("conversation is not ACTIVE", {"status": conv.status})
-            # the active profile version is copied (number, hash, content) under the same project row lock that
-            # serialises profile changes, so a task sees exactly one version and a later change cannot alter it
-            profile = (await ProfileRepository(s).get(project.id, project.profile_version)
-                       if project is not None and project.profile_version else None)
-            task_id = uuid.uuid4()
-            # project tasks share the registered workspace (re-validated here and before every run)
-            workspace = project_root if project else self.guard.task_workspace(task_id)
-            task = await TaskRepository(s).add(Task(
-                id=task_id, conversation_id=conversation_id, project_id=project_id, requirements=requirements,
-                requirements_hash=stable_hash("requirements", requirements), status=str(TaskState.PENDING),
-                limits={k: getattr(limit_values, k) for k in P.LIMIT_BOUNDS}, test_policy=policy,
-                test_policy_hash=hash_test_policy(policy), workspace_path=str(workspace), plan_revision=0,
-                workflow_iteration=0, replan_count=0, cli_invocations=0, run_seconds=0.0, decisions_hash="",
-                profile_version=profile.version if profile else None,
-                profile_hash=profile.content_hash if profile else None,
-                profile_snapshot=copy.deepcopy(profile.content) if profile else None, row_version=0))
-            await TaskRepository(s).add_transition(task.id, str(TaskState.PENDING), None, "created")
-            return task
+            project = await self._lock_active_project(s, project_id)
+            policy, project_root = self._resolve_policy(project, test_policy)
+            return await self._insert_task(s, project, project_root, requirements=requirements,
+                                           conversation_id=conversation_id, limit_values=limit_values, policy=policy)
+
+    async def create_test_run(self, project_id: uuid.UUID, *, idempotency_key: str | None = None) -> tuple[Task, bool]:
+        """A Project Test Run: an ordinary Task with mode TEST_ONLY that only runs the project's test policy (D4).
+        Returns (task, replayed). One short, DB-only transaction under the project row lock (the lock create_task and
+        archive use), so two concurrent calls cannot both create a run. The Runner consumes the START request it records.
+
+        The key is looked up FIRST: the same key and the same meaning replays that run (in progress or finished); the same
+        key with another meaning is IDEMPOTENCY_KEY_REUSED. Otherwise a project with a non-terminal run answers
+        TEST_RUN_ACTIVE. No command, path or policy comes from the caller: the policy is the project's own."""
+        key = V.validate_idempotency_key(idempotency_key)
+        async with self.db.transaction() as s:
+            project = await self._lock_active_project(s, project_id)
+            if project is None:
+                raise NotFound("project not found")
+            policy, project_root = self._resolve_policy(project, None)
+            fingerprint = stable_hash("test_run_request", str(project.id), hash_test_policy(policy))
+            repo = TaskRepository(s)
+            if key is not None:
+                existing = await repo.test_run_by_key(project.id, key)
+                if existing is not None:
+                    if existing.request_fingerprint != fingerprint:
+                        raise IdempotencyKeyReused("the idempotency key was used for a different request",
+                                                   {"test_run_id": str(existing.id)})
+                    return existing, True
+            active = await repo.active_test_run(project.id, tuple(str(x) for x in TERMINAL_TASK_STATES))
+            if active is not None:
+                raise ActiveTestRunExists("the project already has an active test run", {"test_run_id": str(active.id)})
+            task = await self._insert_task(s, project, project_root, requirements=P.TEST_ONLY_REQUIREMENTS,
+                                           conversation_id=None, limit_values=V.validate_limits(None), policy=policy,
+                                           mode=TaskMode.TEST_ONLY, idempotency_key=key, request_fingerprint=fingerprint)
+            await ExecutionRequestRepository(s).add(
+                ExecutionRequest(id=uuid.uuid4(), task_id=task.id, kind="START", status="PENDING"))
+            return task, False
+
+    async def _lock_active_project(self, s, project_id: uuid.UUID | None):
+        if project_id is None:
+            return None
+        # FOR UPDATE: serialises with ARCHIVE, so a task can never be added to a project being archived
+        project = await ProjectRepository(s).lock(project_id)
+        if project is None:
+            raise NotFound("project not found")
+        if project.status != "ACTIVE":
+            raise Conflict("project is not ACTIVE", {"status": project.status})
+        return project
+
+    @staticmethod
+    def _resolve_policy(project, test_policy: dict | None) -> tuple[dict, object]:
+        """precedence: task policy > project policy > default; a preset is resolved to ONE runnable command now and copied
+        into the task, so test_policy_hash describes exactly what will run. Returns (policy, project root or None)."""
+        project_root = resolve_project_root(project.workspace_path) if project else None
+        policy = resolve_test_policy(test_policy if test_policy is not None else
+                                     (project.test_policy if project else None), project_root)
+        return policy, project_root
+
+    async def _insert_task(self, s, project, project_root, *, requirements: str, conversation_id: uuid.UUID | None,
+                           limit_values, policy: dict, mode: TaskMode = TaskMode.WORKFLOW,
+                           idempotency_key: str | None = None, request_fingerprint: str | None = None) -> Task:
+        """The part create_task and create_test_run share: conversation, profile copy, the Task row and its first transition."""
+        project_id = project.id if project is not None else None
+        convs = ConversationRepository(s)
+        if conversation_id is None:
+            conversation_id = (await convs.create()).id
+        else:
+            conv = await convs.get(conversation_id)
+            if conv is None:
+                raise NotFound("conversation not found")
+            if conv.status != "ACTIVE":
+                raise Conflict("conversation is not ACTIVE", {"status": conv.status})
+        # the active profile version is copied (number, hash, content) under the same project row lock that
+        # serialises profile changes, so a task sees exactly one version and a later change cannot alter it
+        profile = (await ProfileRepository(s).get(project.id, project.profile_version)
+                   if project is not None and project.profile_version else None)
+        task_id = uuid.uuid4()
+        # project tasks share the registered workspace (re-validated here and before every run)
+        workspace = project_root if project else self.guard.task_workspace(task_id)
+        task = await TaskRepository(s).add(Task(
+            id=task_id, conversation_id=conversation_id, project_id=project_id, requirements=requirements,
+            requirements_hash=stable_hash("requirements", requirements), status=str(TaskState.PENDING),
+            limits={k: getattr(limit_values, k) for k in P.LIMIT_BOUNDS}, test_policy=policy,
+            test_policy_hash=hash_test_policy(policy), workspace_path=str(workspace), plan_revision=0,
+            workflow_iteration=0, replan_count=0, cli_invocations=0, run_seconds=0.0, decisions_hash="",
+            profile_version=profile.version if profile else None,
+            profile_hash=profile.content_hash if profile else None,
+            profile_snapshot=copy.deepcopy(profile.content) if profile else None, row_version=0,
+            mode=str(mode), idempotency_key=idempotency_key, request_fingerprint=request_fingerprint))
+        await TaskRepository(s).add_transition(task.id, str(TaskState.PENDING), None, "created")
+        return task
 
     async def get_task(self, task_id: uuid.UUID) -> Task:
         async with self.db.transaction() as s:
@@ -179,6 +230,8 @@ class TaskService:
             task = await TaskRepository(s).lock(task_id)
             if task is None:
                 raise NotFound("task not found")
+            if task.mode == str(TaskMode.TEST_ONLY):
+                raise Conflict("a test run cannot be modified", {"mode": task.mode})
             if task.status != str(TaskState.PENDING):
                 raise Conflict("only a PENDING task can be modified", {"status": task.status})
             values: dict = {"updated_at": func.now(), "row_version": Task.row_version + 1}
