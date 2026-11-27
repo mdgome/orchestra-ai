@@ -247,19 +247,19 @@ migration 번호는 잠정이다(HEAD는 B2의 `0005`이며 E1은 다른 변경�
 
 | ID | 결정 | 제안 |
 |---|---|---|
-| G1 | 컬럼 이름과 값: `tasks.mode`(`WORKFLOW`/`TEST_ONLY`) 대 `task_kind`/`execution_mode`; 후속 계획/검토/전체 "모드" 설계와의 겹침 | `tasks.mode`, 이후 scope mode는 같은 값 집합을 확장 |
-| G2 | Task 목록 정책(§9) | 옵션 2: 기본 제외, `?mode=` 필터 |
-| G3 | 바쁜 project에 대한 대기 상한(`TEST_RUN_MAX_DEFERS`, `FAILED(PROJECT_BUSY)`) 대 Task처럼 무제한 defer | 상한 |
+| G1 | 컬럼 이름과 값: `tasks.mode`(`WORKFLOW`/`TEST_ONLY`) 대 `task_kind`/`execution_mode`; 후속 계획/검토/전체 "모드" 설계와의 겹침 | **결정:** `tasks.mode`, 이후 scope mode는 같은 값 집합을 확장 |
+| G2 | Task 목록 정책(§9) | **결정:** 옵션 2: 기본 제외, `?mode=` 필터 |
+| G3 | 바쁜 project에 대한 대기 상한(`TEST_RUN_MAX_DEFERS`, `FAILED(PROJECT_BUSY)`) 대 Task처럼 무제한 defer | **결정:** 상한 |
 | G4 | 실패한 test run이 Task를 `FAILED`로 끝냄(제안) 대 `passed=false`인 `COMPLETED` | **결정:** 이유 코드를 가진 `FAILED` |
-| G5 | TEST_ONLY recovery 옵션: `abort`/`retry`, `retry`의 snapshot-diff 검사 완화 | §7.3대로 |
-| G6 | TEST_ONLY에 한정한 gate 만료 sweep(WORKFLOW 불변) | 예 |
-| G7 | 테스트 execution 행의 role: `TESTER`/`LOCAL`(`STEP_ROLE` 필터 재사용) 대 새 role | `TESTER`/`LOCAL` |
+| G5 | TEST_ONLY recovery 옵션: `abort`/`retry`, `retry`의 snapshot-diff 검사 완화 | **결정:** §7.3대로 |
+| G6 | TEST_ONLY에 한정한 gate 만료 sweep(WORKFLOW 불변) | **결정:** 예 |
+| G7 | 테스트 execution 행의 role: `TESTER`/`LOCAL`(`STEP_ROLE` 필터 재사용) 대 새 role | **결정:** `TESTER`/`LOCAL` |
 | G8 | CONTENT mode(비 git) workspace 허용 여부. fingerprint 기반 CLEAN/DIRTY는 빌드 산출물과 사용자 변경을 구분할 수 없어 더 약함 | **결정:** 허용하고 문서화하며 diagnostics에서 경고한다(생성은 DB만 쓰므로 거기서는 거부할 수 없음). acquisition에서 거부(더 엄격)는 채택하지 않는다 |
+| G9 | 후속 확장 가능성: 폐기한 `NONE/TASK/TEST_RUN` owner 모델. TEST_ONLY Task로 감당할 수 없을 때만(예: Task로 보이면 안 되는 test run) | **결정:** 추진하지 않음 |
 | G10 | test-only step의 step key: `TEST` 재사용(§4) 대 새 key `TEST_ONLY` | **결정:** `TEST` 재사용, 흐름 구분은 `Task.mode` |
-| G9 | 후속 확장 가능성: 폐기한 `NONE/TASK/TEST_RUN` owner 모델. TEST_ONLY Task로 감당할 수 없을 때만(예: Task로 보이면 안 되는 test run) | 추진하지 않음 |
 | B2-H1…H6 | B2 문서 참조 | B2 §12 참조 |
 
-> **기록한 결정(G4, G8, G10).** 이 세 결정을 진행하라는 지시에 따라 각각의 권장안을 채택했다: G4 실패한 test run은 이유 코드를 가진 `FAILED`로 끝낸다. G8 CONTENT mode workspace는 허용하고 문서화하며 diagnostics 경고로 알린다(E2의 diagnostics 항목, 생성은 DB만 쓴다). G10 test-only step은 key `TEST`를 재사용한다. G1–G3, G5–G7, G9는 결정 전까지 제안으로 남는다.
+> **기록한 결정(G1–G10).** 진행하라는 지시에 따라 열려 있던 모든 결정의 권장안을 채택했다. 앞서: G4 실패한 test run은 이유 코드를 가진 `FAILED`로 끝낸다. G8 CONTENT mode workspace는 허용하고 문서화하며 diagnostics 경고로 알린다(E2의 diagnostics 항목, 생성은 DB만 쓴다). G10 test-only step은 key `TEST`를 재사용한다. 이번: G1 `tasks.mode`(`WORKFLOW`/`TEST_ONLY`). G2 `GET /tasks`는 TEST_ONLY를 기본 제외하고 `?mode=` 필터를 둔다. G3 바쁜 project에 대한 대기 상한(`TEST_RUN_MAX_DEFERS`, `FAILED(PROJECT_BUSY)`). G5 RECOVERY 옵션 `abort`/`retry`, `retry`의 snapshot-diff 검사 완화(§7.3). G6 TEST_ONLY에 한정한 gate 만료 sweep. G7 execution 행은 `TESTER`/`LOCAL` 유지. G9 `NONE/TASK/TEST_RUN` owner 모델은 추진하지 않는다. 이는 설계 결정일 뿐이며 문서 전체는 여전히 **미승인**이고 아무것도 구현되지 않았다. B2 결정(B2-H1…H6)은 B2 문서에 기록되어 있다.
 
 ## 15. 알려진 한계
 

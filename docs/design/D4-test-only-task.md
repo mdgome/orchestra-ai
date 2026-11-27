@@ -247,19 +247,19 @@ Unchanged-behaviour guarantees first, then the new behaviour. None of this has b
 
 | ID | Decision | Proposal |
 |---|---|---|
-| G1 | Column name and values: `tasks.mode` (`WORKFLOW`/`TEST_ONLY`) vs `task_kind` / `execution_mode`; overlap with the deferred plan/review/full "mode" design | `tasks.mode`; later scope modes extend the same value set |
-| G2 | Task list policy (§9) | option 2: excluded by default, `?mode=` filter |
-| G3 | Bounded wait for a busy project (`TEST_RUN_MAX_DEFERS`, `FAILED(PROJECT_BUSY)`) vs unlimited defer like Tasks | bounded |
+| G1 | Column name and values: `tasks.mode` (`WORKFLOW`/`TEST_ONLY`) vs `task_kind` / `execution_mode`; overlap with the deferred plan/review/full "mode" design | **Decided:** `tasks.mode`; later scope modes extend the same value set |
+| G2 | Task list policy (§9) | **Decided:** option 2: excluded by default, `?mode=` filter |
+| G3 | Bounded wait for a busy project (`TEST_RUN_MAX_DEFERS`, `FAILED(PROJECT_BUSY)`) vs unlimited defer like Tasks | **Decided:** bounded |
 | G4 | A failed test run ends the Task `FAILED` (proposed) vs `COMPLETED` with `passed=false` | **Decided:** `FAILED` with a reason code |
-| G5 | RECOVERY options for TEST_ONLY: `abort`/`retry`; relax the snapshot-diff check for `retry` | as §7.3 |
-| G6 | Gate-expiry sweep for TEST_ONLY only (WORKFLOW unchanged) | yes |
-| G7 | Role of the test execution row: `TESTER`/`LOCAL` (reuses the `STEP_ROLE` filters) vs a new role | `TESTER`/`LOCAL` |
+| G5 | RECOVERY options for TEST_ONLY: `abort`/`retry`; relax the snapshot-diff check for `retry` | **Decided:** as §7.3 |
+| G6 | Gate-expiry sweep for TEST_ONLY only (WORKFLOW unchanged) | **Decided:** yes |
+| G7 | Role of the test execution row: `TESTER`/`LOCAL` (reuses the `STEP_ROLE` filters) vs a new role | **Decided:** `TESTER`/`LOCAL` |
 | G8 | CONTENT-mode (non-git) workspaces: allowed? Fingerprint-based CLEAN/DIRTY is weaker because build outputs cannot be told from user changes | **Decided:** allow, document it and warn in diagnostics (creation stays DB-only, so it cannot be refused there); refusing at acquisition (stricter) is not adopted |
+| G9 | Possible later extension: the abandoned `NONE/TASK/TEST_RUN` owner model, only if TEST_ONLY Tasks prove unable to serve (e.g. test runs that must not appear as Tasks at all) | **Decided:** not pursued |
 | G10 | Step key of the test-only step: reuse `TEST` (§4) vs a new key `TEST_ONLY` | **Decided:** reuse `TEST`; `Task.mode` distinguishes the flows |
-| G9 | Possible later extension: the abandoned `NONE/TASK/TEST_RUN` owner model, only if TEST_ONLY Tasks prove unable to serve (e.g. test runs that must not appear as Tasks at all) | not pursued |
 | B2-H1…H6 | see the B2 document | see B2 §12 |
 
-> **Decisions recorded (G4, G8, G10).** On the instruction to proceed with these three decisions, the recommended option of each was adopted: G4 a failed test run ends the Task `FAILED` with a reason code; G8 CONTENT-mode workspaces are allowed, documented, and flagged by a diagnostics warning (a diagnostics item for E2; creation stays DB-only); G10 the test-only step reuses the key `TEST`. G1–G3, G5–G7 and G9 remain proposals until decided.
+> **Decisions recorded (G1–G10).** On the instruction to proceed, the recommended option of every open decision was adopted. Earlier: G4 a failed test run ends the Task `FAILED` with a reason code; G8 CONTENT-mode workspaces are allowed, documented, and flagged by a diagnostics warning (a diagnostics item for E2; creation stays DB-only); G10 the test-only step reuses the key `TEST`. Now: G1 `tasks.mode` with `WORKFLOW`/`TEST_ONLY`; G2 `GET /tasks` excludes TEST_ONLY by default with a `?mode=` filter; G3 a bounded wait for a busy project (`TEST_RUN_MAX_DEFERS`, `FAILED(PROJECT_BUSY)`); G5 RECOVERY options `abort`/`retry` with the snapshot-diff check relaxed for `retry` (§7.3); G6 a gate-expiry sweep for TEST_ONLY only; G7 the execution row stays `TESTER`/`LOCAL`; G9 the `NONE/TASK/TEST_RUN` owner model is not pursued. These are design decisions only: the document is still **not approved** as a whole and nothing is implemented; the B2 decisions (B2-H1…H6) are recorded in the B2 document.
 
 ## 15. Known limitations
 
