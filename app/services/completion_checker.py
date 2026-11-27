@@ -3,6 +3,7 @@ from dataclasses import dataclass
 
 from app.infra.workspace_snapshot import is_current_snapshot_version
 from app.services.artifacts import has_critical
+from app.validation import policies as P
 
 
 @dataclass(frozen=True)
@@ -102,3 +103,59 @@ def evaluate_definition_of_done(d: DoDInput) -> list[Condition]:
 def check_definition_of_done(d: DoDInput) -> list[str]:
     """Returns the list of unmet conditions; empty means the task may complete."""
     return [c.message for c in evaluate_definition_of_done(d) if c.met is False]
+
+
+# --- Project Test Run (a TEST_ONLY Task): no plan, design review, code review or profile criteria apply -------------------
+@dataclass(frozen=True)
+class TestOnlyInput:
+    __test__ = False                    # not a pytest class, whatever the name starts with
+    test_policy_unchanged: bool         # the step recorded the very policy hash the Task was created with
+    cancel_requested: bool              # Task.cancel_requested_at, read under the Task row lock in the completing transaction
+    test_result: dict                   # TestRunResult.to_dict(): the orchestrator's own result, never the agent's word
+    min_tests_executed: int
+    process_tree_confirmed: bool        # no unterminated tracked execution is left for the Task (B2)
+
+
+# condition id -> the Task failure_reason it produces when unmet, in the order the first unmet one is reported
+TEST_ONLY_FAILURE_REASONS = (
+    ("TEST_POLICY_UNCHANGED", P.TEST_RUN_TEST_POLICY_CHANGED),
+    ("NO_CANCEL_REQUESTED", P.TEST_RUN_CANCEL_REQUESTED),
+    ("NO_TIMEOUT", P.TEST_RUN_TESTS_TIMEOUT),
+    ("COMMANDS_SUCCEEDED", P.TEST_RUN_TESTS_FAILED),
+    ("JUNIT_OK", P.TEST_RUN_NO_JUNIT),
+    ("NO_FAILED_TESTS", P.TEST_RUN_TESTS_FAILED),
+    ("MIN_TESTS_EXECUTED", P.TEST_RUN_TOO_FEW_TESTS),
+    ("TESTS_PASSED", P.TEST_RUN_TESTS_FAILED),            # the orchestrator's own verdict: the fallback for anything above missed
+)
+
+
+def evaluate_test_only_completion(d: TestOnlyInput) -> list[Condition]:
+    """Completion conditions of a TEST_ONLY Task (same shape as the workflow's, so a report can show them). Anything unclear
+    is NOT a pass. The lease and the claim fence are not listed: they are enforced structurally (the completing transaction
+    raises LeaseLost / is fenced), they never produce a verdict."""
+    result = d.test_result or {}
+    outcomes = [str(o) for o in (result.get("outcomes") or [])]
+    junit_ok = bool(result.get("junit_ok"))
+    executed = int(result.get("executed") or 0) - int(result.get("skipped") or 0)
+    return [
+        Condition("TEST_POLICY_UNCHANGED", d.test_policy_unchanged, "the test policy changed while the tests ran"),
+        Condition("NO_CANCEL_REQUESTED", not d.cancel_requested, "cancellation was requested"),
+        Condition("NO_TIMEOUT", "TIMEOUT" not in outcomes, "a test command timed out"),
+        Condition("COMMANDS_SUCCEEDED", bool(outcomes) and all(o == "SUCCESS" for o in outcomes),
+                  "a test command did not succeed"),
+        Condition("JUNIT_OK", junit_ok, "no usable JUnit result was produced by this run"),
+        Condition("NO_FAILED_TESTS", not (result.get("failures") or []), "at least one test failed"),
+        Condition("MIN_TESTS_EXECUTED", junit_ok and executed >= d.min_tests_executed,
+                  f"fewer than {d.min_tests_executed} test(s) actually executed"),
+        # `passed` is the orchestrator's verdict (exit codes, fresh JUnit, no failures, minimum executed)
+        Condition("TESTS_PASSED", bool(result.get("passed")), "the tests did not pass"),
+        Condition("PROCESS_TREE_TERMINATION_CONFIRMED", d.process_tree_confirmed,
+                  "a tracked command is not proven to have stopped"),
+    ]
+
+
+def failure_reason_of_test_only(conditions: list[Condition]) -> str | None:
+    """The failure_reason of the first unmet condition (None when all are met). An unmet process-tree condition has no
+    reason code here: the caller fails closed instead (it can only happen if the B2 proof was bypassed)."""
+    unmet = {c.id for c in conditions if c.met is not True}
+    return next((reason for cid, reason in TEST_ONLY_FAILURE_REASONS if cid in unmet), None)

@@ -73,6 +73,21 @@ RECOVERY_REASON_EXECUTION_UNCERTAIN = "EXECUTION_UNCERTAIN"
 RECOVERY_REASON_PROJECT_DIRTY = "PROJECT_DIRTY"
 PROJECT_DIRTY_OPTIONS = ("continue", "abort")    # no `retry`: nothing was started
 
+# --- Project Test Run (D4: an ordinary Task with mode TEST_ONLY that only runs the project's test policy) ---------------
+TEST_ONLY_REQUIREMENTS = "Run the project's tests"      # fixed text: a test run takes no user text (validate_requirements applies)
+# A test run must not wait for a busy project for hours: after this many defers it fails with PROJECT_BUSY (an ordinary Task
+# keeps deferring without a limit). With the defer backoff above that is about seven minutes.
+TEST_RUN_MAX_DEFERS = 10
+# Failure reasons of a TEST_ONLY Task, in the order the completion conditions are checked (the first unmet one is reported).
+TEST_RUN_TEST_POLICY_CHANGED = "TEST_POLICY_CHANGED"
+TEST_RUN_CANCEL_REQUESTED = "CANCEL_REQUESTED"
+TEST_RUN_TESTS_TIMEOUT = "TESTS_TIMEOUT"
+TEST_RUN_NO_JUNIT = "NO_JUNIT"
+TEST_RUN_TESTS_FAILED = "TESTS_FAILED"
+TEST_RUN_TOO_FEW_TESTS = "TOO_FEW_TESTS"
+TEST_RUN_PROJECT_BUSY = "PROJECT_BUSY"
+TEST_RUN_IDEMPOTENCY_KEY_MAX_LENGTH = 128                # the column is String(128)
+
 # --- Runner dispatch / backoff ---------------------------------------------------------
 DEFER_BASE_SECONDS = 5.0           # first defer waits BASE, then BASE*2, BASE*4 ... capped at MAX
 DEFER_MAX_SECONDS = 60.0
